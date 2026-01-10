@@ -48,6 +48,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwWhile) return parseWhileStmt();
   if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
 
+  // assignment statement: <ident> "=" <expr> ";"
   if (cur_.kind == TokenKind::Identifier) return parseAssignStmt();
 
   diags_.error(cur_.loc, "expected statement");
@@ -180,33 +181,23 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
   return std::make_unique<ReturnStmt>(l, std::move(*e));
 }
 
-int Parser::precedence(TokenKind k) const {
-  switch (k) {
-    case TokenKind::Star:
-    case TokenKind::Slash:
-      return 20;
-    case TokenKind::Plus:
-    case TokenKind::Minus:
-      return 10;
-    case TokenKind::Less:
-    case TokenKind::Greater:
-    case TokenKind::LessEqual:
-    case TokenKind::GreaterEqual:
-    case TokenKind::EqualEqual:
-    case TokenKind::BangEqual:
-      return 5;
-    case TokenKind::AmpAmp:
-      return 3;
-    case TokenKind::PipePipe:
-      return 2;
-    default:
-      return -1;
-  }
-}
-
-bool Parser::isBinaryOp(TokenKind k) const {
-  return precedence(k) >= 0;
-}
+// -------------------- Expression parsing (stable layered) --------------------
+//
+// Grammar (subset):
+//   expr            := assignment
+//   assignment      := logical_or ( '=' assignment )?
+//   logical_or      := logical_and ( '||' logical_and )*
+//   logical_and     := equality ( '&&' equality )*
+//   equality        := relational ( ( '==' | '!=' ) relational )*
+//   relational      := additive ( ( '<' | '<=' | '>' | '>=' ) additive )*
+//   additive        := multiplicative ( ( '+' | '-' ) multiplicative )*
+//   multiplicative  := unary ( ( '*' | '/' ) unary )*
+//   unary           := ( '+' | '-' | '!' | '~' ) unary | primary
+//   primary         := integer | identifier | '(' expr ')'
+//
+// Notes:
+// - All binary ops here are LEFT associative via ( ... )*
+// - Assignment is RIGHT associative via recursion on RHS.
 
 std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
   if (cur_.kind == TokenKind::IntegerLiteral) {
@@ -249,49 +240,163 @@ std::optional<std::unique_ptr<Expr>> Parser::parseUnary() {
   return parsePrimary();
 }
 
-std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int minPrec) {
-  auto lhs = parseUnary();
-  if (!lhs) return std::nullopt;
+static bool isMulOp(TokenKind k) { return k == TokenKind::Star || k == TokenKind::Slash; }
+static bool isAddOp(TokenKind k) { return k == TokenKind::Plus || k == TokenKind::Minus; }
+static bool isRelOp(TokenKind k) {
+  return k == TokenKind::Less || k == TokenKind::LessEqual ||
+         k == TokenKind::Greater || k == TokenKind::GreaterEqual;
+}
+static bool isEqOp(TokenKind k) { return k == TokenKind::EqualEqual || k == TokenKind::BangEqual; }
 
-  while (isBinaryOp(cur_.kind) && precedence(cur_.kind) >= minPrec) {
-    TokenKind op = cur_.kind;
-    int prec = precedence(op);
-    advance();
+static bool isAndOp(TokenKind k) { return k == TokenKind::AmpAmp; }
+static bool isOrOp(TokenKind k) { return k == TokenKind::PipePipe; }
 
-    auto rhs = parseBinary(prec + 1); // left-assoc
-    if (!rhs) return std::nullopt;
+static TokenKind curKind(const Parser& p) { (void)p; return TokenKind::Eof; }
 
-    lhs = std::make_unique<BinaryExpr>((*lhs)->loc, op, std::move(*lhs), std::move(*rhs));
-  }
-
-  return lhs;
+std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) {
+  // Not used in layered version. Keep for header compatibility.
+  return parseUnary();
 }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
-  // Parse non-assignment first (||, &&, comparisons, +-, */ ...)
-  auto lhs = parseBinary(0);
+  // expr := assignment
+  // We'll implement assignment inline here to avoid editing header.
+  // First parse logical_or
+  // logical_or := logical_and ( '||' logical_and )*
+  auto parseLogicalAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    // equality ( '&&' equality )*
+    // equality := relational ( ( '==' | '!=' ) relational )*
+    auto parseRelational = [&]() -> std::optional<std::unique_ptr<Expr>> {
+      // additive ( relop additive )*
+      auto parseAdditive = [&]() -> std::optional<std::unique_ptr<Expr>> {
+        // multiplicative ( addop multiplicative )*
+        auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
+          auto lhs = parseUnary();
+          if (!lhs) return std::nullopt;
+          while (isMulOp(cur_.kind)) {
+            TokenKind op = cur_.kind;
+            SourceLocation l = (*lhs)->loc;
+            advance();
+            auto rhs = parseUnary();
+            if (!rhs) return std::nullopt;
+            lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+          }
+          return lhs;
+        };
+
+        auto lhs = parseMultiplicative();
+        if (!lhs) return std::nullopt;
+        while (isAddOp(cur_.kind)) {
+          TokenKind op = cur_.kind;
+          SourceLocation l = (*lhs)->loc;
+          advance();
+          auto rhs = parseMultiplicative();
+          if (!rhs) return std::nullopt;
+          lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+        }
+        return lhs;
+      };
+
+      auto lhs = parseAdditive();
+      if (!lhs) return std::nullopt;
+      while (isRelOp(cur_.kind)) {
+        TokenKind op = cur_.kind;
+        SourceLocation l = (*lhs)->loc;
+        advance();
+        auto rhs = parseAdditive();
+        if (!rhs) return std::nullopt;
+        lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+      }
+      return lhs;
+    };
+
+    auto parseEquality = [&]() -> std::optional<std::unique_ptr<Expr>> {
+      auto lhs = parseRelational();
+      if (!lhs) return std::nullopt;
+      while (isEqOp(cur_.kind)) {
+        TokenKind op = cur_.kind;
+        SourceLocation l = (*lhs)->loc;
+        advance();
+        auto rhs = parseRelational();
+        if (!rhs) return std::nullopt;
+        lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+      }
+      return lhs;
+    };
+
+    auto lhs = parseEquality();
+    if (!lhs) return std::nullopt;
+    while (isAndOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseEquality();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto lhs = parseLogicalAnd();
   if (!lhs) return std::nullopt;
 
-  // assignment: only allow "VarRef = expr" and it is right-assoc
+  while (isOrOp(cur_.kind)) {
+    TokenKind op = cur_.kind;
+    SourceLocation l = (*lhs)->loc;
+    advance();
+    auto rhs = parseLogicalAnd();
+    if (!rhs) return std::nullopt;
+    lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+  }
+
+  // assignment := logical_or ( '=' assignment )?
   if (cur_.kind == TokenKind::Assign) {
     auto* vr = dynamic_cast<VarRefExpr*>(lhs->get());
     if (!vr) {
       diags_.error(cur_.loc, "expected identifier on left-hand side of assignment");
       return std::nullopt;
     }
-
     SourceLocation nameLoc = vr->loc;
     std::string name = vr->name;
     SourceLocation assignLoc = cur_.loc;
 
     advance();
-    auto rhs = parseExpr(); // right-assoc
+    auto rhs = parseExpr(); // right associative
     if (!rhs) return std::nullopt;
 
     return std::make_unique<AssignExpr>(assignLoc, std::move(name), nameLoc, std::move(*rhs));
   }
 
   return lhs;
+}
+
+// Old precedence helpers kept for header compatibility (unused here)
+int Parser::precedence(TokenKind k) const {
+  switch (k) {
+    case TokenKind::Star:
+    case TokenKind::Slash:
+      return 20;
+    case TokenKind::Plus:
+    case TokenKind::Minus:
+      return 10;
+    case TokenKind::Less:
+    case TokenKind::Greater:
+    case TokenKind::LessEqual:
+    case TokenKind::GreaterEqual:
+    case TokenKind::EqualEqual:
+    case TokenKind::BangEqual:
+      return 5;
+    case TokenKind::AmpAmp:
+      return 3;
+    case TokenKind::PipePipe:
+      return 2;
+    default:
+      return -1;
+  }
+}
+
+bool Parser::isBinaryOp(TokenKind k) const {
+  return precedence(k) >= 0;
 }
 
 } // namespace c99cc
