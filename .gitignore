@@ -1,0 +1,80 @@
+# ===============================
+# Build directories
+# ===============================
+build/
+build-*/
+cmake-build-*/
+
+# ===============================
+# CMake generated files
+# ===============================
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+.ninja_*
+
+# ===============================
+# Compiled objects / binaries
+# ===============================
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+a.out
+
+# Compiler outputs (from tests)
+hello
+hello.*
+*.out
+
+# ===============================
+# LLVM / Clang artifacts
+# ===============================
+*.bc
+*.ll
+*.opt
+*.s
+
+# ===============================
+# Test runner temporary files
+# ===============================
+test_tmp/
+build/test_tmp/
+
+# ===============================
+# Logs
+# ===============================
+*.log
+
+# ===============================
+# Editor / IDE files
+# ===============================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===============================
+# OS-specific files
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# GitHub / CI (keep workflows)
+# ===============================
+# .github/workflows/   <-- intentionally NOT ignored
+
+# ===============================
+# Optional: ccache
+# ===============================
+.ccache/
+
+# ===============================
+# Optional: clangd
+# ===============================
+compile_commands.json
