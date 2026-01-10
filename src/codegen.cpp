@@ -1,6 +1,8 @@
 #include "codegen.h"
 
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
@@ -17,6 +19,11 @@ struct CGEnv {
   llvm::Function* fn = nullptr;
 
   std::unordered_map<std::string, llvm::AllocaInst*> locals;
+
+  // loop stack:
+  //   first  = break target (loop end)
+  //   second = continue target (loop cond)
+  std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
 };
 
 static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name) {
@@ -138,7 +145,6 @@ static llvm::Value* emitAssignExpr(CGEnv& env, const AssignExpr& a) {
   }
 
   env.b.CreateStore(rhsV, it->second);
-  // C assignment expression evaluates to the stored value
   return rhsV;
 }
 
@@ -201,7 +207,7 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   return llvm::UndefValue::get(i32);
 }
 
-// Return true if current basic block is terminated (e.g., by return)
+// Return true if current basic block is terminated (e.g., by return/break/continue)
 static bool emitStmt(CGEnv& env, const Stmt& s);
 
 static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
@@ -248,15 +254,26 @@ static bool emitWhile(CGEnv& env, const WhileStmt& w) {
   llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "while.body", F);
   llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "while.end");
 
+  // initial jump to cond
   env.b.CreateBr(condBB);
 
+  // cond
   env.b.SetInsertPoint(condBB);
   llvm::Value* condV = emitExpr(env, *w.cond);
   llvm::Value* condI1 = asBoolI1(env, condV);
   env.b.CreateCondBr(condI1, bodyBB, endBB);
 
+  // body
   env.b.SetInsertPoint(bodyBB);
+
+  // push loop targets: break->endBB, continue->condBB
+  env.loopStack.push_back({endBB, condBB});
+
   bool bodyTerminated = emitStmt(env, *w.body);
+
+  // pop even if terminated
+  env.loopStack.pop_back();
+
   if (!bodyTerminated) env.b.CreateBr(condBB);
 
   F->getBasicBlockList().push_back(endBB);
@@ -290,6 +307,23 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     return true;
   }
 
+  if (auto* br = dynamic_cast<const BreakStmt*>(&s)) {
+    if (!env.loopStack.empty()) {
+      env.b.CreateBr(env.loopStack.back().first); // break target
+      return true;
+    }
+    // Sema should error; keep IR valid: do nothing
+    return false;
+  }
+
+  if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
+    if (!env.loopStack.empty()) {
+      env.b.CreateBr(env.loopStack.back().second); // continue target
+      return true;
+    }
+    return false;
+  }
+
   if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) {
     return emitBlock(env, *blk);
   }
@@ -320,7 +354,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
   b.SetInsertPoint(entry);
 
-  CGEnv env{ctx, b, fn, {}};
+  CGEnv env{ctx, b, fn, {}, {}};
 
   bool terminated = false;
   for (const auto& st : tu.body) {

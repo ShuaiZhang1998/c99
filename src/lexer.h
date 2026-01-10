@@ -11,6 +11,11 @@ enum class TokenKind {
 
   KwInt,
   KwReturn,
+  KwIf,
+  KwElse,
+  KwWhile,
+  KwBreak,
+  KwContinue,
 
   LParen, RParen,
   LBrace, RBrace,
@@ -27,9 +32,7 @@ enum class TokenKind {
   GreaterEqual,// >=
   EqualEqual,  // ==
   BangEqual,   // !=
-  KwIf,
-  KwElse,
-  KwWhile,
+
   AmpAmp,   // &&
   PipePipe, // ||
 };

@@ -20,24 +20,35 @@ static bool isDeclared(const ScopeStack& scopes, const std::string& name) {
 
 static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const Expr& e);
 
-static void checkStmtImpl(Diagnostics& diags, ScopeStack& scopes, const Stmt& s) {
+static void checkStmtImpl(Diagnostics& diags, ScopeStack& scopes, int loopDepth, const Stmt& s) {
   if (auto* b = dynamic_cast<const BlockStmt*>(&s)) {
     scopes.push_back({});
-    for (const auto& st : b->stmts) checkStmtImpl(diags, scopes, *st);
+    for (const auto& st : b->stmts) checkStmtImpl(diags, scopes, loopDepth, *st);
     scopes.pop_back();
     return;
   }
 
   if (auto* i = dynamic_cast<const IfStmt*>(&s)) {
     checkExprImpl(diags, scopes, *i->cond);
-    checkStmtImpl(diags, scopes, *i->thenBranch);
-    if (i->elseBranch) checkStmtImpl(diags, scopes, *i->elseBranch);
+    checkStmtImpl(diags, scopes, loopDepth, *i->thenBranch);
+    if (i->elseBranch) checkStmtImpl(diags, scopes, loopDepth, *i->elseBranch);
     return;
   }
 
   if (auto* w = dynamic_cast<const WhileStmt*>(&s)) {
     checkExprImpl(diags, scopes, *w->cond);
-    checkStmtImpl(diags, scopes, *w->body);
+    // inside loop body: loopDepth + 1
+    checkStmtImpl(diags, scopes, loopDepth + 1, *w->body);
+    return;
+  }
+
+  if (auto* br = dynamic_cast<const BreakStmt*>(&s)) {
+    if (loopDepth <= 0) diags.error(br->loc, "break statement not within loop");
+    return;
+  }
+
+  if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
+    if (loopDepth <= 0) diags.error(co->loc, "continue statement not within loop");
     return;
   }
 
@@ -79,7 +90,7 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const Expr& e)
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
     // RHS always checked
     checkExprImpl(diags, scopes, *asn->rhs);
-    // LHS name must already exist (assignment expression cannot declare)
+    // LHS name must already exist
     if (!isDeclared(scopes, asn->name)) {
       diags.error(asn->nameLoc, "assignment to undeclared identifier '" + asn->name + "'");
     }
@@ -103,7 +114,7 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const Expr& e)
 bool Sema::run(const AstTranslationUnit& tu) {
   ScopeStack scopes;
   scopes.push_back({});
-  for (const auto& st : tu.body) checkStmtImpl(diags_, scopes, *st);
+  for (const auto& st : tu.body) checkStmtImpl(diags_, scopes, /*loopDepth=*/0, *st);
   return !diags_.hasError();
 }
 

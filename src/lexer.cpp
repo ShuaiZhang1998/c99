@@ -44,11 +44,14 @@ Token Lexer::lexIdentifierOrKeyword() {
     else break;
   }
 
-  if (s == "int")    return Token{TokenKind::KwInt, s, loc};
-  if (s == "return") return Token{TokenKind::KwReturn, s, loc};
-  if (s == "if")   return Token{TokenKind::KwIf, s, loc};
-  if (s == "else") return Token{TokenKind::KwElse, s, loc};
-  if (s == "while") return Token{TokenKind::KwWhile, s, loc};
+  if (s == "int")      return Token{TokenKind::KwInt, s, loc};
+  if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
+  if (s == "if")       return Token{TokenKind::KwIf, s, loc};
+  if (s == "else")     return Token{TokenKind::KwElse, s, loc};
+  if (s == "while")    return Token{TokenKind::KwWhile, s, loc};
+  if (s == "break")    return Token{TokenKind::KwBreak, s, loc};
+  if (s == "continue") return Token{TokenKind::KwContinue, s, loc};
+
   return Token{TokenKind::Identifier, s, loc};
 }
 
@@ -84,14 +87,14 @@ Token Lexer::next() {
     case '-': get(); return Token{TokenKind::Minus, "-", loc};
     case '*': get(); return Token{TokenKind::Star, "*", loc};
     case '/': get(); return Token{TokenKind::Slash, "/", loc};
-    
+
     case '&': {
       get();
       if (!eof() && peek() == '&') { get(); return Token{TokenKind::AmpAmp, "&&", loc}; }
       diags_.error(loc, "unexpected character: '&'");
       return next();
     }
-    
+
     case '|': {
       get();
       if (!eof() && peek() == '|') { get(); return Token{TokenKind::PipePipe, "||", loc}; }
@@ -101,28 +104,28 @@ Token Lexer::next() {
 
     case '=': {
       get();
-      if (!eof() && peek() == '=') {get(); return Token{TokenKind::EqualEqual, "==", loc}; }
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::EqualEqual, "==", loc}; }
       return Token{TokenKind::Assign, "=", loc};
     }
-    
+
     case '<': {
       get();
       if (!eof() && peek() == '=') { get(); return Token{TokenKind::LessEqual, "<=", loc}; }
       return Token{TokenKind::Less, "<", loc};
     }
-    
+
     case '>': {
       get();
       if (!eof() && peek() == '=') { get(); return Token{TokenKind::GreaterEqual, ">=", loc}; }
       return Token{TokenKind::Greater, ">", loc};
-    }	      
-    
+    }
+
     case '!': {
-     get();
-     if (!eof() && peek() == '=') { get(); return Token{TokenKind::BangEqual, "!=", loc}; }
-     return Token{TokenKind::Bang, "!", loc};
-    }	      
-    
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::BangEqual, "!=", loc}; }
+      return Token{TokenKind::Bang, "!", loc};
+    }
+
     case '~': get(); return Token{TokenKind::Tilde, "~", loc};
 
     default:

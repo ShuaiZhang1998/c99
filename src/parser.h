@@ -54,10 +54,7 @@ struct BinaryExpr final : Expr {
       : Expr(l), op(o), lhs(std::move(a)), rhs(std::move(b)) {}
 };
 
-// NEW: assignment expression: <ident> "=" <expr>
-// - lowest precedence
-// - right associative
-// - value is RHS
+// assignment expression: <ident> "=" <expr>
 struct AssignExpr final : Expr {
   std::string name;
   SourceLocation nameLoc;
@@ -86,6 +83,14 @@ struct AssignStmt final : Stmt {
 struct ReturnStmt final : Stmt {
   std::unique_ptr<Expr> valueExpr;
   ReturnStmt(SourceLocation l, std::unique_ptr<Expr> v) : Stmt(l), valueExpr(std::move(v)) {}
+};
+
+struct BreakStmt final : Stmt {
+  explicit BreakStmt(SourceLocation l) : Stmt(l) {}
+};
+
+struct ContinueStmt final : Stmt {
+  explicit ContinueStmt(SourceLocation l) : Stmt(l) {}
 };
 
 struct BlockStmt final : Stmt {
@@ -118,10 +123,7 @@ struct AstTranslationUnit {
 
 class Parser {
 public:
-  // Keep old API (for main.cpp)
   Parser(Lexer& lex, Diagnostics& diags) : lex_(lex), diags_(diags) { cur_ = lex_.next(); }
-
-  // Keep old API (for main.cpp)
   std::optional<AstTranslationUnit> parse() { return parseTranslationUnit(); }
 
 private:
@@ -138,13 +140,13 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseDeclStmt();
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt();
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt();
+  std::optional<std::unique_ptr<Stmt>> parseBreakStmt();
+  std::optional<std::unique_ptr<Stmt>> parseContinueStmt();
   std::optional<std::unique_ptr<Stmt>> parseBlockStmt();
   std::optional<std::unique_ptr<Stmt>> parseIfStmt();
   std::optional<std::unique_ptr<Stmt>> parseWhileStmt();
 
-  // Expressions:
-  // - assignment is lowest precedence and right-associative
-  std::optional<std::unique_ptr<Expr>> parseExpr();      // entry: assignment
+  std::optional<std::unique_ptr<Expr>> parseExpr(); // entry: assignment
   std::optional<std::unique_ptr<Expr>> parseBinary(int minPrec);
   std::optional<std::unique_ptr<Expr>> parseUnary();
   std::optional<std::unique_ptr<Expr>> parsePrimary();

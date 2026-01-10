@@ -46,6 +46,8 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwReturn) return parseReturnStmt();
   if (cur_.kind == TokenKind::KwIf) return parseIfStmt();
   if (cur_.kind == TokenKind::KwWhile) return parseWhileStmt();
+  if (cur_.kind == TokenKind::KwBreak) return parseBreakStmt();
+  if (cur_.kind == TokenKind::KwContinue) return parseContinueStmt();
   if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
 
   // assignment statement: <ident> "=" <expr> ";"
@@ -181,6 +183,24 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
   return std::make_unique<ReturnStmt>(l, std::move(*e));
 }
 
+std::optional<std::unique_ptr<Stmt>> Parser::parseBreakStmt() {
+  SourceLocation l = cur_.loc;
+  if (!expect(TokenKind::KwBreak, "'break'")) return std::nullopt;
+  advance();
+  if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+  advance();
+  return std::make_unique<BreakStmt>(l);
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseContinueStmt() {
+  SourceLocation l = cur_.loc;
+  if (!expect(TokenKind::KwContinue, "'continue'")) return std::nullopt;
+  advance();
+  if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+  advance();
+  return std::make_unique<ContinueStmt>(l);
+}
+
 // -------------------- Expression parsing (stable layered) --------------------
 //
 // Grammar (subset):
@@ -251,8 +271,6 @@ static bool isEqOp(TokenKind k) { return k == TokenKind::EqualEqual || k == Toke
 static bool isAndOp(TokenKind k) { return k == TokenKind::AmpAmp; }
 static bool isOrOp(TokenKind k) { return k == TokenKind::PipePipe; }
 
-static TokenKind curKind(const Parser& p) { (void)p; return TokenKind::Eof; }
-
 std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) {
   // Not used in layered version. Keep for header compatibility.
   return parseUnary();
@@ -260,16 +278,9 @@ std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) {
 
 std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
   // expr := assignment
-  // We'll implement assignment inline here to avoid editing header.
-  // First parse logical_or
-  // logical_or := logical_and ( '||' logical_and )*
   auto parseLogicalAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
-    // equality ( '&&' equality )*
-    // equality := relational ( ( '==' | '!=' ) relational )*
     auto parseRelational = [&]() -> std::optional<std::unique_ptr<Expr>> {
-      // additive ( relop additive )*
       auto parseAdditive = [&]() -> std::optional<std::unique_ptr<Expr>> {
-        // multiplicative ( addop multiplicative )*
         auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
           auto lhs = parseUnary();
           if (!lhs) return std::nullopt;
