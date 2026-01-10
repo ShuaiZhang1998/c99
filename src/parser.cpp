@@ -55,8 +55,27 @@ std::unique_ptr<Expr> Parser::parsePrimary() {
   return nullptr;
 }
 
+std::unique_ptr<Expr> Parser::parseUnary() {
+  // unary := ('+'|'-'|'!'|'~') unary | primary
+  switch (cur_.kind) {
+    case TokenKind::Plus:
+    case TokenKind::Minus:
+    case TokenKind::Bang:
+    case TokenKind::Tilde: {
+      SourceLocation opLoc = cur_.loc;
+      TokenKind op = cur_.kind;
+      advance();
+      auto operand = parseUnary();
+      if (!operand) return nullptr;
+      return std::make_unique<UnaryExpr>(opLoc, op, std::move(operand));
+    }
+    default:
+      return parsePrimary();
+  }
+}
+
 std::unique_ptr<Expr> Parser::parseExpr(int minPrec) {
-  auto lhs = parsePrimary();
+  auto lhs = parseUnary();
   if (!lhs) return nullptr;
 
   while (true) {
@@ -101,7 +120,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
-  // "return" expr ";"
   SourceLocation retLoc = cur_.loc;
   if (!expect(TokenKind::KwReturn, "'return'")) return std::nullopt;
   advance();
@@ -116,7 +134,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseAssignStmt() {
-  // ident "=" expr ";"
   SourceLocation stmtLoc = cur_.loc;
 
   if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
@@ -146,7 +163,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
 }
 
 std::optional<AstTranslationUnit> Parser::parse() {
-  // TU := "int" IDENT "(" ")" "{" { stmt } "}"
   AstTranslationUnit tu;
 
   if (!expect(TokenKind::KwInt, "'int'")) return std::nullopt;

@@ -18,6 +18,9 @@ enum class TokenKind {
 
   Plus, Minus, Star, Slash,
   Assign,
+
+  Bang,   // !
+  Tilde,  // ~
 };
 
 struct Token {

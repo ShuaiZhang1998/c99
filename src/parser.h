@@ -29,6 +29,14 @@ struct VarRefExpr final : Expr {
   VarRefExpr(SourceLocation l, std::string n) : Expr(l), name(std::move(n)) {}
 };
 
+struct UnaryExpr final : Expr {
+  TokenKind op;                // Plus / Minus / Bang / Tilde
+  std::unique_ptr<Expr> operand;
+
+  UnaryExpr(SourceLocation l, TokenKind op, std::unique_ptr<Expr> e)
+      : Expr(l), op(op), operand(std::move(e)) {}
+};
+
 struct BinaryExpr final : Expr {
   TokenKind op;
   std::unique_ptr<Expr> lhs;
@@ -51,7 +59,7 @@ struct Stmt {
 struct DeclStmt final : Stmt {
   std::string name;
   SourceLocation nameLoc{};
-  std::unique_ptr<Expr> initExpr; // nullable (no initializer)
+  std::unique_ptr<Expr> initExpr; // nullable
 
   DeclStmt(SourceLocation l, std::string n, SourceLocation nl, std::unique_ptr<Expr> init)
       : Stmt(l), name(std::move(n)), nameLoc(nl), initExpr(std::move(init)) {}
@@ -91,7 +99,9 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt(); // "return" expr ";"
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // ident "=" expr ";"
 
+  // expressions
   std::unique_ptr<Expr> parseExpr(int minPrec = 0);
+  std::unique_ptr<Expr> parseUnary();
   std::unique_ptr<Expr> parsePrimary();
   int precedence(TokenKind k) const;
 

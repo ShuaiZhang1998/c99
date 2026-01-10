@@ -19,6 +19,11 @@ static void checkExprImpl(Diagnostics& diags, SymTable& syms, const Expr& e) {
     return;
   }
 
+  if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
+    checkExprImpl(diags, syms, *un->operand);
+    return;
+  }
+
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
     checkExprImpl(diags, syms, *bin->lhs);
     checkExprImpl(diags, syms, *bin->rhs);
@@ -33,7 +38,7 @@ static void checkStmtImpl(Diagnostics& diags, SymTable& syms, const Stmt& s) {
       return;
     }
 
-    // C 里：initializer 不能引用正在声明的变量（此处 x 尚未加入 syms）
+    // initializer 不能引用正在声明的变量（此处尚未插入）
     if (d->initExpr) {
       checkExprImpl(diags, syms, *d->initExpr);
     }

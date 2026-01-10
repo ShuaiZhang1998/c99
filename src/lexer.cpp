@@ -83,6 +83,9 @@ Token Lexer::next() {
     case '/': get(); return Token{TokenKind::Slash, "/", loc};
     case '=': get(); return Token{TokenKind::Assign, "=", loc};
 
+    case '!': get(); return Token{TokenKind::Bang, "!", loc};
+    case '~': get(); return Token{TokenKind::Tilde, "~", loc};
+
     default:
       diags_.error(loc, std::string("unexpected character: '") + c + "'");
       get();
