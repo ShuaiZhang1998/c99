@@ -80,6 +80,26 @@ struct ReturnStmt final : Stmt {
   ReturnStmt(SourceLocation l, std::unique_ptr<Expr> e) : Stmt(l), valueExpr(std::move(e)) {}
 };
 
+struct BlockStmt final : Stmt {
+  std::vector<std::unique_ptr<Stmt>> stmts;
+  BlockStmt(SourceLocation l, std::vector<std::unique_ptr<Stmt>> s)
+      : Stmt(l), stmts(std::move(s)) {}
+};
+
+struct IfStmt final : Stmt {
+  std::unique_ptr<Expr> cond;
+  std::unique_ptr<Stmt> thenBranch;
+  std::unique_ptr<Stmt> elseBranch; // nullable
+  IfStmt(SourceLocation l, std::unique_ptr<Expr> c, std::unique_ptr<Stmt> t, std::unique_ptr<Stmt> e)
+      : Stmt(l), cond(std::move(c)), thenBranch(std::move(t)), elseBranch(std::move(e)) {}
+};
+
+struct WhileStmt final : Stmt {
+  std::unique_ptr<Expr> cond;
+  std::unique_ptr<Stmt> body;
+  WhileStmt(SourceLocation l, std::unique_ptr<Expr> c, std::unique_ptr<Stmt> b)
+      : Stmt(l), cond(std::move(c)), body(std::move(b)) {}
+};
 //====================
 // TU
 //====================
@@ -98,7 +118,10 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseDeclStmt();   // "int" ident ["=" expr] ";"
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt(); // "return" expr ";"
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // ident "=" expr ";"
-
+  std::optional<std::unique_ptr<Stmt>> parseIfStmt();     // "if" "(" expr ")" stmt ["else" stmt]
+  std::optional<std::unique_ptr<Stmt>> parseBlockStmt();  // "{" { stmt } "}"
+  std::optional<std::unique_ptr<Stmt>> parseWhileStmt();  // "while" "(" expr ")" stmt
+							  
   // expressions
   std::unique_ptr<Expr> parseExpr(int minPrec = 0);
   std::unique_ptr<Expr> parseUnary();

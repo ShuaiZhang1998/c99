@@ -59,6 +59,24 @@ static void checkStmtImpl(Diagnostics& diags, SymTable& syms, const Stmt& s) {
     checkExprImpl(diags, syms, *r->valueExpr);
     return;
   }
+
+  if (auto* b = dynamic_cast<const BlockStmt*>(&s)) {
+    for (const auto& st : b->stmts) checkStmtImpl(diags, syms, *st);
+    return;
+  }
+
+  if (auto* i = dynamic_cast<const IfStmt*>(&s)) {
+    checkExprImpl(diags, syms, *i->cond);
+    checkStmtImpl(diags, syms, *i->thenBranch);
+    if (i->elseBranch) checkStmtImpl(diags, syms, *i->elseBranch);
+    return;
+  }
+
+  if (auto* w = dynamic_cast<const WhileStmt*>(&s)) {
+    checkExprImpl(diags, syms, *w->cond);
+    checkStmtImpl(diags, syms, *w->body);
+    return;
+}
 }
 
 bool Sema::run(const AstTranslationUnit& tu) {

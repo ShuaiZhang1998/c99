@@ -27,6 +27,9 @@ enum class TokenKind {
   GreaterEqual,// >=
   EqualEqual,  // ==
   BangEqual,   // !=
+  KwIf,
+  KwElse,
+  KwWhile,
 };
 
 struct Token {

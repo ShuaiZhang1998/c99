@@ -46,6 +46,9 @@ Token Lexer::lexIdentifierOrKeyword() {
 
   if (s == "int")    return Token{TokenKind::KwInt, s, loc};
   if (s == "return") return Token{TokenKind::KwReturn, s, loc};
+  if (s == "if")   return Token{TokenKind::KwIf, s, loc};
+  if (s == "else") return Token{TokenKind::KwElse, s, loc};
+  if (s == "while") return Token{TokenKind::KwWhile, s, loc};
   return Token{TokenKind::Identifier, s, loc};
 }
 

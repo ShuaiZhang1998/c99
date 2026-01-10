@@ -164,9 +164,79 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwInt) return parseDeclStmt();
   if (cur_.kind == TokenKind::KwReturn) return parseReturnStmt();
   if (cur_.kind == TokenKind::Identifier) return parseAssignStmt();
-
+  if (cur_.kind == TokenKind::KwIf) return parseIfStmt();
+  if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
+  if (cur_.kind == TokenKind::KwWhile) return parseWhileStmt();
   diags_.error(cur_.loc, "expected statement");
   return std::nullopt;
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseBlockStmt() {
+  // "{" { stmt } "}"
+  SourceLocation l = cur_.loc;
+  if (!expect(TokenKind::LBrace, "'{'")) return std::nullopt;
+  advance();
+
+  std::vector<std::unique_ptr<Stmt>> stmts;
+  while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::Eof) {
+    auto s = parseStmt();
+    if (!s.has_value() || diags_.hasError()) return std::nullopt;
+    stmts.push_back(std::move(*s));
+  }
+
+  if (!expect(TokenKind::RBrace, "'}'")) return std::nullopt;
+  advance();
+  return std::make_unique<BlockStmt>(l, std::move(stmts));
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseIfStmt() {
+  // "if" "(" expr ")" stmt ["else" stmt]
+  SourceLocation ifLoc = cur_.loc;
+  if (!expect(TokenKind::KwIf, "'if'")) return std::nullopt;
+  advance();
+
+  if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+  advance();
+
+  auto cond = parseExpr(/*minPrec=*/0);
+  if (!cond) return std::nullopt;
+
+  if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+  advance();
+
+  auto thenS = parseStmt();
+  if (!thenS.has_value()) return std::nullopt;
+
+  std::unique_ptr<Stmt> elseS = nullptr;
+  if (cur_.kind == TokenKind::KwElse) {
+    advance();
+    auto e = parseStmt();
+    if (!e.has_value()) return std::nullopt;
+    elseS = std::move(*e);
+  }
+
+  return std::make_unique<IfStmt>(ifLoc, std::move(cond), std::move(*thenS), std::move(elseS));
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseWhileStmt() {
+  // "while" "(" expr ")" stmt
+  SourceLocation wLoc = cur_.loc;
+  if (!expect(TokenKind::KwWhile, "'while'")) return std::nullopt;
+  advance();
+
+  if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+  advance();
+
+  auto cond = parseExpr(/*minPrec=*/0);
+  if (!cond) return std::nullopt;
+
+  if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+  advance();
+
+  auto body = parseStmt();
+  if (!body.has_value()) return std::nullopt;
+
+  return std::make_unique<WhileStmt>(wLoc, std::move(cond), std::move(*body));
 }
 
 std::optional<AstTranslationUnit> Parser::parse() {
