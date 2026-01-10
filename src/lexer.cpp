@@ -81,9 +81,26 @@ Token Lexer::next() {
     case '-': get(); return Token{TokenKind::Minus, "-", loc};
     case '*': get(); return Token{TokenKind::Star, "*", loc};
     case '/': get(); return Token{TokenKind::Slash, "/", loc};
-    case '=': get(); return Token{TokenKind::Assign, "=", loc};
-
-    case '!': get(); return Token{TokenKind::Bang, "!", loc};
+    case '=': {
+      get();
+      if (!eof() && peek() == '=') {get(); return Token{TokenKind::EqualEqual, "==", loc}; }
+      return Token{TokenKind::Assign, "=", loc};
+    }
+    case '<': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::LessEqual, "<=", loc}; }
+      return Token{TokenKind::Less, "<", loc};
+    }
+    case '>': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::GreaterEqual, ">=", loc}; }
+      return Token{TokenKind::Greater, ">", loc};
+    }	      
+    case '!': {
+     get();
+     if (!eof() && peek() == '=') { get(); return Token{TokenKind::BangEqual, "!=", loc}; }
+     return Token{TokenKind::Bang, "!", loc};
+    }	      
     case '~': get(); return Token{TokenKind::Tilde, "~", loc};
 
     default:

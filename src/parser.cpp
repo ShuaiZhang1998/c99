@@ -22,6 +22,13 @@ int Parser::precedence(TokenKind k) const {
     case TokenKind::Plus:
     case TokenKind::Minus:
       return 10;
+    case TokenKind::Less:
+    case TokenKind::Greater:
+    case TokenKind::LessEqual:
+    case TokenKind::GreaterEqual:
+    case TokenKind::EqualEqual:
+    case TokenKind::BangEqual:
+      return 5;
     default:
       return -1;
   }

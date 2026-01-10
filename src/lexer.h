@@ -21,6 +21,12 @@ enum class TokenKind {
 
   Bang,   // !
   Tilde,  // ~
+  Less,        // <
+  Greater,     // >
+  LessEqual,   // <=
+  GreaterEqual,// >=
+  EqualEqual,  // ==
+  BangEqual,   // !=
 };
 
 struct Token {

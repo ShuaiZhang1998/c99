@@ -77,13 +77,32 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
     llvm::Value* L = emitExpr(env, *bin->lhs);
     llvm::Value* R = emitExpr(env, *bin->rhs);
-
     switch (bin->op) {
       case TokenKind::Plus:  return env.b.CreateAdd(L, R, "addtmp");
       case TokenKind::Minus: return env.b.CreateSub(L, R, "subtmp");
       case TokenKind::Star:  return env.b.CreateMul(L, R, "multmp");
       case TokenKind::Slash: return env.b.CreateSDiv(L, R, "divtmp");
-      default: break;
+
+      case TokenKind::Less:
+      case TokenKind::Greater:
+      case TokenKind::LessEqual:
+      case TokenKind::GreaterEqual:
+      case TokenKind::EqualEqual:
+      case TokenKind::BangEqual: {
+        llvm::Value* cmp = nullptr;
+        switch (bin->op) {
+          case TokenKind::Less:         cmp = env.b.CreateICmpSLT(L, R, "cmptmp"); break;
+          case TokenKind::Greater:      cmp = env.b.CreateICmpSGT(L, R, "cmptmp"); break;
+          case TokenKind::LessEqual:    cmp = env.b.CreateICmpSLE(L, R, "cmptmp"); break;
+          case TokenKind::GreaterEqual: cmp = env.b.CreateICmpSGE(L, R, "cmptmp"); break;
+          case TokenKind::EqualEqual:   cmp = env.b.CreateICmpEQ(L, R, "cmptmp"); break;
+          case TokenKind::BangEqual:    cmp = env.b.CreateICmpNE(L, R, "cmptmp"); break;
+          default: break;
+        }
+        return env.b.CreateZExt(cmp, llvm::Type::getInt32Ty(env.ctx), "booltmp");
+     }
+     default:
+       break;
     }
   }
 
