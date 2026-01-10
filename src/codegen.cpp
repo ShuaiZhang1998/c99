@@ -64,7 +64,15 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
 
 static void emitStmt(CGEnv& env, const Stmt& s) {
   if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
-    env.locals[d->name] = createEntryAlloca(env, d->name);
+    // allocate
+    auto* slot = createEntryAlloca(env, d->name);
+    env.locals[d->name] = slot;
+
+    // initializer: store
+    if (d->initExpr) {
+      llvm::Value* initV = emitExpr(env, *d->initExpr);
+      env.b.CreateStore(initV, slot);
+    }
     return;
   }
 

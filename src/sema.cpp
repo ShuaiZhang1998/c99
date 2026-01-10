@@ -30,9 +30,15 @@ static void checkStmtImpl(Diagnostics& diags, SymTable& syms, const Stmt& s) {
   if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
     if (syms.declared.count(d->name)) {
       diags.error(d->nameLoc, "redefinition of '" + d->name + "'");
-    } else {
-      syms.declared.insert(d->name);
+      return;
     }
+
+    // C 里：initializer 不能引用正在声明的变量（此处 x 尚未加入 syms）
+    if (d->initExpr) {
+      checkExprImpl(diags, syms, *d->initExpr);
+    }
+
+    syms.declared.insert(d->name);
     return;
   }
 

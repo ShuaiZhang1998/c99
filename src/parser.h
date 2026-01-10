@@ -47,17 +47,22 @@ struct Stmt {
   virtual ~Stmt() = default;
 };
 
+// Decl: int x;  or  int x = <expr>;
 struct DeclStmt final : Stmt {
-  std::string name;        // int <name>;
-  SourceLocation nameLoc{}; // for better diagnostics
-  DeclStmt(SourceLocation l, std::string n, SourceLocation nl)
-      : Stmt(l), name(std::move(n)), nameLoc(nl) {}
+  std::string name;
+  SourceLocation nameLoc{};
+  std::unique_ptr<Expr> initExpr; // nullable (no initializer)
+
+  DeclStmt(SourceLocation l, std::string n, SourceLocation nl, std::unique_ptr<Expr> init)
+      : Stmt(l), name(std::move(n)), nameLoc(nl), initExpr(std::move(init)) {}
 };
 
+// Assign: x = <expr>;
 struct AssignStmt final : Stmt {
-  std::string name;         // <name> = <expr>;
+  std::string name;
   SourceLocation nameLoc{};
   std::unique_ptr<Expr> valueExpr;
+
   AssignStmt(SourceLocation l, std::string n, SourceLocation nl, std::unique_ptr<Expr> e)
       : Stmt(l), name(std::move(n)), nameLoc(nl), valueExpr(std::move(e)) {}
 };
@@ -82,7 +87,7 @@ public:
 
 private:
   std::optional<std::unique_ptr<Stmt>> parseStmt();
-  std::optional<std::unique_ptr<Stmt>> parseDeclStmt();   // "int" ident ";"
+  std::optional<std::unique_ptr<Stmt>> parseDeclStmt();   // "int" ident ["=" expr] ";"
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt(); // "return" expr ";"
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // ident "=" expr ";"
 

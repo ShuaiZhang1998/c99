@@ -77,7 +77,7 @@ std::unique_ptr<Expr> Parser::parseExpr(int minPrec) {
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
-  // "int" ident ";"
+  // "int" ident ["=" expr] ";"
   SourceLocation kwLoc = cur_.loc;
   if (!expect(TokenKind::KwInt, "'int'")) return std::nullopt;
   advance();
@@ -87,10 +87,17 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
   std::string name = cur_.text;
   advance();
 
+  std::unique_ptr<Expr> init = nullptr;
+  if (cur_.kind == TokenKind::Assign) {
+    advance();
+    init = parseExpr(/*minPrec=*/0);
+    if (!init) return std::nullopt;
+  }
+
   if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
   advance();
 
-  return std::make_unique<DeclStmt>(kwLoc, std::move(name), nameLoc);
+  return std::make_unique<DeclStmt>(kwLoc, std::move(name), nameLoc, std::move(init));
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
