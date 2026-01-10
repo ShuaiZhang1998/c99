@@ -35,6 +35,17 @@ static llvm::Value* emitVarRef(CGEnv& env, const VarRefExpr& v) {
   return env.b.CreateLoad(it->second->getAllocatedType(), it->second, v.name + ".val");
 }
 
+static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* vI32) {
+  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
+  llvm::Value* zero = llvm::ConstantInt::get(i32, 0, true);
+  return env.b.CreateICmpNE(vI32, zero, "tobool");
+}
+
+static llvm::Value* boolI1ToI32(CGEnv& env, llvm::Value* vI1) {
+  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
+  return env.b.CreateZExt(vI1, i32, "booltmp");
+}
+
 static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
   auto* i32 = llvm::Type::getInt32Ty(env.ctx);
   llvm::Value* x = emitExpr(env, *u.operand);
@@ -58,6 +69,79 @@ static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
   return llvm::UndefValue::get(i32);
 }
 
+static llvm::Value* emitLogicalAnd(CGEnv& env, const Expr& lhsE, const Expr& rhsE) {
+  llvm::Function* F = env.fn;
+
+  llvm::BasicBlock* rhsBB   = llvm::BasicBlock::Create(env.ctx, "land.rhs", F);
+  llvm::BasicBlock* falseBB = llvm::BasicBlock::Create(env.ctx, "land.false", F);
+  llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(env.ctx, "land.end");
+
+  llvm::Value* lhsV = emitExpr(env, lhsE);  // i32
+  llvm::Value* lhsB = asBoolI1(env, lhsV);  // i1
+  env.b.CreateCondBr(lhsB, rhsBB, falseBB);
+
+  env.b.SetInsertPoint(falseBB);
+  env.b.CreateBr(mergeBB);
+
+  env.b.SetInsertPoint(rhsBB);
+  llvm::Value* rhsV = emitExpr(env, rhsE);
+  llvm::Value* rhsB = asBoolI1(env, rhsV);
+  env.b.CreateBr(mergeBB);
+
+  F->getBasicBlockList().push_back(mergeBB);
+  env.b.SetInsertPoint(mergeBB);
+
+  llvm::PHINode* phi = env.b.CreatePHI(llvm::Type::getInt1Ty(env.ctx), 2, "landphi");
+  phi->addIncoming(llvm::ConstantInt::getFalse(env.ctx), falseBB);
+  phi->addIncoming(rhsB, rhsBB);
+
+  return boolI1ToI32(env, phi);
+}
+
+static llvm::Value* emitLogicalOr(CGEnv& env, const Expr& lhsE, const Expr& rhsE) {
+  llvm::Function* F = env.fn;
+
+  llvm::BasicBlock* rhsBB   = llvm::BasicBlock::Create(env.ctx, "lor.rhs", F);
+  llvm::BasicBlock* trueBB  = llvm::BasicBlock::Create(env.ctx, "lor.true", F);
+  llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(env.ctx, "lor.end");
+
+  llvm::Value* lhsV = emitExpr(env, lhsE);
+  llvm::Value* lhsB = asBoolI1(env, lhsV);
+  env.b.CreateCondBr(lhsB, trueBB, rhsBB);
+
+  env.b.SetInsertPoint(trueBB);
+  env.b.CreateBr(mergeBB);
+
+  env.b.SetInsertPoint(rhsBB);
+  llvm::Value* rhsV = emitExpr(env, rhsE);
+  llvm::Value* rhsB = asBoolI1(env, rhsV);
+  env.b.CreateBr(mergeBB);
+
+  F->getBasicBlockList().push_back(mergeBB);
+  env.b.SetInsertPoint(mergeBB);
+
+  llvm::PHINode* phi = env.b.CreatePHI(llvm::Type::getInt1Ty(env.ctx), 2, "lorphi");
+  phi->addIncoming(llvm::ConstantInt::getTrue(env.ctx), trueBB);
+  phi->addIncoming(rhsB, rhsBB);
+
+  return boolI1ToI32(env, phi);
+}
+
+static llvm::Value* emitAssignExpr(CGEnv& env, const AssignExpr& a) {
+  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
+  llvm::Value* rhsV = emitExpr(env, *a.rhs);
+
+  auto it = env.locals.find(a.name);
+  if (it == env.locals.end()) {
+    // Sema should have rejected this; keep IR valid-ish
+    return rhsV ? rhsV : llvm::UndefValue::get(i32);
+  }
+
+  env.b.CreateStore(rhsV, it->second);
+  // C assignment expression evaluates to the stored value
+  return rhsV;
+}
+
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   auto* i32 = llvm::Type::getInt32Ty(env.ctx);
 
@@ -69,11 +153,18 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     return emitVarRef(env, *vr);
   }
 
+  if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
+    return emitAssignExpr(env, *asn);
+  }
+
   if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
     return emitUnary(env, *un);
   }
 
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
+    if (bin->op == TokenKind::AmpAmp) return emitLogicalAnd(env, *bin->lhs, *bin->rhs);
+    if (bin->op == TokenKind::PipePipe) return emitLogicalOr(env, *bin->lhs, *bin->rhs);
+
     llvm::Value* L = emitExpr(env, *bin->lhs);
     llvm::Value* R = emitExpr(env, *bin->rhs);
 
@@ -121,12 +212,8 @@ static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
 }
 
 static bool emitIf(CGEnv& env, const IfStmt& iff) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
   llvm::Value* condV = emitExpr(env, *iff.cond);
-
-  // i32 -> i1: cond != 0
-  llvm::Value* zero = llvm::ConstantInt::get(i32, 0, true);
-  llvm::Value* condI1 = env.b.CreateICmpNE(condV, zero, "ifcond");
+  llvm::Value* condI1 = asBoolI1(env, condV);
 
   llvm::Function* F = env.fn;
   llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(env.ctx, "if.then", F);
@@ -143,46 +230,35 @@ static bool emitIf(CGEnv& env, const IfStmt& iff) {
   bool thenTerminated = emitStmt(env, *iff.thenBranch);
   if (!thenTerminated) env.b.CreateBr(mergeBB);
 
-  bool elseTerminated = false;
   if (hasElse) {
     env.b.SetInsertPoint(elseBB);
-    elseTerminated = emitStmt(env, *iff.elseBranch);
+    bool elseTerminated = emitStmt(env, *iff.elseBranch);
     if (!elseTerminated) env.b.CreateBr(mergeBB);
   }
 
-  // Continue at merge
   F->getBasicBlockList().push_back(mergeBB);
   env.b.SetInsertPoint(mergeBB);
   return false;
 }
 
 static bool emitWhile(CGEnv& env, const WhileStmt& w) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
   llvm::Function* F = env.fn;
 
-  // Create blocks
   llvm::BasicBlock* condBB = llvm::BasicBlock::Create(env.ctx, "while.cond", F);
   llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "while.body", F);
   llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "while.end");
 
-  // Jump from current block to cond
   env.b.CreateBr(condBB);
 
-  // Emit condition
   env.b.SetInsertPoint(condBB);
   llvm::Value* condV = emitExpr(env, *w.cond);
-  llvm::Value* zero = llvm::ConstantInt::get(i32, 0, true);
-  llvm::Value* condI1 = env.b.CreateICmpNE(condV, zero, "whilecond");
+  llvm::Value* condI1 = asBoolI1(env, condV);
   env.b.CreateCondBr(condI1, bodyBB, endBB);
 
-  // Emit body
   env.b.SetInsertPoint(bodyBB);
   bool bodyTerminated = emitStmt(env, *w.body);
-  if (!bodyTerminated) {
-    env.b.CreateBr(condBB); // backedge
-  }
+  if (!bodyTerminated) env.b.CreateBr(condBB);
 
-  // Continue at end
   F->getBasicBlockList().push_back(endBB);
   env.b.SetInsertPoint(endBB);
   return false;

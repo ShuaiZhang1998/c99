@@ -1,22 +1,32 @@
 #pragma once
-#include <string>
-#include <optional>
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <string>
+#include <utility>
 #include <vector>
 
-#include "lexer.h"
 #include "diag.h"
+#include "lexer.h"
 
 namespace c99cc {
 
-//====================
-// AST: Expressions
-//====================
-struct Expr {
-  SourceLocation loc{};
-  explicit Expr(SourceLocation l) : loc(l) {}
+// -------------------- AST --------------------
+
+struct Node {
+  SourceLocation loc;
+  explicit Node(SourceLocation l) : loc(l) {}
+  virtual ~Node() = default;
+};
+
+struct Expr : Node {
+  using Node::Node;
   virtual ~Expr() = default;
+};
+
+struct Stmt : Node {
+  using Node::Node;
+  virtual ~Stmt() = default;
 };
 
 struct IntLiteralExpr final : Expr {
@@ -30,54 +40,52 @@ struct VarRefExpr final : Expr {
 };
 
 struct UnaryExpr final : Expr {
-  TokenKind op;                // Plus / Minus / Bang / Tilde
+  TokenKind op;
   std::unique_ptr<Expr> operand;
-
-  UnaryExpr(SourceLocation l, TokenKind op, std::unique_ptr<Expr> e)
-      : Expr(l), op(op), operand(std::move(e)) {}
+  UnaryExpr(SourceLocation l, TokenKind o, std::unique_ptr<Expr> e)
+      : Expr(l), op(o), operand(std::move(e)) {}
 };
 
 struct BinaryExpr final : Expr {
   TokenKind op;
   std::unique_ptr<Expr> lhs;
   std::unique_ptr<Expr> rhs;
-
-  BinaryExpr(SourceLocation l, TokenKind op, std::unique_ptr<Expr> lhs, std::unique_ptr<Expr> rhs)
-      : Expr(l), op(op), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+  BinaryExpr(SourceLocation l, TokenKind o, std::unique_ptr<Expr> a, std::unique_ptr<Expr> b)
+      : Expr(l), op(o), lhs(std::move(a)), rhs(std::move(b)) {}
 };
 
-//====================
-// AST: Statements
-//====================
-struct Stmt {
-  SourceLocation loc{};
-  explicit Stmt(SourceLocation l) : loc(l) {}
-  virtual ~Stmt() = default;
+// NEW: assignment expression: <ident> "=" <expr>
+// - lowest precedence
+// - right associative
+// - value is RHS
+struct AssignExpr final : Expr {
+  std::string name;
+  SourceLocation nameLoc;
+  std::unique_ptr<Expr> rhs;
+  AssignExpr(SourceLocation l, std::string n, SourceLocation nLoc, std::unique_ptr<Expr> r)
+      : Expr(l), name(std::move(n)), nameLoc(nLoc), rhs(std::move(r)) {}
 };
 
-// Decl: int x;  or  int x = <expr>;
+// statements
 struct DeclStmt final : Stmt {
   std::string name;
-  SourceLocation nameLoc{};
+  SourceLocation nameLoc;
   std::unique_ptr<Expr> initExpr; // nullable
-
-  DeclStmt(SourceLocation l, std::string n, SourceLocation nl, std::unique_ptr<Expr> init)
-      : Stmt(l), name(std::move(n)), nameLoc(nl), initExpr(std::move(init)) {}
+  DeclStmt(SourceLocation l, std::string n, SourceLocation nLoc, std::unique_ptr<Expr> init)
+      : Stmt(l), name(std::move(n)), nameLoc(nLoc), initExpr(std::move(init)) {}
 };
 
-// Assign: x = <expr>;
 struct AssignStmt final : Stmt {
   std::string name;
-  SourceLocation nameLoc{};
+  SourceLocation nameLoc;
   std::unique_ptr<Expr> valueExpr;
-
-  AssignStmt(SourceLocation l, std::string n, SourceLocation nl, std::unique_ptr<Expr> e)
-      : Stmt(l), name(std::move(n)), nameLoc(nl), valueExpr(std::move(e)) {}
+  AssignStmt(SourceLocation l, std::string n, SourceLocation nLoc, std::unique_ptr<Expr> v)
+      : Stmt(l), name(std::move(n)), nameLoc(nLoc), valueExpr(std::move(v)) {}
 };
 
 struct ReturnStmt final : Stmt {
   std::unique_ptr<Expr> valueExpr;
-  ReturnStmt(SourceLocation l, std::unique_ptr<Expr> e) : Stmt(l), valueExpr(std::move(e)) {}
+  ReturnStmt(SourceLocation l, std::unique_ptr<Expr> v) : Stmt(l), valueExpr(std::move(v)) {}
 };
 
 struct BlockStmt final : Stmt {
@@ -100,40 +108,49 @@ struct WhileStmt final : Stmt {
   WhileStmt(SourceLocation l, std::unique_ptr<Expr> c, std::unique_ptr<Stmt> b)
       : Stmt(l), cond(std::move(c)), body(std::move(b)) {}
 };
-//====================
-// TU
-//====================
+
 struct AstTranslationUnit {
   std::string funcName;
   std::vector<std::unique_ptr<Stmt>> body;
 };
 
+// -------------------- Parser --------------------
+
 class Parser {
 public:
-  Parser(Lexer& lex, Diagnostics& diags);
-  std::optional<AstTranslationUnit> parse();
+  // Keep old API (for main.cpp)
+  Parser(Lexer& lex, Diagnostics& diags) : lex_(lex), diags_(diags) { cur_ = lex_.next(); }
+
+  // Keep old API (for main.cpp)
+  std::optional<AstTranslationUnit> parse() { return parseTranslationUnit(); }
 
 private:
-  std::optional<std::unique_ptr<Stmt>> parseStmt();
-  std::optional<std::unique_ptr<Stmt>> parseDeclStmt();   // "int" ident ["=" expr] ";"
-  std::optional<std::unique_ptr<Stmt>> parseReturnStmt(); // "return" expr ";"
-  std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // ident "=" expr ";"
-  std::optional<std::unique_ptr<Stmt>> parseIfStmt();     // "if" "(" expr ")" stmt ["else" stmt]
-  std::optional<std::unique_ptr<Stmt>> parseBlockStmt();  // "{" { stmt } "}"
-  std::optional<std::unique_ptr<Stmt>> parseWhileStmt();  // "while" "(" expr ")" stmt
-							  
-  // expressions
-  std::unique_ptr<Expr> parseExpr(int minPrec = 0);
-  std::unique_ptr<Expr> parseUnary();
-  std::unique_ptr<Expr> parsePrimary();
-  int precedence(TokenKind k) const;
-
-  bool expect(TokenKind k, const char* what);
-  void advance();
-
   Lexer& lex_;
   Diagnostics& diags_;
   Token cur_;
+
+  void advance() { cur_ = lex_.next(); }
+  bool expect(TokenKind k, const char* what);
+
+  std::optional<AstTranslationUnit> parseTranslationUnit();
+
+  std::optional<std::unique_ptr<Stmt>> parseStmt();
+  std::optional<std::unique_ptr<Stmt>> parseDeclStmt();
+  std::optional<std::unique_ptr<Stmt>> parseAssignStmt();
+  std::optional<std::unique_ptr<Stmt>> parseReturnStmt();
+  std::optional<std::unique_ptr<Stmt>> parseBlockStmt();
+  std::optional<std::unique_ptr<Stmt>> parseIfStmt();
+  std::optional<std::unique_ptr<Stmt>> parseWhileStmt();
+
+  // Expressions:
+  // - assignment is lowest precedence and right-associative
+  std::optional<std::unique_ptr<Expr>> parseExpr();      // entry: assignment
+  std::optional<std::unique_ptr<Expr>> parseBinary(int minPrec);
+  std::optional<std::unique_ptr<Expr>> parseUnary();
+  std::optional<std::unique_ptr<Expr>> parsePrimary();
+
+  int precedence(TokenKind k) const;
+  bool isBinaryOp(TokenKind k) const;
 };
 
 } // namespace c99cc

@@ -30,6 +30,8 @@ enum class TokenKind {
   KwIf,
   KwElse,
   KwWhile,
+  AmpAmp,   // &&
+  PipePipe, // ||
 };
 
 struct Token {
