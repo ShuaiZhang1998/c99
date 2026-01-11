@@ -39,6 +39,16 @@ struct VarRefExpr final : Expr {
   VarRefExpr(SourceLocation l, std::string n) : Expr(l), name(std::move(n)) {}
 };
 
+struct CallExpr final : Expr {
+  std::string callee;
+  SourceLocation calleeLoc;
+  std::vector<std::unique_ptr<Expr>> args;
+  CallExpr(SourceLocation l, std::string c, SourceLocation cLoc, std::vector<std::unique_ptr<Expr>> a)
+      : Expr(l), callee(std::move(c)), calleeLoc(cLoc), args(std::move(a)) {}
+};
+
+
+
 struct UnaryExpr final : Expr {
   TokenKind op;
   std::unique_ptr<Expr> operand;
@@ -146,11 +156,21 @@ struct ForStmt final : Stmt {
       : Stmt(l), init(std::move(i)), cond(std::move(c)), inc(std::move(in)), body(std::move(b)) {}
 };
 
-struct AstTranslationUnit {
-  std::string funcName;
+struct Param {
+  std::string name;
+  SourceLocation nameLoc;
+};
+
+struct FunctionDef {
+  std::string name;
+  SourceLocation nameLoc;
+  std::vector<Param> params;
   std::vector<std::unique_ptr<Stmt>> body;
 };
 
+struct AstTranslationUnit {
+  std::vector<FunctionDef> functions;
+};
 // -------------------- Parser --------------------
 
 class Parser {
@@ -167,7 +187,8 @@ private:
   bool expect(TokenKind k, const char* what);
 
   std::optional<AstTranslationUnit> parseTranslationUnit();
-
+  std::optional<FunctionDef> parseFunctionDef();
+  std::optional<std::vector<Param>> parseParamList(); // parses inside (...)
   std::optional<std::unique_ptr<Stmt>> parseStmt();
   std::optional<std::unique_ptr<Stmt>> parseDeclStmt();
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt();
@@ -180,7 +201,9 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseDoWhileStmt();
   std::optional<std::unique_ptr<Stmt>> parseForStmt();
 
-  std::optional<std::unique_ptr<Expr>> parseExpr(); // entry: assignment
+  std::optional<std::unique_ptr<Expr>> parseExpr();           // entry: comma-expression
+  std::optional<std::unique_ptr<Expr>> parseAssignmentExpr(); // entry: assignment (NO comma)
+
   std::optional<std::unique_ptr<Expr>> parseUnary();
   std::optional<std::unique_ptr<Expr>> parsePrimary();
 

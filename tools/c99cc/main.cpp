@@ -85,8 +85,9 @@ int main(int argc, char** argv) {
 
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "-o" && i + 1 < argc) outPath = argv[++i];
-    else {
+    if (a == "-o" && i + 1 < argc) {
+      outPath = argv[++i];
+    } else {
       std::cerr << "unknown arg: " << a << "\n";
       return 1;
     }
@@ -101,6 +102,19 @@ int main(int argc, char** argv) {
   auto tuOpt = parser.parse();
   if (!tuOpt || diags.hasError()) {
     diags.printAll(inputPath, source);
+    return 1;
+  }
+
+  // Optional but recommended: ensure there is a main() function
+  bool hasMain = false;
+  for (const auto& fn : tuOpt->functions) {
+    if (fn.name == "main") {
+      hasMain = true;
+      break;
+    }
+  }
+  if (!hasMain) {
+    std::cerr << "error: no 'main' function defined\n";
     return 1;
   }
 

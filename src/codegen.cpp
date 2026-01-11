@@ -25,16 +25,29 @@ struct CGEnv {
   llvm::LLVMContext& ctx;
   llvm::Module& mod;
   llvm::IRBuilder<>& b;
+
   llvm::Function* fn = nullptr;
 
+  // function table: name -> llvm::Function*
+  std::unordered_map<std::string, llvm::Function*> functions;
+
+  // local scopes: name -> alloca
   std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> scopes;
-  std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loops; // {break, continue}
+
+  // loop stack: {breakTarget, continueTarget}
+  std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loops;
 
   llvm::Type* i32Ty() { return llvm::Type::getInt32Ty(ctx); }
   llvm::Type* i1Ty() { return llvm::Type::getInt1Ty(ctx); }
 
   void pushScope() { scopes.emplace_back(); }
   void popScope() { scopes.pop_back(); }
+
+  void resetFunctionState(llvm::Function* f) {
+    fn = f;
+    scopes.clear();
+    loops.clear();
+  }
 
   llvm::AllocaInst* lookup(const std::string& name) {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
@@ -70,12 +83,17 @@ static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
 static bool emitStmt(CGEnv& env, const Stmt& s);
 
+// -------------------- Expr --------------------
+
 static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
   llvm::Value* opnd = emitExpr(env, *u.operand);
   switch (u.op) {
-    case TokenKind::Plus:  return opnd;
-    case TokenKind::Minus: return env.b.CreateSub(i32Const(env, 0), opnd, "neg");
-    case TokenKind::Tilde: return env.b.CreateNot(opnd, "bitnot");
+    case TokenKind::Plus:
+      return opnd;
+    case TokenKind::Minus:
+      return env.b.CreateSub(i32Const(env, 0), opnd, "neg");
+    case TokenKind::Tilde:
+      return env.b.CreateNot(opnd, "bitnot");
     case TokenKind::Bang: {
       llvm::Value* b = asBoolI1(env, opnd);
       llvm::Value* inv = env.b.CreateNot(b, "lnot");
@@ -148,8 +166,11 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
     case TokenKind::Minus: return env.b.CreateSub(L, R, "sub");
     case TokenKind::Star:  return env.b.CreateMul(L, R, "mul");
     case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
+
     case TokenKind::Comma:
-        return R;
+      // value of comma expr is RHS (LHS evaluated for side effects already)
+      return R;
+
     case TokenKind::Less: {
       auto* c = env.b.CreateICmpSLT(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
@@ -184,25 +205,45 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
     return i32Const(env, lit->value);
   }
+
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
     llvm::AllocaInst* slot = env.lookup(vr->name);
     if (!slot) return i32Const(env, 0);
     return env.b.CreateLoad(env.i32Ty(), slot, vr->name + ".val");
   }
+
+  if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+    llvm::Function* callee = nullptr;
+    auto it = env.functions.find(call->callee);
+    if (it != env.functions.end()) callee = it->second;
+    if (!callee) return i32Const(env, 0);
+
+    std::vector<llvm::Value*> argsV;
+    argsV.reserve(call->args.size());
+    for (const auto& a : call->args) argsV.push_back(emitExpr(env, *a));
+
+    return env.b.CreateCall(callee, argsV, "calltmp");
+  }
+
   if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
     return emitUnary(env, *un);
   }
+
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
     return emitBinary(env, *bin);
   }
+
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
     llvm::AllocaInst* slot = env.lookup(asn->name);
     llvm::Value* rhsV = emitExpr(env, *asn->rhs);
     if (slot) env.b.CreateStore(rhsV, slot);
     return rhsV;
   }
+
   return i32Const(env, 0);
 }
+
+// -------------------- Stmt --------------------
 
 static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
   env.pushScope();
@@ -234,13 +275,13 @@ static bool emitIf(CGEnv& env, const IfStmt& s) {
 
   env.b.SetInsertPoint(thenBB);
   bool thenTerm = emitStmt(env, *s.thenBranch);
-  if (!thenTerm) env.b.CreateBr(endBB);
+  if (!thenTerm && !env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(endBB);
 
   if (s.elseBranch) {
     F->getBasicBlockList().push_back(elseBB);
     env.b.SetInsertPoint(elseBB);
     bool elseTerm = emitStmt(env, *s.elseBranch);
-    if (!elseTerm) env.b.CreateBr(endBB);
+    if (!elseTerm && !env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(endBB);
   }
 
   F->getBasicBlockList().push_back(endBB);
@@ -266,7 +307,7 @@ static bool emitWhile(CGEnv& env, const WhileStmt& s) {
   env.loops.push_back({endBB, condBB}); // continue => cond
   bool bodyTerm = emitStmt(env, *s.body);
   env.loops.pop_back();
-  if (!bodyTerm) env.b.CreateBr(condBB);
+  if (!bodyTerm && !env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(condBB);
 
   F->getBasicBlockList().push_back(endBB);
   env.b.SetInsertPoint(endBB);
@@ -286,7 +327,7 @@ static bool emitDoWhile(CGEnv& env, const DoWhileStmt& s) {
   env.loops.push_back({endBB, condBB}); // continue => cond
   bool bodyTerm = emitStmt(env, *s.body);
   env.loops.pop_back();
-  if (!bodyTerm) env.b.CreateBr(condBB);
+  if (!bodyTerm && !env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(condBB);
 
   env.b.SetInsertPoint(condBB);
   llvm::Value* condV = emitExpr(env, *s.cond);
@@ -324,7 +365,7 @@ static bool emitFor(CGEnv& env, const ForStmt& s) {
   env.loops.push_back({endBB, incBB}); // continue => inc
   bool bodyTerm = emitStmt(env, *s.body);
   env.loops.pop_back();
-  if (!bodyTerm) env.b.CreateBr(incBB);
+  if (!bodyTerm && !env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(incBB);
 
   env.b.SetInsertPoint(incBB);
   if (s.inc) (void)emitExpr(env, *s.inc);
@@ -350,6 +391,7 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     return false;
   }
 
+  // legacy AssignStmt (if still produced somewhere)
   if (auto* a = dynamic_cast<const AssignStmt*>(&s)) {
     llvm::AllocaInst* slot = env.lookup(a->name);
     llvm::Value* rhsV = emitExpr(env, *a->valueExpr);
@@ -363,12 +405,18 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   }
 
   if (auto* br = dynamic_cast<const BreakStmt*>(&s)) {
-    if (!env.loops.empty()) { env.b.CreateBr(env.loops.back().first); return true; }
+    if (!env.loops.empty()) {
+      env.b.CreateBr(env.loops.back().first);
+      return true;
+    }
     return false;
   }
 
   if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
-    if (!env.loops.empty()) { env.b.CreateBr(env.loops.back().second); return true; }
+    if (!env.loops.empty()) {
+      env.b.CreateBr(env.loops.back().second);
+      return true;
+    }
     return false;
   }
 
@@ -378,20 +426,20 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   if (auto* fo  = dynamic_cast<const ForStmt*>(&s)) return emitFor(env, *fo);
 
   if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
-    (void)emitExpr(env, *es->expr); // 计算但丢弃结果
-    return false;                  // 表示没终止控制流（按你现有约定）
-  }
-
-  if (auto* emp = dynamic_cast<const EmptyStmt*>(&s)) {
-    (void)emp;
+    (void)emitExpr(env, *es->expr);
     return false;
   }
 
+  if (dynamic_cast<const EmptyStmt*>(&s)) {
+    return false;
+  }
 
   return false;
 }
 
 } // namespace
+
+// -------------------- CodeGen entry --------------------
 
 std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     llvm::LLVMContext& ctx,
@@ -401,26 +449,63 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   llvm::IRBuilder<> builder(ctx);
   CGEnv env{ctx, *mod, builder};
 
-  auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), false);
-  env.fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, tu.funcName, mod.get());
+  // 1) predeclare all functions
+  for (const auto& fn : tu.functions) {
+    std::vector<llvm::Type*> paramTys(fn.params.size(), llvm::Type::getInt32Ty(ctx));
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), paramTys, false);
+    llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, fn.name, mod.get());
+    env.functions[fn.name] = F;
 
-  llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", env.fn);
-  builder.SetInsertPoint(entry);
-
-  env.pushScope();
-
-  bool terminated = false;
-  for (const auto& st : tu.body) {
-    terminated = emitStmt(env, *st);
-    if (terminated) break;
+    // name LLVM args for readability
+    unsigned i = 0;
+    for (auto& arg : F->args()) {
+      if (i < fn.params.size()) arg.setName(fn.params[i].name);
+      ++i;
+    }
   }
 
-  if (!builder.GetInsertBlock()->getTerminator()) {
-    builder.CreateRet(i32Const(env, 0));
+  // 2) emit each function body
+  for (const auto& fnAst : tu.functions) {
+    llvm::Function* F = env.functions[fnAst.name];
+    assert(F && "function must have been declared");
+
+    // fresh function body (in case module reused)
+    // (LLVM allows reusing F but not here; ensure it's empty)
+    if (!F->empty()) {
+      // If already has body, skip to avoid verifier issues in dev workflow.
+      continue;
+    }
+
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", F);
+    builder.SetInsertPoint(entry);
+
+    env.resetFunctionState(F);
+    env.pushScope(); // function scope
+
+    // lower parameters: alloca in entry + store
+    unsigned idx = 0;
+    for (auto& arg : F->args()) {
+      std::string pname = (idx < fnAst.params.size()) ? fnAst.params[idx].name : std::string("arg");
+      llvm::AllocaInst* slot = createEntryAlloca(env, pname);
+      env.insertLocal(pname, slot);
+      builder.CreateStore(&arg, slot);
+      ++idx;
+    }
+
+    bool terminated = false;
+    for (const auto& st : fnAst.body) {
+      terminated = emitStmt(env, *st);
+      if (terminated) break;
+    }
+
+    if (!builder.GetInsertBlock()->getTerminator()) {
+      builder.CreateRet(i32Const(env, 0));
+    }
+
+    env.popScope();
+    llvm::verifyFunction(*F);
   }
 
-  env.popScope();
-  llvm::verifyFunction(*env.fn);
   return mod;
 }
 
