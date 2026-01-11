@@ -79,6 +79,16 @@ static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
   return env.b.CreateICmpNE(v, i32Const(env, 0), "tobool");
 }
 
+static size_t arityOfProto(const FunctionProto& p) {
+  return p.params.size();
+}
+
+static const FunctionProto* getProto(const TopLevelItem& item) {
+  if (auto* d = std::get_if<FunctionDecl>(&item)) return &d->proto;
+  if (auto* f = std::get_if<FunctionDef>(&item)) return &f->proto;
+  return nullptr;
+}
+
 // forward decl
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
 static bool emitStmt(CGEnv& env, const Stmt& s);
@@ -168,7 +178,6 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
     case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
 
     case TokenKind::Comma:
-      // value of comma expr is RHS (LHS evaluated for side effects already)
       return R;
 
     case TokenKind::Less: {
@@ -244,6 +253,8 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
 }
 
 // -------------------- Stmt --------------------
+
+static bool emitStmt(CGEnv& env, const Stmt& s);
 
 static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
   env.pushScope();
@@ -391,7 +402,7 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     return false;
   }
 
-  // legacy AssignStmt (if still produced somewhere)
+  // legacy AssignStmt
   if (auto* a = dynamic_cast<const AssignStmt*>(&s)) {
     llvm::AllocaInst* slot = env.lookup(a->name);
     llvm::Value* rhsV = emitExpr(env, *a->valueExpr);
@@ -430,9 +441,7 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     return false;
   }
 
-  if (dynamic_cast<const EmptyStmt*>(&s)) {
-    return false;
-  }
+  if (dynamic_cast<const EmptyStmt*>(&s)) return false;
 
   return false;
 }
@@ -449,30 +458,41 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   llvm::IRBuilder<> builder(ctx);
   CGEnv env{ctx, *mod, builder};
 
-  // 1) predeclare all functions
-  for (const auto& fn : tu.functions) {
-    std::vector<llvm::Type*> paramTys(fn.params.size(), llvm::Type::getInt32Ty(ctx));
-    auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), paramTys, false);
-    llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, fn.name, mod.get());
-    env.functions[fn.name] = F;
+  // 1) Predeclare all functions from prototypes (decls + defs)
+  for (const auto& item : tu.items) {
+    const FunctionProto* p = getProto(item);
+    if (!p) continue;
 
-    // name LLVM args for readability
+    const std::string& name = p->name;
+    size_t arity = arityOfProto(*p);
+
+    // if already declared, skip (Sema guarantees signature consistency)
+    if (env.functions.count(name)) continue;
+
+    std::vector<llvm::Type*> paramTys(arity, llvm::Type::getInt32Ty(ctx));
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), paramTys, false);
+    llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
+    env.functions[name] = F;
+
+    // name args if we have parameter names (definition may have names even if earlier decl didn't)
     unsigned i = 0;
     for (auto& arg : F->args()) {
-      if (i < fn.params.size()) arg.setName(fn.params[i].name);
+      if (i < p->params.size() && p->params[i].name.has_value()) arg.setName(*p->params[i].name);
       ++i;
     }
   }
 
-  // 2) emit each function body
-  for (const auto& fnAst : tu.functions) {
-    llvm::Function* F = env.functions[fnAst.name];
+  // 2) Emit bodies only for FunctionDef
+  for (const auto& item : tu.items) {
+    auto* def = std::get_if<FunctionDef>(&item);
+    if (!def) continue;
+
+    const FunctionProto& p = def->proto;
+    llvm::Function* F = env.functions[p.name];
     assert(F && "function must have been declared");
 
-    // fresh function body (in case module reused)
-    // (LLVM allows reusing F but not here; ensure it's empty)
     if (!F->empty()) {
-      // If already has body, skip to avoid verifier issues in dev workflow.
+      // already emitted (shouldn't happen if Sema prevents redefinition)
       continue;
     }
 
@@ -482,18 +502,20 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     env.resetFunctionState(F);
     env.pushScope(); // function scope
 
-    // lower parameters: alloca in entry + store
+    // lower parameters: allocate only those with names; still need to accept unnamed params
     unsigned idx = 0;
     for (auto& arg : F->args()) {
-      std::string pname = (idx < fnAst.params.size()) ? fnAst.params[idx].name : std::string("arg");
-      llvm::AllocaInst* slot = createEntryAlloca(env, pname);
-      env.insertLocal(pname, slot);
-      builder.CreateStore(&arg, slot);
+      if (idx < p.params.size() && p.params[idx].name.has_value()) {
+        std::string pname = *p.params[idx].name;
+        llvm::AllocaInst* slot = createEntryAlloca(env, pname);
+        env.insertLocal(pname, slot);
+        builder.CreateStore(&arg, slot);
+      }
       ++idx;
     }
 
     bool terminated = false;
-    for (const auto& st : fnAst.body) {
+    for (const auto& st : def->body) {
       terminated = emitStmt(env, *st);
       if (terminated) break;
     }

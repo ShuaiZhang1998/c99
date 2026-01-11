@@ -11,21 +11,37 @@ namespace {
 
 using Scope = std::unordered_set<std::string>;
 using ScopeStack = std::vector<Scope>;
-using FnSigMap = std::unordered_map<std::string, size_t>; // name -> arity
 
-static bool isDeclared(const ScopeStack& scopes, const std::string& name) {
+static bool isDeclaredVar(const ScopeStack& scopes, const std::string& name) {
   for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
     if (it->count(name)) return true;
   }
   return false;
 }
 
-static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnSigMap& fns, const Expr& e);
+// ---- function table ----
+
+struct FnInfo {
+  size_t arity = 0;
+  bool hasDecl = false;
+  bool hasDef = false;
+  SourceLocation firstLoc{};
+};
+
+using FnTable = std::unordered_map<std::string, FnInfo>;
+
+static bool sameSignature(const FnInfo& info, size_t arity) {
+  return info.arity == arity;
+}
+
+// ---- expr/stmt checking ----
+
+static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const Expr& e);
 
 static void checkStmtImpl(
     Diagnostics& diags,
     ScopeStack& scopes,
-    const FnSigMap& fns,
+    const FnTable& fns,
     int loopDepth,
     const Stmt& s) {
   if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) {
@@ -55,15 +71,12 @@ static void checkStmtImpl(
   }
 
   if (auto* fo = dynamic_cast<const ForStmt*>(&s)) {
-    // for introduces a new scope for init declarations (matches your existing behavior/tests)
+    // for introduces its own scope (matches your existing tests)
     scopes.push_back({});
-
     if (fo->init) checkStmtImpl(diags, scopes, fns, loopDepth, *fo->init);
     if (fo->cond) checkExprImpl(diags, scopes, fns, *fo->cond);
     if (fo->inc)  checkExprImpl(diags, scopes, fns, *fo->inc);
-
     checkStmtImpl(diags, scopes, fns, loopDepth + 1, *fo->body);
-
     scopes.pop_back();
     return;
   }
@@ -79,7 +92,6 @@ static void checkStmtImpl(
   }
 
   if (auto* decl = dynamic_cast<const DeclStmt*>(&s)) {
-    // "redefinition" should be checked in current scope only
     auto& cur = scopes.back();
     if (cur.count(decl->name)) {
       diags.error(decl->nameLoc, "redefinition of '" + decl->name + "'");
@@ -87,20 +99,17 @@ static void checkStmtImpl(
     }
 
     // initializer cannot reference the variable being declared:
-    // mimic your original rule by temporarily checking without inserting the name.
-    if (decl->initExpr) {
-      checkExprImpl(diags, scopes, fns, *decl->initExpr);
-      // if initExpr references decl->name, checkExprImpl will see it as undeclared (good)
-    }
+    // keep behavior by checking before insertion.
+    if (decl->initExpr) checkExprImpl(diags, scopes, fns, *decl->initExpr);
 
     cur.insert(decl->name);
     return;
   }
 
   if (auto* as = dynamic_cast<const AssignStmt*>(&s)) {
-    // you may still have AssignStmt in AST; support it
+    // legacy stmt (if still exists somewhere)
     checkExprImpl(diags, scopes, fns, *as->valueExpr);
-    if (!isDeclared(scopes, as->name)) {
+    if (!isDeclaredVar(scopes, as->name)) {
       diags.error(as->nameLoc, "assignment to undeclared identifier '" + as->name + "'");
     }
     return;
@@ -116,16 +125,14 @@ static void checkStmtImpl(
     return;
   }
 
-  if (dynamic_cast<const EmptyStmt*>(&s)) {
-    return;
-  }
+  if (dynamic_cast<const EmptyStmt*>(&s)) return;
 }
 
-static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnSigMap& fns, const Expr& e) {
+static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const Expr& e) {
   if (dynamic_cast<const IntLiteralExpr*>(&e)) return;
 
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
-    if (!isDeclared(scopes, vr->name)) {
+    if (!isDeclaredVar(scopes, vr->name)) {
       diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
     }
     return;
@@ -135,18 +142,16 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnSigMap
     auto it = fns.find(call->callee);
     if (it == fns.end()) {
       diags.error(call->calleeLoc, "call to undeclared function '" + call->callee + "'");
-      // still check args for more errors
       for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, *a);
       return;
     }
 
-    size_t expected = it->second;
+    size_t expected = it->second.arity;
     size_t have = call->args.size();
     if (expected != have) {
       diags.error(call->calleeLoc,
                   "expected " + std::to_string(expected) +
                       " arguments, have " + std::to_string(have));
-      // continue to check args
     }
 
     for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, *a);
@@ -155,7 +160,7 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnSigMap
 
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
     checkExprImpl(diags, scopes, fns, *asn->rhs);
-    if (!isDeclared(scopes, asn->name)) {
+    if (!isDeclaredVar(scopes, asn->name)) {
       diags.error(asn->nameLoc, "assignment to undeclared identifier '" + asn->name + "'");
     }
     return;
@@ -171,43 +176,88 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnSigMap
     checkExprImpl(diags, scopes, fns, *bin->rhs);
     return;
   }
+}
 
-  // If future Expr kinds exist, silently ignore for now (project minimalism).
+static size_t protoArity(const FunctionProto& p) {
+  return p.params.size();
+}
+
+static void addOrCheckFn(
+    Diagnostics& diags,
+    FnTable& fns,
+    const std::string& name,
+    SourceLocation nameLoc,
+    size_t arity,
+    bool isDef) {
+  auto it = fns.find(name);
+  if (it == fns.end()) {
+    FnInfo info;
+    info.arity = arity;
+    info.firstLoc = nameLoc;
+    info.hasDecl = !isDef;
+    info.hasDef = isDef;
+    fns.emplace(name, info);
+    return;
+  }
+
+  FnInfo& info = it->second;
+
+  // signature mismatch
+  if (!sameSignature(info, arity)) {
+    diags.error(nameLoc,
+                "conflicting types for '" + name +
+                    "' (previous declaration has different parameter count)");
+    return;
+  }
+
+  // same signature: update decl/def flags
+  if (isDef) {
+    if (info.hasDef) {
+      diags.error(nameLoc, "redefinition of '" + name + "'");
+      return;
+    }
+    info.hasDef = true;
+  } else {
+    info.hasDecl = true; // repeated decl ok
+  }
 }
 
 } // namespace
 
 bool Sema::run(const AstTranslationUnit& tu) {
-  // 1) collect function signatures + detect duplicates
-  FnSigMap fns;
-  {
-    std::unordered_set<std::string> seen;
-    for (const auto& fn : tu.functions) {
-      if (seen.count(fn.name)) {
-        diags_.error(fn.nameLoc, "redefinition of '" + fn.name + "'");
-        continue;
-      }
-      seen.insert(fn.name);
-      fns[fn.name] = fn.params.size();
+  // 1) collect all function prototypes (decls + defs)
+  FnTable fns;
+  for (const auto& item : tu.items) {
+    if (auto* d = std::get_if<FunctionDecl>(&item)) {
+      const auto& p = d->proto;
+      addOrCheckFn(diags_, fns, p.name, p.nameLoc, protoArity(p), /*isDef=*/false);
+    } else if (auto* def = std::get_if<FunctionDef>(&item)) {
+      const auto& p = def->proto;
+      addOrCheckFn(diags_, fns, p.name, p.nameLoc, protoArity(p), /*isDef=*/true);
     }
   }
 
-  // 2) check each function
-  for (const auto& fn : tu.functions) {
+  // 2) check bodies of function definitions
+  for (const auto& item : tu.items) {
+    auto* def = std::get_if<FunctionDef>(&item);
+    if (!def) continue;
+
     ScopeStack scopes;
     scopes.push_back({}); // function scope
 
-    // parameters as locals
-    for (const auto& p : fn.params) {
+    // parameters as locals ONLY if they have names
+    for (const auto& prm : def->proto.params) {
+      if (!prm.name.has_value()) continue;
+      const std::string& pname = *prm.name;
       auto& cur = scopes.back();
-      if (cur.count(p.name)) {
-        diags_.error(p.nameLoc, "redefinition of '" + p.name + "'");
+      if (cur.count(pname)) {
+        diags_.error(prm.nameLoc, "redefinition of '" + pname + "'");
         continue;
       }
-      cur.insert(p.name);
+      cur.insert(pname);
     }
 
-    for (const auto& st : fn.body) checkStmtImpl(diags_, scopes, fns, /*loopDepth=*/0, *st);
+    for (const auto& st : def->body) checkStmtImpl(diags_, scopes, fns, /*loopDepth=*/0, *st);
   }
 
   return !diags_.hasError();

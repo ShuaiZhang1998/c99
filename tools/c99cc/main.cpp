@@ -74,6 +74,18 @@ static void writeObjOrDie(llvm::Module& module, const std::string& objPath) {
   dest.flush();
 }
 
+static bool tuHasMain(const c99cc::AstTranslationUnit& tu) {
+  // count both decl and def as "main exists"
+  for (const auto& item : tu.items) {
+    if (auto* d = std::get_if<c99cc::FunctionDecl>(&item)) {
+      if (d->proto.name == "main") return true;
+    } else if (auto* f = std::get_if<c99cc::FunctionDef>(&item)) {
+      if (f->proto.name == "main") return true;
+    }
+  }
+  return false;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: c99cc <input.c> [-o <output>]\n";
@@ -85,9 +97,8 @@ int main(int argc, char** argv) {
 
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "-o" && i + 1 < argc) {
-      outPath = argv[++i];
-    } else {
+    if (a == "-o" && i + 1 < argc) outPath = argv[++i];
+    else {
       std::cerr << "unknown arg: " << a << "\n";
       return 1;
     }
@@ -105,15 +116,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // Optional but recommended: ensure there is a main() function
-  bool hasMain = false;
-  for (const auto& fn : tuOpt->functions) {
-    if (fn.name == "main") {
-      hasMain = true;
-      break;
-    }
-  }
-  if (!hasMain) {
+  // Optional but helpful: fail early if no main declared/defined
+  if (!tuHasMain(*tuOpt)) {
     std::cerr << "error: no 'main' function defined\n";
     return 1;
   }

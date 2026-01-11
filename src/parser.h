@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "diag.h"
@@ -47,8 +48,6 @@ struct CallExpr final : Expr {
       : Expr(l), callee(std::move(c)), calleeLoc(cLoc), args(std::move(a)) {}
 };
 
-
-
 struct UnaryExpr final : Expr {
   TokenKind op;
   std::unique_ptr<Expr> operand;
@@ -64,7 +63,6 @@ struct BinaryExpr final : Expr {
       : Expr(l), op(o), lhs(std::move(a)), rhs(std::move(b)) {}
 };
 
-// assignment expression: <ident> "=" <expr>
 struct AssignExpr final : Expr {
   std::string name;
   SourceLocation nameLoc;
@@ -96,9 +94,8 @@ struct ReturnStmt final : Stmt {
 };
 
 struct ExprStmt final : Stmt {
-  std::unique_ptr<Expr> expr; // nullable? 这里我们让它非空；空语句用 nullptr 也行，看你风格
-  ExprStmt(SourceLocation l, std::unique_ptr<Expr> e)
-      : Stmt(l), expr(std::move(e)) {}
+  std::unique_ptr<Expr> expr;
+  ExprStmt(SourceLocation l, std::unique_ptr<Expr> e) : Stmt(l), expr(std::move(e)) {}
 };
 
 struct EmptyStmt final : Stmt {
@@ -141,11 +138,6 @@ struct DoWhileStmt final : Stmt {
       : Stmt(l), body(std::move(b)), cond(std::move(c)) {}
 };
 
-
-// for(init; cond; inc) body
-// - init: nullable, may be DeclStmt or AssignStmt (in this milestone)
-// - cond: nullable (null => true)
-// - inc : nullable (expression, usually assignment expr)
 struct ForStmt final : Stmt {
   std::unique_ptr<Stmt> init;   // nullable
   std::unique_ptr<Expr> cond;   // nullable
@@ -156,21 +148,37 @@ struct ForStmt final : Stmt {
       : Stmt(l), init(std::move(i)), cond(std::move(c)), inc(std::move(in)), body(std::move(b)) {}
 };
 
+// ---- functions / TU ----
+
 struct Param {
-  std::string name;
-  SourceLocation nameLoc;
+  // param name is optional (prototype can omit names)
+  std::optional<std::string> name;
+  SourceLocation nameLoc; // valid iff name.has_value()
+  SourceLocation loc;     // location of 'int' keyword for this param
 };
 
-struct FunctionDef {
+struct FunctionProto {
   std::string name;
   SourceLocation nameLoc;
   std::vector<Param> params;
+};
+
+struct FunctionDecl {
+  FunctionProto proto;
+  SourceLocation semiLoc; // location of ';'
+};
+
+struct FunctionDef {
+  FunctionProto proto;
   std::vector<std::unique_ptr<Stmt>> body;
 };
 
+using TopLevelItem = std::variant<FunctionDecl, FunctionDef>;
+
 struct AstTranslationUnit {
-  std::vector<FunctionDef> functions;
+  std::vector<TopLevelItem> items;
 };
+
 // -------------------- Parser --------------------
 
 class Parser {
@@ -187,11 +195,14 @@ private:
   bool expect(TokenKind k, const char* what);
 
   std::optional<AstTranslationUnit> parseTranslationUnit();
-  std::optional<FunctionDef> parseFunctionDef();
-  std::optional<std::vector<Param>> parseParamList(); // parses inside (...)
+  std::optional<TopLevelItem> parseTopLevelItem();
+  std::optional<FunctionProto> parseFunctionProto();         // parses: int name '(' params ')'
+  std::optional<std::vector<Param>> parseParamList();        // parses inside (...) ; allows nameless params
+  std::optional<FunctionDef> parseFunctionDefAfterProto(FunctionProto proto);
+
   std::optional<std::unique_ptr<Stmt>> parseStmt();
   std::optional<std::unique_ptr<Stmt>> parseDeclStmt();
-  std::optional<std::unique_ptr<Stmt>> parseAssignStmt();
+  std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // legacy, may be unused
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt();
   std::optional<std::unique_ptr<Stmt>> parseBreakStmt();
   std::optional<std::unique_ptr<Stmt>> parseContinueStmt();
@@ -201,13 +212,12 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseDoWhileStmt();
   std::optional<std::unique_ptr<Stmt>> parseForStmt();
 
-  std::optional<std::unique_ptr<Expr>> parseExpr();           // entry: comma-expression
-  std::optional<std::unique_ptr<Expr>> parseAssignmentExpr(); // entry: assignment (NO comma)
-
+  std::optional<std::unique_ptr<Expr>> parseExpr();           // comma-expression
+  std::optional<std::unique_ptr<Expr>> parseAssignmentExpr(); // assignment (NO comma)
   std::optional<std::unique_ptr<Expr>> parseUnary();
   std::optional<std::unique_ptr<Expr>> parsePrimary();
 
-  // kept for compatibility with older code, but the current parser uses layered parsing.
+  // Compatibility (not used)
   std::optional<std::unique_ptr<Expr>> parseBinary(int /*minPrec*/);
 
   int precedence(TokenKind k) const;

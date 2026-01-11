@@ -10,25 +10,29 @@ bool Parser::expect(TokenKind k, const char* what) {
   return false;
 }
 
-// -------------------- TU / function --------------------
+// -------------------- TU / top-level --------------------
 
 std::optional<std::vector<Param>> Parser::parseParamList() {
-  // params := ε | 'int' ident (',' 'int' ident)*
+  // params := ε | 'int' [ident]? (',' 'int' [ident]?)*
   std::vector<Param> params;
 
-  if (cur_.kind == TokenKind::RParen) {
-    return params; // empty
-  }
+  if (cur_.kind == TokenKind::RParen) return params; // empty
 
   while (true) {
     if (!expect(TokenKind::KwInt, "'int'")) return std::nullopt;
+    Param p;
+    p.loc = cur_.loc;
     advance();
 
-    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
-    Param p;
-    p.name = cur_.text;
-    p.nameLoc = cur_.loc;
-    advance();
+    if (cur_.kind == TokenKind::Identifier) {
+      p.name = cur_.text;
+      p.nameLoc = cur_.loc;
+      advance();
+    } else {
+      p.name = std::nullopt;
+      p.nameLoc = SourceLocation{}; // unused
+    }
+
     params.push_back(std::move(p));
 
     if (cur_.kind == TokenKind::Comma) {
@@ -45,15 +49,15 @@ std::optional<std::vector<Param>> Parser::parseParamList() {
   return params;
 }
 
-std::optional<FunctionDef> Parser::parseFunctionDef() {
-  // int <name> '(' params ')' '{' stmts '}'
+std::optional<FunctionProto> Parser::parseFunctionProto() {
+  // int <name> '(' params ')'
   if (!expect(TokenKind::KwInt, "'int'")) return std::nullopt;
   advance();
 
   if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
-  FunctionDef fn;
-  fn.name = cur_.text;
-  fn.nameLoc = cur_.loc;
+  FunctionProto proto;
+  proto.name = cur_.text;
+  proto.nameLoc = cur_.loc;
   advance();
 
   if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
@@ -61,33 +65,62 @@ std::optional<FunctionDef> Parser::parseFunctionDef() {
 
   auto params = parseParamList();
   if (!params) return std::nullopt;
-  fn.params = std::move(*params);
+  proto.params = std::move(*params);
 
   if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
   advance();
 
+  return proto;
+}
+
+std::optional<FunctionDef> Parser::parseFunctionDefAfterProto(FunctionProto proto) {
+  // expects current token is '{'
   if (!expect(TokenKind::LBrace, "'{'")) return std::nullopt;
   advance();
+
+  FunctionDef def;
+  def.proto = std::move(proto);
 
   while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::Eof) {
     auto s = parseStmt();
     if (!s) return std::nullopt;
-    fn.body.push_back(std::move(*s));
+    def.body.push_back(std::move(*s));
   }
 
   if (!expect(TokenKind::RBrace, "'}'")) return std::nullopt;
   advance();
+  return def;
+}
 
-  return fn;
+std::optional<TopLevelItem> Parser::parseTopLevelItem() {
+  auto proto = parseFunctionProto();
+  if (!proto) return std::nullopt;
+
+  if (cur_.kind == TokenKind::Semicolon) {
+    FunctionDecl decl;
+    decl.proto = std::move(*proto);
+    decl.semiLoc = cur_.loc;
+    advance();
+    return TopLevelItem{std::move(decl)};
+  }
+
+  if (cur_.kind == TokenKind::LBrace) {
+    auto def = parseFunctionDefAfterProto(std::move(*proto));
+    if (!def) return std::nullopt;
+    return TopLevelItem{std::move(*def)};
+  }
+
+  diags_.error(cur_.loc, "expected ';' or '{' after function prototype");
+  return std::nullopt;
 }
 
 std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
   AstTranslationUnit tu;
 
   while (cur_.kind != TokenKind::Eof) {
-    auto fn = parseFunctionDef();
-    if (!fn) return std::nullopt;
-    tu.functions.push_back(std::move(*fn));
+    auto item = parseTopLevelItem();
+    if (!item) return std::nullopt;
+    tu.items.push_back(std::move(*item));
   }
 
   return tu;
@@ -106,59 +139,13 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwContinue) return parseContinueStmt();
   if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
 
-  // empty stmt
   if (cur_.kind == TokenKind::Semicolon) {
     SourceLocation l = cur_.loc;
     advance();
     return std::make_unique<EmptyStmt>(l);
   }
 
-  // assignment stmt starts with identifier and then '='
-  if (cur_.kind == TokenKind::Identifier) {
-    // lookahead not available; parseAssignStmt expects identifier '=' ...
-    // But expression stmt can also start with identifier (like call).
-    // We disambiguate by trying to parse "ident = ..." pattern manually.
-    Token save = cur_;
-    advance();
-    if (cur_.kind == TokenKind::Assign) {
-      // rollback by reconstructing: easier is to re-run parseAssignStmt by keeping saved.
-      // We'll implement assign stmt parsing inline to avoid lexer rollback.
-      // We already consumed ident, and see '=':
-      SourceLocation l = save.loc;
-      std::string name = save.text;
-      SourceLocation nameLoc = save.loc;
-      advance(); // consume '='
-
-      auto rhs = parseExpr();
-      if (!rhs) return std::nullopt;
-      if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
-      advance();
-      return std::make_unique<AssignStmt>(l, std::move(name), nameLoc, std::move(*rhs));
-    }
-
-    // not assignment stmt. We need to parse as expression stmt.
-    // We have consumed one token too far (the identifier).
-    // Without lexer rewind, handle by building a VarRefExpr/CallExpr with the consumed identifier
-    // and continue parsing from current token.
-    // We'll parse the "primary starting from already-consumed identifier" here:
-    // - if current token is '(' => parse call args and build CallExpr
-    // - else => build VarRefExpr
-    // then parse rest of expression by feeding it into the assignment-expression / comma-expression
-    // pipeline. Simplest: create a small helper to parse "post-identifier primary" then continue.
-    // We'll implement a limited re-entry: build an Expr* as lhs and then parse remaining
-    // using the same precedence ladder by temporarily stitching is hard. So instead:
-    // We reconstitute the identifier into a fake token stream is not possible.
-    //
-    // Therefore, to keep parser simple and correct, we DO NOT consume identifier here.
-    // We'll fall back to generic expr-stmt path by restoring cur_ to saved and
-    // using a minimal "rewind" via a member cache.
-    //
-    // But we can't rewind lexer. So we must avoid consuming here.
-    //
-    // => Solution: do not try to disambiguate here. Let generic expr stmt parse.
-  }
-
-  // Generic expression statement: <expr> ';'
+  // expression statement
   SourceLocation l = cur_.loc;
   auto e = parseExpr();
   if (!e) return std::nullopt;
@@ -168,7 +155,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
-  // int <name> ["=" expr] ";"
   SourceLocation l = cur_.loc;
   if (!expect(TokenKind::KwInt, "'int'")) return std::nullopt;
   advance();
@@ -193,7 +179,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseAssignStmt() {
-  // <name> "=" expr ";"
+  // legacy path; not used by parseStmt() anymore
   SourceLocation l = cur_.loc;
 
   if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
@@ -346,16 +332,12 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
   if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
   advance();
 
-  // init:
-  //   empty ';'
-  //   decl:  int x [= expr] ;
-  //   expr-stmt: <expr> ;
   std::unique_ptr<Stmt> init = nullptr;
 
   if (cur_.kind == TokenKind::Semicolon) {
     advance();
   } else if (cur_.kind == TokenKind::KwInt) {
-    auto d = parseDeclStmt(); // consumes trailing ';'
+    auto d = parseDeclStmt();
     if (!d) return std::nullopt;
     init = std::move(*d);
   } else {
@@ -369,7 +351,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
     init = std::make_unique<ExprStmt>(loc, std::move(*e));
   }
 
-  // cond (optional) until ';'
   std::unique_ptr<Expr> cond = nullptr;
   if (cur_.kind == TokenKind::Semicolon) {
     advance();
@@ -381,7 +362,6 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
     advance();
   }
 
-  // inc (optional) until ')'
   std::unique_ptr<Expr> inc = nullptr;
   if (cur_.kind == TokenKind::RParen) {
     advance();
@@ -399,20 +379,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
   return std::make_unique<ForStmt>(fLoc, std::move(init), std::move(cond), std::move(inc), std::move(*body));
 }
 
-// -------------------- Expression parsing (layered) --------------------
-//
-// expr            := assignment (',' assignment)*
-// assignment      := logical_or ( '=' assignment )?
-// logical_or      := logical_and ( '||' logical_and )*
-// logical_and     := equality ( '&&' equality )*
-// equality        := relational ( ( '==' | '!=' ) relational )*
-// relational      := additive ( ( '<' | '<=' | '>' | '>=' ) additive )*
-// additive        := multiplicative ( ( '+' | '-' ) multiplicative )*
-// multiplicative  := unary ( ( '*' | '/' ) unary )*
-// unary           := ( '+' | '-' | '!' | '~' ) unary | primary
-// primary         := integer | identifier | call | '(' expr ')'
-//
-// NOTE: call arguments are parsed by parseAssignmentExpr() (no top-level comma).
+// -------------------- Expression parsing --------------------
 
 std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
   if (cur_.kind == TokenKind::IntegerLiteral) {
@@ -427,14 +394,13 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     std::string name = cur_.text;
     advance();
 
-    // call: ident '(' args ')'
     if (cur_.kind == TokenKind::LParen) {
       advance(); // '('
       std::vector<std::unique_ptr<Expr>> args;
 
       if (cur_.kind != TokenKind::RParen) {
         while (true) {
-          auto a = parseAssignmentExpr(); // IMPORTANT: no comma-expr here
+          auto a = parseAssignmentExpr(); // IMPORTANT: no comma-expr
           if (!a) return std::nullopt;
           args.push_back(std::move(*a));
 
@@ -484,10 +450,8 @@ std::optional<std::unique_ptr<Expr>> Parser::parseUnary() {
   return parsePrimary();
 }
 
-// Keep these for compatibility with parser.h (even if unused)
-std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) {
-  return parseUnary();
-}
+// compatibility (unused)
+std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) { return parseUnary(); }
 
 int Parser::precedence(TokenKind k) const {
   switch (k) {
@@ -505,9 +469,7 @@ int Parser::precedence(TokenKind k) const {
   }
 }
 
-bool Parser::isBinaryOp(TokenKind k) const {
-  return precedence(k) >= 0;
-}
+bool Parser::isBinaryOp(TokenKind k) const { return precedence(k) >= 0; }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseAssignmentExpr() {
   auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
@@ -595,7 +557,6 @@ std::optional<std::unique_ptr<Expr>> Parser::parseAssignmentExpr() {
     return lhs;
   };
 
-  // assignment := logical_or ( '=' assignment )?
   auto lhs = parseLogicalOr();
   if (!lhs) return std::nullopt;
 
@@ -621,7 +582,6 @@ std::optional<std::unique_ptr<Expr>> Parser::parseAssignmentExpr() {
 }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
-  // comma-expression: assignment (',' assignment)*
   auto lhs = parseAssignmentExpr();
   if (!lhs) return std::nullopt;
 
