@@ -1,4 +1,5 @@
 #include "parser.h"
+#include <functional>
 
 namespace c99cc {
 
@@ -51,9 +52,23 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwBreak) return parseBreakStmt();
   if (cur_.kind == TokenKind::KwContinue) return parseContinueStmt();
   if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
-
-  // assignment statement: <ident> "=" <expr> ";"
   if (cur_.kind == TokenKind::Identifier) return parseAssignStmt();
+  // empty statement: ';'
+  if (cur_.kind == TokenKind::Semicolon) {
+    SourceLocation loc = cur_.loc;
+    advance();
+    return std::make_unique<EmptyStmt>(loc);
+  }
+
+  // expression statement: <expr> ';'
+  {
+    SourceLocation loc = cur_.loc;
+    auto e = parseExpr();              // 你已有 parseExpr
+    if (!e) return std::nullopt;
+    if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+    advance();
+    return std::make_unique<ExprStmt>(loc, std::move(*e));
+  }
 
   diags_.error(cur_.loc, "expected statement");
   return std::nullopt;
@@ -173,29 +188,16 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
     if (!d) return std::nullopt;
     init = std::move(*d);
   } else {
-    // parse expression and require it to be AssignExpr (minimal)
+    // init 可以是任意表达式（支持逗号表达式），例如：i = 0, sum = 0;
+    SourceLocation loc = cur_.loc;
     auto e = parseExpr();
     if (!e) return std::nullopt;
-
-    auto* asn = dynamic_cast<AssignExpr*>(e->get());
-    if (!asn) {
-      diags_.error(cur_.loc, "expected assignment expression in for-init");
-      return std::nullopt;
-    }
 
     if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
     advance();
 
-    // turn AssignExpr into AssignStmt
-    std::string name = asn->name;
-    SourceLocation nameLoc = asn->nameLoc;
-    std::unique_ptr<Expr> rhs = std::move(asn->rhs);
-    SourceLocation loc = asn->loc;
-
-    init = std::make_unique<AssignStmt>(loc, std::move(name), nameLoc, std::move(rhs));
-
+    init = std::make_unique<ExprStmt>(loc, std::move(*e));
   }
-
   // cond (optional) until ';'
   std::unique_ptr<Expr> cond = nullptr;
   if (cur_.kind == TokenKind::Semicolon) {
@@ -444,38 +446,75 @@ std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
     return lhs;
   };
 
-  auto lhs = parseLogicalAnd();
+  auto parseLogicalOr = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseLogicalAnd();
+    if (!lhs) return std::nullopt;
+
+    while (isOrOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseLogicalAnd();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  // assignment := logical_or ( '=' assignment )?
+  // 右结合：a=b=c 解析为 a=(b=c)
+  std::function<std::optional<std::unique_ptr<Expr>>()> parseAssignment =
+      [&]() -> std::optional<std::unique_ptr<Expr>> {
+        auto lhs = parseLogicalOr();
+        if (!lhs) return std::nullopt;
+
+        if (cur_.kind == TokenKind::Assign) {
+          auto* vr = dynamic_cast<VarRefExpr*>(lhs->get());
+          if (!vr) {
+            diags_.error(cur_.loc, "expected identifier on left-hand side of assignment");
+            return std::nullopt;
+          }
+          SourceLocation nameLoc = vr->loc;
+          std::string name = vr->name;
+          SourceLocation assignLoc = cur_.loc;
+
+          advance();
+          auto rhs = parseAssignment(); // 关键：递归调用自己，实现右结合
+          if (!rhs) return std::nullopt;
+
+          return std::make_unique<AssignExpr>(assignLoc, std::move(name), nameLoc, std::move(*rhs));
+        }
+
+        return lhs;
+      };
+
+  // comma-expression: assignment (',' assignment)*
+  auto lhs = parseAssignment();
   if (!lhs) return std::nullopt;
 
-  while (isOrOp(cur_.kind)) {
-    TokenKind op = cur_.kind;
+  while (cur_.kind == TokenKind::Comma) {
+    SourceLocation commaLoc = cur_.loc;
+    TokenKind op = cur_.kind;      // Comma
     SourceLocation l = (*lhs)->loc;
     advance();
-    auto rhs = parseLogicalAnd();
+
+    // 逗号后必须是一个表达式；如果直接收尾，给更符合测试的诊断
+    if (cur_.kind == TokenKind::RParen || cur_.kind == TokenKind::Semicolon ||
+        cur_.kind == TokenKind::RBrace || cur_.kind == TokenKind::Eof) {
+      diags_.error(commaLoc, "expected expression");
+      return std::nullopt;
+    }  
+
+    auto rhs = parseAssignment();
     if (!rhs) return std::nullopt;
+
     lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
   }
 
-  // assignment := logical_or ( '=' assignment )?
-  if (cur_.kind == TokenKind::Assign) {
-    auto* vr = dynamic_cast<VarRefExpr*>(lhs->get());
-    if (!vr) {
-      diags_.error(cur_.loc, "expected identifier on left-hand side of assignment");
-      return std::nullopt;
-    }
-    SourceLocation nameLoc = vr->loc;
-    std::string name = vr->name;
-    SourceLocation assignLoc = cur_.loc;
-
-    advance();
-    auto rhs = parseExpr(); // right associative
-    if (!rhs) return std::nullopt;
-
-    return std::make_unique<AssignExpr>(assignLoc, std::move(name), nameLoc, std::move(*rhs));
-  }
 
   return lhs;
 }
+
 
 int Parser::precedence(TokenKind k) const {
   switch (k) {

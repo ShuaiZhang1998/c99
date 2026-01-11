@@ -148,7 +148,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
     case TokenKind::Minus: return env.b.CreateSub(L, R, "sub");
     case TokenKind::Star:  return env.b.CreateMul(L, R, "mul");
     case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
-
+    case TokenKind::Comma:
+        return R;
     case TokenKind::Less: {
       auto* c = env.b.CreateICmpSLT(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
@@ -375,6 +376,17 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   if (auto* wh  = dynamic_cast<const WhileStmt*>(&s)) return emitWhile(env, *wh);
   if (auto* dw  = dynamic_cast<const DoWhileStmt*>(&s)) return emitDoWhile(env, *dw);
   if (auto* fo  = dynamic_cast<const ForStmt*>(&s)) return emitFor(env, *fo);
+
+  if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
+    (void)emitExpr(env, *es->expr); // 计算但丢弃结果
+    return false;                  // 表示没终止控制流（按你现有约定）
+  }
+
+  if (auto* emp = dynamic_cast<const EmptyStmt*>(&s)) {
+    (void)emp;
+    return false;
+  }
+
 
   return false;
 }

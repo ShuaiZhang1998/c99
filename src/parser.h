@@ -85,6 +85,16 @@ struct ReturnStmt final : Stmt {
   ReturnStmt(SourceLocation l, std::unique_ptr<Expr> v) : Stmt(l), valueExpr(std::move(v)) {}
 };
 
+struct ExprStmt final : Stmt {
+  std::unique_ptr<Expr> expr; // nullable? 这里我们让它非空；空语句用 nullptr 也行，看你风格
+  ExprStmt(SourceLocation l, std::unique_ptr<Expr> e)
+      : Stmt(l), expr(std::move(e)) {}
+};
+
+struct EmptyStmt final : Stmt {
+  explicit EmptyStmt(SourceLocation l) : Stmt(l) {}
+};
+
 struct BreakStmt final : Stmt {
   explicit BreakStmt(SourceLocation l) : Stmt(l) {}
 };

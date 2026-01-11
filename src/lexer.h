@@ -26,6 +26,8 @@ enum class TokenKind {
   Plus, Minus, Star, Slash,
   Assign,
 
+  Comma,
+
   Bang,   // !
   Tilde,  // ~
   Less,        // <

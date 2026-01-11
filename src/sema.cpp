@@ -94,6 +94,17 @@ static void checkStmtImpl(Diagnostics& diags, ScopeStack& scopes, int loopDepth,
     checkExprImpl(diags, scopes, *r->valueExpr);
     return;
   }
+  
+  if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
+    checkExprImpl(diags, scopes, *es->expr);
+    return;
+  }
+
+  if (auto* emp = dynamic_cast<const EmptyStmt*>(&s)) {
+    (void)emp;
+    return;
+  }
+
 }
 
 static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const Expr& e) {
