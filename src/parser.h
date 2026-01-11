@@ -114,6 +114,28 @@ struct WhileStmt final : Stmt {
       : Stmt(l), cond(std::move(c)), body(std::move(b)) {}
 };
 
+struct DoWhileStmt final : Stmt {
+  std::unique_ptr<Stmt> body;
+  std::unique_ptr<Expr> cond;
+  DoWhileStmt(SourceLocation l, std::unique_ptr<Stmt> b, std::unique_ptr<Expr> c)
+      : Stmt(l), body(std::move(b)), cond(std::move(c)) {}
+};
+
+
+// for(init; cond; inc) body
+// - init: nullable, may be DeclStmt or AssignStmt (in this milestone)
+// - cond: nullable (null => true)
+// - inc : nullable (expression, usually assignment expr)
+struct ForStmt final : Stmt {
+  std::unique_ptr<Stmt> init;   // nullable
+  std::unique_ptr<Expr> cond;   // nullable
+  std::unique_ptr<Expr> inc;    // nullable
+  std::unique_ptr<Stmt> body;
+  ForStmt(SourceLocation l, std::unique_ptr<Stmt> i, std::unique_ptr<Expr> c,
+          std::unique_ptr<Expr> in, std::unique_ptr<Stmt> b)
+      : Stmt(l), init(std::move(i)), cond(std::move(c)), inc(std::move(in)), body(std::move(b)) {}
+};
+
 struct AstTranslationUnit {
   std::string funcName;
   std::vector<std::unique_ptr<Stmt>> body;
@@ -145,11 +167,15 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseBlockStmt();
   std::optional<std::unique_ptr<Stmt>> parseIfStmt();
   std::optional<std::unique_ptr<Stmt>> parseWhileStmt();
+  std::optional<std::unique_ptr<Stmt>> parseDoWhileStmt();
+  std::optional<std::unique_ptr<Stmt>> parseForStmt();
 
   std::optional<std::unique_ptr<Expr>> parseExpr(); // entry: assignment
-  std::optional<std::unique_ptr<Expr>> parseBinary(int minPrec);
   std::optional<std::unique_ptr<Expr>> parseUnary();
   std::optional<std::unique_ptr<Expr>> parsePrimary();
+
+  // kept for compatibility with older code, but the current parser uses layered parsing.
+  std::optional<std::unique_ptr<Expr>> parseBinary(int /*minPrec*/);
 
   int precedence(TokenKind k) const;
   bool isBinaryOp(TokenKind k) const;

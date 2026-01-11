@@ -46,6 +46,8 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwReturn) return parseReturnStmt();
   if (cur_.kind == TokenKind::KwIf) return parseIfStmt();
   if (cur_.kind == TokenKind::KwWhile) return parseWhileStmt();
+  if (cur_.kind == TokenKind::KwDo) return parseDoWhileStmt();
+  if (cur_.kind == TokenKind::KwFor) return parseForStmt();
   if (cur_.kind == TokenKind::KwBreak) return parseBreakStmt();
   if (cur_.kind == TokenKind::KwContinue) return parseContinueStmt();
   if (cur_.kind == TokenKind::LBrace) return parseBlockStmt();
@@ -121,6 +123,107 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseWhileStmt() {
   if (!body) return std::nullopt;
 
   return std::make_unique<WhileStmt>(wLoc, std::move(*cond), std::move(*body));
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseDoWhileStmt() {
+  SourceLocation loc = cur_.loc;
+
+  if (!expect(TokenKind::KwDo, "'do'")) return std::nullopt;
+  advance();
+
+  auto body = parseStmt();
+  if (!body) return std::nullopt;
+
+  if (!expect(TokenKind::KwWhile, "'while'")) return std::nullopt;
+  advance();
+
+  if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+  advance();
+
+  auto cond = parseExpr();
+  if (!cond) return std::nullopt;
+
+  if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+  advance();
+
+  if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+  advance();
+
+  return std::make_unique<DoWhileStmt>(loc, std::move(*body), std::move(*cond));
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
+  SourceLocation fLoc = cur_.loc;
+  if (!expect(TokenKind::KwFor, "'for'")) return std::nullopt;
+  advance();
+
+  if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+  advance();
+
+  // init:
+  //   empty ';'
+  //   decl:  int x [= expr] ;
+  //   assign-expr: <identifier '=' expr> ;
+  std::unique_ptr<Stmt> init = nullptr;
+
+  if (cur_.kind == TokenKind::Semicolon) {
+    advance();
+  } else if (cur_.kind == TokenKind::KwInt) {
+    auto d = parseDeclStmt(); // consumes trailing ';'
+    if (!d) return std::nullopt;
+    init = std::move(*d);
+  } else {
+    // parse expression and require it to be AssignExpr (minimal)
+    auto e = parseExpr();
+    if (!e) return std::nullopt;
+
+    auto* asn = dynamic_cast<AssignExpr*>(e->get());
+    if (!asn) {
+      diags_.error(cur_.loc, "expected assignment expression in for-init");
+      return std::nullopt;
+    }
+
+    if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+    advance();
+
+    // turn AssignExpr into AssignStmt
+    std::string name = asn->name;
+    SourceLocation nameLoc = asn->nameLoc;
+    std::unique_ptr<Expr> rhs = std::move(asn->rhs);
+    SourceLocation loc = asn->loc;
+
+    init = std::make_unique<AssignStmt>(loc, std::move(name), nameLoc, std::move(rhs));
+
+  }
+
+  // cond (optional) until ';'
+  std::unique_ptr<Expr> cond = nullptr;
+  if (cur_.kind == TokenKind::Semicolon) {
+    advance();
+  } else {
+    auto c = parseExpr();
+    if (!c) return std::nullopt;
+    cond = std::move(*c);
+    if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+    advance();
+  }
+
+  // inc (optional) until ')'
+  std::unique_ptr<Expr> inc = nullptr;
+  if (cur_.kind == TokenKind::RParen) {
+    advance();
+  } else {
+    auto in = parseExpr();
+    if (!in) return std::nullopt;
+    inc = std::move(*in);
+    if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+    advance();
+  }
+
+  auto body = parseStmt();
+  if (!body) return std::nullopt;
+
+  return std::make_unique<ForStmt>(fLoc, std::move(init), std::move(cond), std::move(inc), std::move(*body));
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
@@ -201,23 +304,18 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseContinueStmt() {
   return std::make_unique<ContinueStmt>(l);
 }
 
-// -------------------- Expression parsing (stable layered) --------------------
+// -------------------- Expression parsing (layered) --------------------
 //
-// Grammar (subset):
-//   expr            := assignment
-//   assignment      := logical_or ( '=' assignment )?
-//   logical_or      := logical_and ( '||' logical_and )*
-//   logical_and     := equality ( '&&' equality )*
-//   equality        := relational ( ( '==' | '!=' ) relational )*
-//   relational      := additive ( ( '<' | '<=' | '>' | '>=' ) additive )*
-//   additive        := multiplicative ( ( '+' | '-' ) multiplicative )*
-//   multiplicative  := unary ( ( '*' | '/' ) unary )*
-//   unary           := ( '+' | '-' | '!' | '~' ) unary | primary
-//   primary         := integer | identifier | '(' expr ')'
-//
-// Notes:
-// - All binary ops here are LEFT associative via ( ... )*
-// - Assignment is RIGHT associative via recursion on RHS.
+// expr            := assignment
+// assignment      := logical_or ( '=' assignment )?
+// logical_or      := logical_and ( '||' logical_and )*
+// logical_and     := equality ( '&&' equality )*
+// equality        := relational ( ( '==' | '!=' ) relational )*
+// relational      := additive ( ( '<' | '<=' | '>' | '>=' ) additive )*
+// additive        := multiplicative ( ( '+' | '-' ) multiplicative )*
+// multiplicative  := unary ( ( '*' | '/' ) unary )*
+// unary           := ( '+' | '-' | '!' | '~' ) unary | primary
+// primary         := integer | identifier | '(' expr ')'
 
 std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
   if (cur_.kind == TokenKind::IntegerLiteral) {
@@ -267,74 +365,72 @@ static bool isRelOp(TokenKind k) {
          k == TokenKind::Greater || k == TokenKind::GreaterEqual;
 }
 static bool isEqOp(TokenKind k) { return k == TokenKind::EqualEqual || k == TokenKind::BangEqual; }
-
 static bool isAndOp(TokenKind k) { return k == TokenKind::AmpAmp; }
 static bool isOrOp(TokenKind k) { return k == TokenKind::PipePipe; }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseBinary(int /*minPrec*/) {
-  // Not used in layered version. Keep for header compatibility.
+  // kept for compatibility; not used in layered version
   return parseUnary();
 }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
-  // expr := assignment
+  auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseUnary();
+    if (!lhs) return std::nullopt;
+    while (isMulOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseUnary();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseAdditive = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseMultiplicative();
+    if (!lhs) return std::nullopt;
+    while (isAddOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseMultiplicative();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseRelational = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseAdditive();
+    if (!lhs) return std::nullopt;
+    while (isRelOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseAdditive();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseEquality = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseRelational();
+    if (!lhs) return std::nullopt;
+    while (isEqOp(cur_.kind)) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseRelational();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
   auto parseLogicalAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
-    auto parseRelational = [&]() -> std::optional<std::unique_ptr<Expr>> {
-      auto parseAdditive = [&]() -> std::optional<std::unique_ptr<Expr>> {
-        auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
-          auto lhs = parseUnary();
-          if (!lhs) return std::nullopt;
-          while (isMulOp(cur_.kind)) {
-            TokenKind op = cur_.kind;
-            SourceLocation l = (*lhs)->loc;
-            advance();
-            auto rhs = parseUnary();
-            if (!rhs) return std::nullopt;
-            lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
-          }
-          return lhs;
-        };
-
-        auto lhs = parseMultiplicative();
-        if (!lhs) return std::nullopt;
-        while (isAddOp(cur_.kind)) {
-          TokenKind op = cur_.kind;
-          SourceLocation l = (*lhs)->loc;
-          advance();
-          auto rhs = parseMultiplicative();
-          if (!rhs) return std::nullopt;
-          lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
-        }
-        return lhs;
-      };
-
-      auto lhs = parseAdditive();
-      if (!lhs) return std::nullopt;
-      while (isRelOp(cur_.kind)) {
-        TokenKind op = cur_.kind;
-        SourceLocation l = (*lhs)->loc;
-        advance();
-        auto rhs = parseAdditive();
-        if (!rhs) return std::nullopt;
-        lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
-      }
-      return lhs;
-    };
-
-    auto parseEquality = [&]() -> std::optional<std::unique_ptr<Expr>> {
-      auto lhs = parseRelational();
-      if (!lhs) return std::nullopt;
-      while (isEqOp(cur_.kind)) {
-        TokenKind op = cur_.kind;
-        SourceLocation l = (*lhs)->loc;
-        advance();
-        auto rhs = parseRelational();
-        if (!rhs) return std::nullopt;
-        lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
-      }
-      return lhs;
-    };
-
     auto lhs = parseEquality();
     if (!lhs) return std::nullopt;
     while (isAndOp(cur_.kind)) {
@@ -381,7 +477,6 @@ std::optional<std::unique_ptr<Expr>> Parser::parseExpr() {
   return lhs;
 }
 
-// Old precedence helpers kept for header compatibility (unused here)
 int Parser::precedence(TokenKind k) const {
   switch (k) {
     case TokenKind::Star:

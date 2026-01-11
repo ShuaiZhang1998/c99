@@ -49,8 +49,10 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "if")       return Token{TokenKind::KwIf, s, loc};
   if (s == "else")     return Token{TokenKind::KwElse, s, loc};
   if (s == "while")    return Token{TokenKind::KwWhile, s, loc};
+  if (s == "for")      return Token{TokenKind::KwFor, s, loc};
   if (s == "break")    return Token{TokenKind::KwBreak, s, loc};
   if (s == "continue") return Token{TokenKind::KwContinue, s, loc};
+  if (s == "do") return Token{TokenKind::KwDo, s, loc};
 
   return Token{TokenKind::Identifier, s, loc};
 }

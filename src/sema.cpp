@@ -37,8 +37,27 @@ static void checkStmtImpl(Diagnostics& diags, ScopeStack& scopes, int loopDepth,
 
   if (auto* w = dynamic_cast<const WhileStmt*>(&s)) {
     checkExprImpl(diags, scopes, *w->cond);
-    // inside loop body: loopDepth + 1
     checkStmtImpl(diags, scopes, loopDepth + 1, *w->body);
+    return;
+  }
+
+  if (auto* dw = dynamic_cast<const DoWhileStmt*>(&s)) {
+    checkStmtImpl(diags, scopes, loopDepth + 1, *dw->body);
+    checkExprImpl(diags, scopes, *dw->cond);
+    return;
+  }
+
+  if (auto* f = dynamic_cast<const ForStmt*>(&s)) {
+    // for introduces a new scope for init-decl variables
+    scopes.push_back({});
+
+    if (f->init) checkStmtImpl(diags, scopes, loopDepth, *f->init);
+    if (f->cond) checkExprImpl(diags, scopes, *f->cond);
+    if (f->inc)  checkExprImpl(diags, scopes, *f->inc);
+
+    checkStmtImpl(diags, scopes, loopDepth + 1, *f->body);
+
+    scopes.pop_back();
     return;
   }
 
@@ -88,9 +107,7 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const Expr& e)
   }
 
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
-    // RHS always checked
     checkExprImpl(diags, scopes, *asn->rhs);
-    // LHS name must already exist
     if (!isDeclared(scopes, asn->name)) {
       diags.error(asn->nameLoc, "assignment to undeclared identifier '" + asn->name + "'");
     }

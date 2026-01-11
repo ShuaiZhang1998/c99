@@ -1,360 +1,401 @@
 #include "codegen.h"
 
+#include <cassert>
+#include <cstdint>
+#include <string>
 #include <unordered_map>
-#include <vector>
 #include <utility>
+#include <vector>
 
-#include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LLVMContext.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/Instructions.h"
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/Verifier.h>
 
 namespace c99cc {
 
+namespace {
+
 struct CGEnv {
   llvm::LLVMContext& ctx;
+  llvm::Module& mod;
   llvm::IRBuilder<>& b;
   llvm::Function* fn = nullptr;
 
-  std::unordered_map<std::string, llvm::AllocaInst*> locals;
+  std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> scopes;
+  std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loops; // {break, continue}
 
-  // loop stack:
-  //   first  = break target (loop end)
-  //   second = continue target (loop cond)
-  std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loopStack;
+  llvm::Type* i32Ty() { return llvm::Type::getInt32Ty(ctx); }
+  llvm::Type* i1Ty() { return llvm::Type::getInt1Ty(ctx); }
+
+  void pushScope() { scopes.emplace_back(); }
+  void popScope() { scopes.pop_back(); }
+
+  llvm::AllocaInst* lookup(const std::string& name) {
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+      auto f = it->find(name);
+      if (f != it->end()) return f->second;
+    }
+    return nullptr;
+  }
+
+  bool insertLocal(const std::string& name, llvm::AllocaInst* slot) {
+    auto& cur = scopes.back();
+    if (cur.count(name)) return false;
+    cur[name] = slot;
+    return true;
+  }
 };
 
 static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name) {
   llvm::IRBuilder<> tmp(&env.fn->getEntryBlock(), env.fn->getEntryBlock().begin());
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-  return tmp.CreateAlloca(i32, nullptr, name);
+  return tmp.CreateAlloca(env.i32Ty(), nullptr, name);
 }
 
+static llvm::Value* i32Const(CGEnv& env, int64_t v) {
+  return llvm::ConstantInt::get(env.i32Ty(), (uint64_t)v, true);
+}
+
+static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
+  if (v->getType()->isIntegerTy(1)) return v;
+  return env.b.CreateICmpNE(v, i32Const(env, 0), "tobool");
+}
+
+// forward decl
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
-
-static llvm::Value* emitVarRef(CGEnv& env, const VarRefExpr& v) {
-  auto it = env.locals.find(v.name);
-  if (it == env.locals.end()) {
-    return llvm::UndefValue::get(llvm::Type::getInt32Ty(env.ctx));
-  }
-  return env.b.CreateLoad(it->second->getAllocatedType(), it->second, v.name + ".val");
-}
-
-static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* vI32) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-  llvm::Value* zero = llvm::ConstantInt::get(i32, 0, true);
-  return env.b.CreateICmpNE(vI32, zero, "tobool");
-}
-
-static llvm::Value* boolI1ToI32(CGEnv& env, llvm::Value* vI1) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-  return env.b.CreateZExt(vI1, i32, "booltmp");
-}
+static bool emitStmt(CGEnv& env, const Stmt& s);
 
 static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-  llvm::Value* x = emitExpr(env, *u.operand);
-
+  llvm::Value* opnd = emitExpr(env, *u.operand);
   switch (u.op) {
-    case TokenKind::Plus:
-      return x;
-    case TokenKind::Minus:
-      return env.b.CreateNeg(x, "negtmp");
-    case TokenKind::Tilde:
-      return env.b.CreateNot(x, "nottmp");
+    case TokenKind::Plus:  return opnd;
+    case TokenKind::Minus: return env.b.CreateSub(i32Const(env, 0), opnd, "neg");
+    case TokenKind::Tilde: return env.b.CreateNot(opnd, "bitnot");
     case TokenKind::Bang: {
-      llvm::Value* zero = llvm::ConstantInt::get(i32, 0, true);
-      llvm::Value* cmp = env.b.CreateICmpEQ(x, zero, "cmptmp"); // i1
-      return env.b.CreateZExt(cmp, i32, "booltmp");             // i32
+      llvm::Value* b = asBoolI1(env, opnd);
+      llvm::Value* inv = env.b.CreateNot(b, "lnot");
+      return env.b.CreateZExt(inv, env.i32Ty(), "lnot.i32");
     }
     default:
-      break;
+      return i32Const(env, 0);
   }
-
-  return llvm::UndefValue::get(i32);
 }
 
-static llvm::Value* emitLogicalAnd(CGEnv& env, const Expr& lhsE, const Expr& rhsE) {
+static llvm::Value* emitShortCircuitAnd(CGEnv& env, const BinaryExpr& bin) {
   llvm::Function* F = env.fn;
 
-  llvm::BasicBlock* rhsBB   = llvm::BasicBlock::Create(env.ctx, "land.rhs", F);
-  llvm::BasicBlock* falseBB = llvm::BasicBlock::Create(env.ctx, "land.false", F);
-  llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(env.ctx, "land.end");
-
-  llvm::Value* lhsV = emitExpr(env, lhsE);  // i32
-  llvm::Value* lhsB = asBoolI1(env, lhsV);  // i1
-  env.b.CreateCondBr(lhsB, rhsBB, falseBB);
-
-  env.b.SetInsertPoint(falseBB);
-  env.b.CreateBr(mergeBB);
-
-  env.b.SetInsertPoint(rhsBB);
-  llvm::Value* rhsV = emitExpr(env, rhsE);
-  llvm::Value* rhsB = asBoolI1(env, rhsV);
-  env.b.CreateBr(mergeBB);
-
-  F->getBasicBlockList().push_back(mergeBB);
-  env.b.SetInsertPoint(mergeBB);
-
-  llvm::PHINode* phi = env.b.CreatePHI(llvm::Type::getInt1Ty(env.ctx), 2, "landphi");
-  phi->addIncoming(llvm::ConstantInt::getFalse(env.ctx), falseBB);
-  phi->addIncoming(rhsB, rhsBB);
-
-  return boolI1ToI32(env, phi);
-}
-
-static llvm::Value* emitLogicalOr(CGEnv& env, const Expr& lhsE, const Expr& rhsE) {
-  llvm::Function* F = env.fn;
-
-  llvm::BasicBlock* rhsBB   = llvm::BasicBlock::Create(env.ctx, "lor.rhs", F);
-  llvm::BasicBlock* trueBB  = llvm::BasicBlock::Create(env.ctx, "lor.true", F);
-  llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(env.ctx, "lor.end");
-
-  llvm::Value* lhsV = emitExpr(env, lhsE);
+  llvm::Value* lhsV = emitExpr(env, *bin.lhs);
   llvm::Value* lhsB = asBoolI1(env, lhsV);
-  env.b.CreateCondBr(lhsB, trueBB, rhsBB);
 
-  env.b.SetInsertPoint(trueBB);
-  env.b.CreateBr(mergeBB);
+  llvm::BasicBlock* curBB = env.b.GetInsertBlock();
+  llvm::BasicBlock* rhsBB = llvm::BasicBlock::Create(env.ctx, "land.rhs", F);
+  llvm::BasicBlock* endBB = llvm::BasicBlock::Create(env.ctx, "land.end", F);
+
+  env.b.CreateCondBr(lhsB, rhsBB, endBB);
 
   env.b.SetInsertPoint(rhsBB);
-  llvm::Value* rhsV = emitExpr(env, rhsE);
+  llvm::Value* rhsV = emitExpr(env, *bin.rhs);
   llvm::Value* rhsB = asBoolI1(env, rhsV);
-  env.b.CreateBr(mergeBB);
+  env.b.CreateBr(endBB);
 
-  F->getBasicBlockList().push_back(mergeBB);
-  env.b.SetInsertPoint(mergeBB);
-
-  llvm::PHINode* phi = env.b.CreatePHI(llvm::Type::getInt1Ty(env.ctx), 2, "lorphi");
-  phi->addIncoming(llvm::ConstantInt::getTrue(env.ctx), trueBB);
+  env.b.SetInsertPoint(endBB);
+  llvm::PHINode* phi = env.b.CreatePHI(env.i1Ty(), 2, "land.phi");
+  phi->addIncoming(llvm::ConstantInt::getFalse(env.ctx), curBB);
   phi->addIncoming(rhsB, rhsBB);
 
-  return boolI1ToI32(env, phi);
+  return env.b.CreateZExt(phi, env.i32Ty(), "land.i32");
 }
 
-static llvm::Value* emitAssignExpr(CGEnv& env, const AssignExpr& a) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-  llvm::Value* rhsV = emitExpr(env, *a.rhs);
+static llvm::Value* emitShortCircuitOr(CGEnv& env, const BinaryExpr& bin) {
+  llvm::Function* F = env.fn;
 
-  auto it = env.locals.find(a.name);
-  if (it == env.locals.end()) {
-    // Sema should have rejected this; keep IR valid-ish
-    return rhsV ? rhsV : llvm::UndefValue::get(i32);
+  llvm::Value* lhsV = emitExpr(env, *bin.lhs);
+  llvm::Value* lhsB = asBoolI1(env, lhsV);
+
+  llvm::BasicBlock* curBB = env.b.GetInsertBlock();
+  llvm::BasicBlock* rhsBB = llvm::BasicBlock::Create(env.ctx, "lor.rhs", F);
+  llvm::BasicBlock* endBB = llvm::BasicBlock::Create(env.ctx, "lor.end", F);
+
+  env.b.CreateCondBr(lhsB, endBB, rhsBB);
+
+  env.b.SetInsertPoint(rhsBB);
+  llvm::Value* rhsV = emitExpr(env, *bin.rhs);
+  llvm::Value* rhsB = asBoolI1(env, rhsV);
+  env.b.CreateBr(endBB);
+
+  env.b.SetInsertPoint(endBB);
+  llvm::PHINode* phi = env.b.CreatePHI(env.i1Ty(), 2, "lor.phi");
+  phi->addIncoming(llvm::ConstantInt::getTrue(env.ctx), curBB);
+  phi->addIncoming(rhsB, rhsBB);
+
+  return env.b.CreateZExt(phi, env.i32Ty(), "lor.i32");
+}
+
+static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
+  if (bin.op == TokenKind::AmpAmp) return emitShortCircuitAnd(env, bin);
+  if (bin.op == TokenKind::PipePipe) return emitShortCircuitOr(env, bin);
+
+  llvm::Value* L = emitExpr(env, *bin.lhs);
+  llvm::Value* R = emitExpr(env, *bin.rhs);
+
+  switch (bin.op) {
+    case TokenKind::Plus:  return env.b.CreateAdd(L, R, "add");
+    case TokenKind::Minus: return env.b.CreateSub(L, R, "sub");
+    case TokenKind::Star:  return env.b.CreateMul(L, R, "mul");
+    case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
+
+    case TokenKind::Less: {
+      auto* c = env.b.CreateICmpSLT(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+    case TokenKind::LessEqual: {
+      auto* c = env.b.CreateICmpSLE(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+    case TokenKind::Greater: {
+      auto* c = env.b.CreateICmpSGT(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+    case TokenKind::GreaterEqual: {
+      auto* c = env.b.CreateICmpSGE(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+    case TokenKind::EqualEqual: {
+      auto* c = env.b.CreateICmpEQ(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+    case TokenKind::BangEqual: {
+      auto* c = env.b.CreateICmpNE(L, R, "cmp");
+      return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
+    }
+
+    default:
+      return i32Const(env, 0);
   }
-
-  env.b.CreateStore(rhsV, it->second);
-  return rhsV;
 }
 
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
-  auto* i32 = llvm::Type::getInt32Ty(env.ctx);
-
   if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
-    return llvm::ConstantInt::get(i32, (int32_t)lit->value, /*isSigned=*/true);
+    return i32Const(env, lit->value);
   }
-
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
-    return emitVarRef(env, *vr);
+    llvm::AllocaInst* slot = env.lookup(vr->name);
+    if (!slot) return i32Const(env, 0);
+    return env.b.CreateLoad(env.i32Ty(), slot, vr->name + ".val");
   }
-
-  if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
-    return emitAssignExpr(env, *asn);
-  }
-
   if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
     return emitUnary(env, *un);
   }
-
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
-    if (bin->op == TokenKind::AmpAmp) return emitLogicalAnd(env, *bin->lhs, *bin->rhs);
-    if (bin->op == TokenKind::PipePipe) return emitLogicalOr(env, *bin->lhs, *bin->rhs);
-
-    llvm::Value* L = emitExpr(env, *bin->lhs);
-    llvm::Value* R = emitExpr(env, *bin->rhs);
-
-    switch (bin->op) {
-      case TokenKind::Plus:  return env.b.CreateAdd(L, R, "addtmp");
-      case TokenKind::Minus: return env.b.CreateSub(L, R, "subtmp");
-      case TokenKind::Star:  return env.b.CreateMul(L, R, "multmp");
-      case TokenKind::Slash: return env.b.CreateSDiv(L, R, "divtmp");
-
-      case TokenKind::Less:
-      case TokenKind::Greater:
-      case TokenKind::LessEqual:
-      case TokenKind::GreaterEqual:
-      case TokenKind::EqualEqual:
-      case TokenKind::BangEqual: {
-        llvm::Value* cmp = nullptr;
-        switch (bin->op) {
-          case TokenKind::Less:         cmp = env.b.CreateICmpSLT(L, R, "cmptmp"); break;
-          case TokenKind::Greater:      cmp = env.b.CreateICmpSGT(L, R, "cmptmp"); break;
-          case TokenKind::LessEqual:    cmp = env.b.CreateICmpSLE(L, R, "cmptmp"); break;
-          case TokenKind::GreaterEqual: cmp = env.b.CreateICmpSGE(L, R, "cmptmp"); break;
-          case TokenKind::EqualEqual:   cmp = env.b.CreateICmpEQ(L, R, "cmptmp");  break;
-          case TokenKind::BangEqual:    cmp = env.b.CreateICmpNE(L, R, "cmptmp");  break;
-          default: break;
-        }
-        return env.b.CreateZExt(cmp, i32, "booltmp");
-      }
-
-      default:
-        break;
-    }
+    return emitBinary(env, *bin);
   }
-
-  return llvm::UndefValue::get(i32);
+  if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
+    llvm::AllocaInst* slot = env.lookup(asn->name);
+    llvm::Value* rhsV = emitExpr(env, *asn->rhs);
+    if (slot) env.b.CreateStore(rhsV, slot);
+    return rhsV;
+  }
+  return i32Const(env, 0);
 }
-
-// Return true if current basic block is terminated (e.g., by return/break/continue)
-static bool emitStmt(CGEnv& env, const Stmt& s);
 
 static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
+  env.pushScope();
+  bool terminated = false;
   for (const auto& st : blk.stmts) {
-    if (emitStmt(env, *st)) return true;
+    terminated = emitStmt(env, *st);
+    if (terminated) break;
   }
-  return false;
+  env.popScope();
+  return terminated;
 }
 
-static bool emitIf(CGEnv& env, const IfStmt& iff) {
-  llvm::Value* condV = emitExpr(env, *iff.cond);
-  llvm::Value* condI1 = asBoolI1(env, condV);
-
+static bool emitIf(CGEnv& env, const IfStmt& s) {
   llvm::Function* F = env.fn;
+
+  llvm::Value* condV = emitExpr(env, *s.cond);
+  llvm::Value* condB = asBoolI1(env, condV);
+
   llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(env.ctx, "if.then", F);
-  llvm::BasicBlock* elseBB = nullptr;
-  llvm::BasicBlock* mergeBB = llvm::BasicBlock::Create(env.ctx, "if.end");
+  llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(env.ctx, "if.else");
+  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "if.end");
 
-  const bool hasElse = (iff.elseBranch != nullptr);
-  if (hasElse) elseBB = llvm::BasicBlock::Create(env.ctx, "if.else", F);
-
-  if (hasElse) env.b.CreateCondBr(condI1, thenBB, elseBB);
-  else env.b.CreateCondBr(condI1, thenBB, mergeBB);
+  if (s.elseBranch) {
+    F->getBasicBlockList().push_back(elseBB);
+    env.b.CreateCondBr(condB, thenBB, elseBB);
+  } else {
+    env.b.CreateCondBr(condB, thenBB, endBB);
+  }
 
   env.b.SetInsertPoint(thenBB);
-  bool thenTerminated = emitStmt(env, *iff.thenBranch);
-  if (!thenTerminated) env.b.CreateBr(mergeBB);
+  bool thenTerm = emitStmt(env, *s.thenBranch);
+  if (!thenTerm) env.b.CreateBr(endBB);
 
-  if (hasElse) {
+  if (s.elseBranch) {
+    F->getBasicBlockList().push_back(elseBB);
     env.b.SetInsertPoint(elseBB);
-    bool elseTerminated = emitStmt(env, *iff.elseBranch);
-    if (!elseTerminated) env.b.CreateBr(mergeBB);
+    bool elseTerm = emitStmt(env, *s.elseBranch);
+    if (!elseTerm) env.b.CreateBr(endBB);
   }
-
-  F->getBasicBlockList().push_back(mergeBB);
-  env.b.SetInsertPoint(mergeBB);
-  return false;
-}
-
-static bool emitWhile(CGEnv& env, const WhileStmt& w) {
-  llvm::Function* F = env.fn;
-
-  llvm::BasicBlock* condBB = llvm::BasicBlock::Create(env.ctx, "while.cond", F);
-  llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "while.body", F);
-  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "while.end");
-
-  // initial jump to cond
-  env.b.CreateBr(condBB);
-
-  // cond
-  env.b.SetInsertPoint(condBB);
-  llvm::Value* condV = emitExpr(env, *w.cond);
-  llvm::Value* condI1 = asBoolI1(env, condV);
-  env.b.CreateCondBr(condI1, bodyBB, endBB);
-
-  // body
-  env.b.SetInsertPoint(bodyBB);
-
-  // push loop targets: break->endBB, continue->condBB
-  env.loopStack.push_back({endBB, condBB});
-
-  bool bodyTerminated = emitStmt(env, *w.body);
-
-  // pop even if terminated
-  env.loopStack.pop_back();
-
-  if (!bodyTerminated) env.b.CreateBr(condBB);
 
   F->getBasicBlockList().push_back(endBB);
   env.b.SetInsertPoint(endBB);
   return false;
 }
 
-static bool emitStmt(CGEnv& env, const Stmt& s) {
-  if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
-    auto* slot = createEntryAlloca(env, d->name);
-    env.locals[d->name] = slot;
+static bool emitWhile(CGEnv& env, const WhileStmt& s) {
+  llvm::Function* F = env.fn;
 
-    if (d->initExpr) {
-      llvm::Value* initV = emitExpr(env, *d->initExpr);
-      env.b.CreateStore(initV, slot);
-    }
+  llvm::BasicBlock* condBB = llvm::BasicBlock::Create(env.ctx, "while.cond", F);
+  llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "while.body", F);
+  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "while.end");
+
+  env.b.CreateBr(condBB);
+
+  env.b.SetInsertPoint(condBB);
+  llvm::Value* condV = emitExpr(env, *s.cond);
+  llvm::Value* condB = asBoolI1(env, condV);
+  env.b.CreateCondBr(condB, bodyBB, endBB);
+
+  env.b.SetInsertPoint(bodyBB);
+  env.loops.push_back({endBB, condBB}); // continue => cond
+  bool bodyTerm = emitStmt(env, *s.body);
+  env.loops.pop_back();
+  if (!bodyTerm) env.b.CreateBr(condBB);
+
+  F->getBasicBlockList().push_back(endBB);
+  env.b.SetInsertPoint(endBB);
+  return false;
+}
+
+static bool emitDoWhile(CGEnv& env, const DoWhileStmt& s) {
+  llvm::Function* F = env.fn;
+
+  llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "do.body", F);
+  llvm::BasicBlock* condBB = llvm::BasicBlock::Create(env.ctx, "do.cond", F);
+  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "do.end");
+
+  env.b.CreateBr(bodyBB);
+
+  env.b.SetInsertPoint(bodyBB);
+  env.loops.push_back({endBB, condBB}); // continue => cond
+  bool bodyTerm = emitStmt(env, *s.body);
+  env.loops.pop_back();
+  if (!bodyTerm) env.b.CreateBr(condBB);
+
+  env.b.SetInsertPoint(condBB);
+  llvm::Value* condV = emitExpr(env, *s.cond);
+  llvm::Value* condB = asBoolI1(env, condV);
+  env.b.CreateCondBr(condB, bodyBB, endBB);
+
+  F->getBasicBlockList().push_back(endBB);
+  env.b.SetInsertPoint(endBB);
+  return false;
+}
+
+static bool emitFor(CGEnv& env, const ForStmt& s) {
+  llvm::Function* F = env.fn;
+
+  env.pushScope(); // for-scope
+
+  if (s.init) {
+    bool t = emitStmt(env, *s.init);
+    if (t) { env.popScope(); return true; }
+  }
+
+  llvm::BasicBlock* condBB = llvm::BasicBlock::Create(env.ctx, "for.cond", F);
+  llvm::BasicBlock* bodyBB = llvm::BasicBlock::Create(env.ctx, "for.body", F);
+  llvm::BasicBlock* incBB  = llvm::BasicBlock::Create(env.ctx, "for.inc", F);
+  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "for.end");
+
+  env.b.CreateBr(condBB);
+
+  env.b.SetInsertPoint(condBB);
+  llvm::Value* condB = s.cond ? asBoolI1(env, emitExpr(env, *s.cond))
+                              : llvm::ConstantInt::getTrue(env.ctx);
+  env.b.CreateCondBr(condB, bodyBB, endBB);
+
+  env.b.SetInsertPoint(bodyBB);
+  env.loops.push_back({endBB, incBB}); // continue => inc
+  bool bodyTerm = emitStmt(env, *s.body);
+  env.loops.pop_back();
+  if (!bodyTerm) env.b.CreateBr(incBB);
+
+  env.b.SetInsertPoint(incBB);
+  if (s.inc) (void)emitExpr(env, *s.inc);
+  if (!env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(condBB);
+
+  F->getBasicBlockList().push_back(endBB);
+  env.b.SetInsertPoint(endBB);
+
+  env.popScope();
+  return false;
+}
+
+static bool emitStmt(CGEnv& env, const Stmt& s) {
+  if (env.b.GetInsertBlock()->getTerminator()) return true;
+
+  if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) return emitBlock(env, *blk);
+
+  if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
+    llvm::AllocaInst* slot = createEntryAlloca(env, d->name);
+    env.insertLocal(d->name, slot);
+    if (d->initExpr) env.b.CreateStore(emitExpr(env, *d->initExpr), slot);
+    else env.b.CreateStore(i32Const(env, 0), slot);
     return false;
   }
 
   if (auto* a = dynamic_cast<const AssignStmt*>(&s)) {
-    auto it = env.locals.find(a->name);
-    if (it == env.locals.end()) return false;
-    llvm::Value* v = emitExpr(env, *a->valueExpr);
-    env.b.CreateStore(v, it->second);
+    llvm::AllocaInst* slot = env.lookup(a->name);
+    llvm::Value* rhsV = emitExpr(env, *a->valueExpr);
+    if (slot) env.b.CreateStore(rhsV, slot);
     return false;
   }
 
   if (auto* r = dynamic_cast<const ReturnStmt*>(&s)) {
-    llvm::Value* v = emitExpr(env, *r->valueExpr);
-    env.b.CreateRet(v);
+    env.b.CreateRet(emitExpr(env, *r->valueExpr));
     return true;
   }
 
   if (auto* br = dynamic_cast<const BreakStmt*>(&s)) {
-    if (!env.loopStack.empty()) {
-      env.b.CreateBr(env.loopStack.back().first); // break target
-      return true;
-    }
-    // Sema should error; keep IR valid: do nothing
+    if (!env.loops.empty()) { env.b.CreateBr(env.loops.back().first); return true; }
     return false;
   }
 
   if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
-    if (!env.loopStack.empty()) {
-      env.b.CreateBr(env.loopStack.back().second); // continue target
-      return true;
-    }
+    if (!env.loops.empty()) { env.b.CreateBr(env.loops.back().second); return true; }
     return false;
   }
 
-  if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) {
-    return emitBlock(env, *blk);
-  }
-
-  if (auto* iff = dynamic_cast<const IfStmt*>(&s)) {
-    return emitIf(env, *iff);
-  }
-
-  if (auto* w = dynamic_cast<const WhileStmt*>(&s)) {
-    return emitWhile(env, *w);
-  }
+  if (auto* iff = dynamic_cast<const IfStmt*>(&s)) return emitIf(env, *iff);
+  if (auto* wh  = dynamic_cast<const WhileStmt*>(&s)) return emitWhile(env, *wh);
+  if (auto* dw  = dynamic_cast<const DoWhileStmt*>(&s)) return emitDoWhile(env, *dw);
+  if (auto* fo  = dynamic_cast<const ForStmt*>(&s)) return emitFor(env, *fo);
 
   return false;
 }
+
+} // namespace
 
 std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     llvm::LLVMContext& ctx,
     const AstTranslationUnit& tu,
     const std::string& moduleName) {
-
   auto mod = std::make_unique<llvm::Module>(moduleName, ctx);
-  llvm::IRBuilder<> b(ctx);
+  llvm::IRBuilder<> builder(ctx);
+  CGEnv env{ctx, *mod, builder};
 
-  auto* i32 = llvm::Type::getInt32Ty(ctx);
-  auto* fnTy = llvm::FunctionType::get(i32, /*isVarArg=*/false);
-  auto* fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, tu.funcName, mod.get());
+  auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), false);
+  env.fn = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, tu.funcName, mod.get());
 
-  auto* entry = llvm::BasicBlock::Create(ctx, "entry", fn);
-  b.SetInsertPoint(entry);
+  llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", env.fn);
+  builder.SetInsertPoint(entry);
 
-  CGEnv env{ctx, b, fn, {}, {}};
+  env.pushScope();
 
   bool terminated = false;
   for (const auto& st : tu.body) {
@@ -362,11 +403,12 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     if (terminated) break;
   }
 
-  if (!terminated) {
-    b.CreateRet(llvm::ConstantInt::get(i32, 0, true));
+  if (!builder.GetInsertBlock()->getTerminator()) {
+    builder.CreateRet(i32Const(env, 0));
   }
 
-  llvm::verifyFunction(*fn);
+  env.popScope();
+  llvm::verifyFunction(*env.fn);
   return mod;
 }
 
