@@ -1,8 +1,6 @@
-
-
 # **c99cc（里程碑 1）**
 
-一个从零开始实现的 C99 编译器项目（当前实现一个**可运行、可测试、结构清晰**的最小子集）。
+一个从零开始实现的 C99 编译器项目（当前实现一个**可运行、可测试、结构清晰**的子集）。
 
 - 前端：C++17（Lexer / Parser / Sema / CodeGen）
 - 后端：LLVM（生成目标文件 .o）
@@ -12,102 +10,48 @@
 
 ### **语言子集**
 
-当前仅支持**单个翻译单元**、**单个函数定义**：
+- 单个翻译单元
+- 多个函数与原型声明
+- 全局变量定义
+
+### **类型系统（当前支持）**
+
+- `int`
+- 指针（多级）：`int*`, `int**`, `void*`
+- 数组（含多维）
+- `struct`（定义、变量、成员访问、按值传参/返回/赋值、比较）
+
+### **函数**
 
 ```
-int <name>() { ... }
+int f(int x, int* p);
+int f(int x, int* p) { return x + p[0]; }
 ```
 
-### **函数体语句**
+- 支持原型与定义
+- 参数可省略名称（原型）
 
-#### **变量声明**
+### **变量声明**
 
 ```
 int x;
 int y = 3;
 int z = x + 4;
+int a[2][3];
 ```
 
-#### **赋值语句**
+### **初始化（当前支持）**
+
+- 标量初始化：`int x = 3;`
+- 结构体初始化列表（含嵌套字段、数组字段）：
 
 ```
-x = <expr>;
+struct Inner { int x; };
+struct Outer { struct Inner in; int arr[2]; };
+struct Outer o = {{1}, {2, 3}};
 ```
 
-#### **表达式语句 / 空语句**
-
-```
-x + 1;
-;
-```
-
-#### **返回语句**
-
-```
-return <expr>;
-```
-
-#### **代码块（Block）**
-
-```
-{
-  int x = 1;
-  x = x + 1;
-}
-```
-
-- {} **引入新的作用域**
-- 支持变量遮蔽（shadowing）
-- 作用域退出后变量不可见
-
-### **控制流语句**
-
-#### **if / else**
-
-```
-if (cond) stmt;
-if (cond) stmt1 else stmt2;
-```
-
-#### **while**
-
-```
-while (cond) stmt;
-```
-
-#### **do / while**
-
-```
-do {
-  stmt;
-} while (cond);
-```
-
-#### **for**
-
-```
-for (init; cond; inc) stmt;
-```
-
-支持：
-
-- init：
-  - 空
-  - 声明语句：int i = 0;
-  - 任意表达式（含逗号表达式）
-- cond 为空时视为真
-- inc 支持任意表达式（含逗号表达式）
-- for 自身引入独立作用域
-
-#### **break / continue**
-
-```
-break;
-continue;
-```
-
-- 仅允许出现在循环内部
-- 语义检查会拒绝 loop 外使用
+> 说明：当前仍不支持**独立数组对象**的初始化列表（但结构体中的数组字段可初始化）。
 
 ### **表达式**
 
@@ -126,6 +70,8 @@ x          // 变量引用
 -x
 !x
 ~x
+&x
+*p
 ```
 
 #### **二元算术运算（左结合 + 正确优先级）**
@@ -139,6 +85,9 @@ x          // 变量引用
 ```
 ==  !=  <  <=  >  >=
 ```
+
+- 支持指针比较（含与 `0/NULL` 比较）
+- 支持结构体按值比较（`==`, `!=`）
 
 #### **逻辑运算（短路）**
 
@@ -162,98 +111,85 @@ a = b = c;
 (a = 1, b = 2, a + b)
 ```
 
-- 从左到右求值
-- 结果为最后一个表达式的值
-- 可用于：
-  - 普通表达式
-  - for 的 init / inc
+#### **数组与指针**
 
-## **语义分析（Sema）**
+```
+int a[2];
+int *p = a;     // 数组衰减
+p[1] = 3;       // 下标
+*(p + 1) = 3;   // 指针算术
+```
+
+#### **结构体成员访问**
+
+```
+struct S { int a; int b; };
+struct S s; s.a = 1; s.b = 2;
+struct S *p = &s; p->a = 3;
+```
+
+### **控制流语句**
+
+#### **if / else**
+
+```
+if (cond) stmt;
+if (cond) stmt1 else stmt2;
+```
+
+#### **while / do-while / for**
+
+```
+while (cond) stmt;
+
+do { stmt; } while (cond);
+
+for (init; cond; inc) stmt;
+```
+
+- `for` 支持：
+  - init 为空 / 声明语句 / 任意表达式（含逗号表达式）
+  - cond 为空时视为真
+  - inc 支持任意表达式（含逗号表达式）
+  - for 自身引入独立作用域
+
+#### **switch / case / default**
+
+```
+switch (x) {
+  case 1: ...; break;
+  default: ...;
+}
+```
+
+#### **break / continue**
+
+```
+break;
+continue;
+```
+
+### **语义分析（Sema）**
 
 在进入 CodeGen 之前执行最小但严格的语义检查。
 
-### **已实现的诊断**
+- 使用未声明变量 / 未声明函数
+- 重复声明（同一作用域）
+- 作用域规则（遮蔽、泄漏）
+- `break/continue` 位置检查
+- 参数/返回类型一致性与原型冲突检测
+- 指针与数组的基础合法性检查
+- 结构体字段查找与类型一致性检查
+- 初始化列表的结构/数组维度检查
 
-- 使用未声明变量：
-
-```
-use of undeclared identifier 'x'
-```
-
-- 给未声明变量赋值：
-
-```
-assignment to undeclared identifier 'x'
-```
-
-- 重复声明（同一作用域）：
-
-```
-redefinition of 'x'
-```
-
-- block 作用域规则：
-  - 内层可遮蔽外层
-  - 作用域外访问报错
-- break / continue 语义检查：
-  - loop 外使用报错
-- 初始化声明规则：
-
-```
-int x = x + 1; // ❌ use of undeclared identifier 'x'
-```
-
-### **诊断信息包含**
-
+诊断信息包含：
 - 文件名
 - 行号 / 列号（基于 token 位置）
 
-## **代码生成（LLVM）**
-
-### **基本策略**
+### **代码生成（LLVM）**
 
 - 在内存中生成 LLVM IR
-- 单函数、i32 返回值
-
-### **局部变量 lowering**
-
-- 所有局部变量：
-  - 在 entry block 中 alloca
-  - 使用 store / load
-- 作用域通过符号表栈管理
-
-### **一元 / 二元运算**
-
-- 一元：
-  - -x → sub 0, x
-  - ~x → not
-  - !x → icmp + zext
-- 比较：
-  - icmp（i1）→ zext 到 i32
-- 逗号运算：
-  - 生成 lhs
-  - 丢弃 lhs 结果
-  - 返回 rhs 值
-
-### **逻辑运算（短路）**
-
-- && / ||：
-  - 使用 condbr
-  - phi 合并结果
-  - 保证 RHS 仅在需要时生成
-
-### **控制流 lowering**
-
-- if / else
-- while
-- do / while
-- for
-- break / continue（通过 loop block 栈）
-
-### **后端**
-
-- 通过 LLVM TargetMachine 生成目标文件
-- 当前已在 **AArch64 (arm64)** 上验证
+- 目标平台：当前已在 **AArch64 (arm64)** 上验证
 - 使用 clang 链接生成最终可执行文件
 
 ## **构建（Build）**
@@ -275,20 +211,19 @@ cmake --build build -j
 ## **快速测试（手动）**
 
 ```
-cat > hello.c << 'EOF'
+cat > hello.c << 'EOS'
+int sum(int x, int y) { return x + y; }
 int main() {
-  int sum = 0;
-  for (int i = 0; i < 4; i = i + 1) {
-    sum = sum + i;
-  }
-  return sum;
+  int a[2];
+  a[0] = 1; a[1] = 2;
+  return sum(a[0], a[1]);
 }
-EOF
+EOS
 
 ./build/c99cc hello.c -o hello
 ./hello
 echo $?
-# 期望输出：6
+# 期望输出：3
 ```
 
 ## **自动化测试**
@@ -324,31 +259,28 @@ echo $?
 - 表达式优先级 / 结合性
 - 赋值 / 逗号表达式
 - 一元 / 二元 / 逻辑运算
+- 指针、数组、多维数组与数组衰减
+- 结构体定义、成员访问、赋值、初始化、比较
 - block 作用域与遮蔽
-- if / while / do-while / for
+- if / while / do-while / for / switch
 - break / continue
 - 语义错误（未声明、重复定义、作用域泄漏）
 - 常见语法错误（缺分号 / 括号 / 非法字符）
 
 ## **已知限制（尚未实现）**
 
-- 无函数参数 / 函数调用
-- 仅支持 int 类型
-- 无类型转换规则
-- 无 switch / case
-- 无 goto
+- 仅支持 `int` 与指针/数组/struct 子集（无 `char/float/double/long`）
+- 无显式类型转换、`sizeof`、`typedef`、`enum`、`union`、位域
+- 仅支持 `==`/`!=` 的结构体比较（无排序比较）
+- 无数组对象的独立初始化列表（但结构体内数组字段可初始化）
+- 不支持结构体在块内定义（仅顶层）
 - 无预处理器（#include / 宏 / 条件编译）
 - 无多翻译单元
 - 错误恢复能力有限
 
 ## **下一步计划（Milestone 2）**
 
-- 函数参数与调用
-- 更完整的 C99 类型系统
-- 隐式 / 显式类型转换
-- switch / case
-- 预处理器实现
+- 更完整的 C99 类型系统与转换规则
+- 更丰富的初始化语法（含数组/设计化初始化）
 - 更健壮的错误恢复
 - IR 层优化 / SSA 改进
-
-
