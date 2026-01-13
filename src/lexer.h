@@ -9,7 +9,10 @@ enum class TokenKind {
   Identifier,
   IntegerLiteral,
 
+  KwChar,
+  KwShort,
   KwInt,
+  KwLong,
   KwVoid,
   KwStruct,
   KwReturn,

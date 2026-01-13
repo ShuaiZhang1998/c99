@@ -21,7 +21,7 @@ struct Node {
 };
 
 struct Type {
-  enum class Base { Int, Void, Struct };
+  enum class Base { Char, Short, Int, Long, Void, Struct };
   Base base = Base::Int;
   std::string structName;
   int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
@@ -32,6 +32,10 @@ struct Type {
   Type(Base b, int d, std::vector<std::optional<size_t>> dims)
       : base(b), ptrDepth(d), arrayDims(std::move(dims)) {}
   bool isInt() const { return base == Base::Int && ptrDepth == 0 && arrayDims.empty(); }
+  bool isInteger() const {
+    if (ptrDepth != 0 || !arrayDims.empty()) return false;
+    return base == Base::Char || base == Base::Short || base == Base::Int || base == Base::Long;
+  }
   bool isVoid() const { return base == Base::Void && ptrDepth == 0 && arrayDims.empty(); }
   bool isStruct() const { return base == Base::Struct; }
   bool isPointer() const { return ptrDepth > 0; }

@@ -68,10 +68,28 @@ static std::optional<Type> checkExprImpl(
     Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e);
 
 static bool isScalarType(const Type& t) {
-  return t.isInt() || t.isPointer();
+  return t.isInteger() || t.isPointer();
 }
 
 static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr);
+
+static Type promoteInteger(const Type& t) {
+  Type res = t;
+  if (!t.isInteger()) return res;
+  if (t.base == Type::Base::Char || t.base == Type::Base::Short) {
+    res.base = Type::Base::Int;
+  }
+  return res;
+}
+
+static Type commonIntegerType(const Type& lhs, const Type& rhs) {
+  Type L = promoteInteger(lhs);
+  Type R = promoteInteger(rhs);
+  if (L.base == Type::Base::Long || R.base == Type::Base::Long) {
+    return Type{Type::Base::Long, 0};
+  }
+  return Type{};
+}
 
 static bool isPointerCompatibleForAssign(const Type& dst, const Type& src) {
   if (!dst.isPointer() || !src.isPointer()) return false;
@@ -303,7 +321,7 @@ static void checkStmtImpl(
 
   if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
     auto condTy = checkExprImpl(diags, scopes, fns, structs, *sw->cond);
-    if (condTy && !condTy->isInt()) {
+    if (condTy && !condTy->isInteger()) {
       diags.error(sw->cond->loc, "switch condition must be int");
     }
     scopes.push_back({});
@@ -454,7 +472,7 @@ static std::optional<Type> checkLValue(
       Type dt = baseTy->decayType();
       baseTy = dt;
     }
-    if (!idxTy->isInt()) {
+    if (!idxTy->isInteger()) {
       diags.error(sub->index->loc, "array subscript must be int");
       return std::nullopt;
     }
@@ -495,6 +513,7 @@ static std::optional<Type> checkLValue(
 
 static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr) {
   if (dst == src) return true;
+  if (dst.isInteger() && src.isInteger()) return true;
   if (dst.isPointer() && src.isInt() && isNullPointerConstant(srcExpr)) return true;
   if (isPointerCompatibleForAssign(dst, src)) return true;
   return false;
@@ -581,6 +600,11 @@ static std::optional<Type> checkExprImpl(
       e.semaType = *thenTy;
       return *thenTy;
     }
+    if (thenTy->isInteger() && elseTy->isInteger()) {
+      Type t = commonIntegerType(*thenTy, *elseTy);
+      e.semaType = t;
+      return t;
+    }
     if (thenTy->isPointer() && elseTy->isInt() && isNullPointerConstant(*ter->elseExpr)) {
       e.semaType = *thenTy;
       return *thenTy;
@@ -634,11 +658,11 @@ static std::optional<Type> checkExprImpl(
     }
 
     if (un->op == TokenKind::Plus || un->op == TokenKind::Minus || un->op == TokenKind::Tilde) {
-      if (!opTy->isInt()) {
+      if (!opTy->isInteger()) {
         diags.error(un->loc, "invalid operand to unary operator");
         return std::nullopt;
       }
-      Type t;
+      Type t = promoteInteger(*opTy);
       e.semaType = t;
       return t;
     }
@@ -671,6 +695,11 @@ static std::optional<Type> checkExprImpl(
           e.semaType = t;
           return t;
         }
+        if (lhsTy->isInteger() && rhsTy->isInteger()) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
         if (lhsTy->isPointer() && rhsTy->isPointer() &&
             lhsTy->ptrDepth == 1 && rhsTy->ptrDepth == 1 &&
             (lhsTy->base == Type::Base::Void || rhsTy->base == Type::Base::Void)) {
@@ -695,7 +724,7 @@ static std::optional<Type> checkExprImpl(
       case TokenKind::LessEqual:
       case TokenKind::Greater:
       case TokenKind::GreaterEqual: {
-        if (!(lhsTy->isInt() && rhsTy->isInt())) {
+        if (!(lhsTy->isInteger() && rhsTy->isInteger())) {
           if (!(lhsTy->isPointer() && rhsTy->isPointer() && *lhsTy == *rhsTy &&
                 !lhsTy->isVoidPointer())) {
             diags.error(bin->loc, "invalid operands to relational operator");
@@ -708,16 +737,16 @@ static std::optional<Type> checkExprImpl(
       }
       case TokenKind::Plus:
       case TokenKind::Minus: {
-        if (lhsTy->isInt() && rhsTy->isInt()) {
-          Type t;
+        if (lhsTy->isInteger() && rhsTy->isInteger()) {
+          Type t = commonIntegerType(*lhsTy, *rhsTy);
           e.semaType = t;
           return t;
         }
-        if (lhsTy->isPointer() && rhsTy->isInt() && !lhsTy->isVoidPointer()) {
+        if (lhsTy->isPointer() && rhsTy->isInteger() && !lhsTy->isVoidPointer()) {
           e.semaType = *lhsTy;
           return *lhsTy;
         }
-        if (bin->op == TokenKind::Plus && lhsTy->isInt() && rhsTy->isPointer() &&
+        if (bin->op == TokenKind::Plus && lhsTy->isInteger() && rhsTy->isPointer() &&
             !rhsTy->isVoidPointer()) {
           e.semaType = *rhsTy;
           return *rhsTy;
@@ -733,11 +762,11 @@ static std::optional<Type> checkExprImpl(
       }
       case TokenKind::Star:
       case TokenKind::Slash: {
-        if (!lhsTy->isInt() || !rhsTy->isInt()) {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
           diags.error(bin->loc, "invalid operands to arithmetic operator");
           return std::nullopt;
         }
-        Type t;
+        Type t = commonIntegerType(*lhsTy, *rhsTy);
         e.semaType = t;
         return t;
       }
@@ -754,7 +783,7 @@ static std::optional<Type> checkExprImpl(
       Type dt = baseTy->decayType();
       baseTy = dt;
     }
-    if (!idxTy->isInt()) {
+    if (!idxTy->isInteger()) {
       diags.error(sub->index->loc, "array subscript must be int");
       return std::nullopt;
     }

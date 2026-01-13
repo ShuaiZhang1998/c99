@@ -104,6 +104,12 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
     auto it = env.structs.find(t.structName);
     assert(it != env.structs.end());
     baseTy = it->second;
+  } else if (t.base == Type::Base::Char) {
+    baseTy = llvm::Type::getInt8Ty(env.ctx);
+  } else if (t.base == Type::Base::Short) {
+    baseTy = llvm::Type::getInt16Ty(env.ctx);
+  } else if (t.base == Type::Base::Long) {
+    baseTy = llvm::Type::getInt64Ty(env.ctx);
   } else {
     baseTy = env.i32Ty();
   }
@@ -137,11 +143,48 @@ static llvm::Value* i32Const(CGEnv& env, int64_t v) {
   return llvm::ConstantInt::get(env.i32Ty(), (uint64_t)v, true);
 }
 
+static Type commonIntegerType(const Type& lhs, const Type& rhs) {
+  if (lhs.base == Type::Base::Long || rhs.base == Type::Base::Long) {
+    return Type{Type::Base::Long, 0};
+  }
+  return Type{};
+}
+
+static llvm::Value* castInteger(CGEnv& env, llvm::Value* v, llvm::Type* dstTy) {
+  if (v->getType() == dstTy) return v;
+  if (v->getType()->isIntegerTy() && dstTy->isIntegerTy()) {
+    return env.b.CreateSExtOrTrunc(v, dstTy, "int.cast");
+  }
+  return v;
+}
+
+static llvm::Value* castIndex(CGEnv& env, llvm::Value* v) {
+  if (v->getType()->isIntegerTy(64)) return v;
+  if (v->getType()->isIntegerTy()) {
+    return env.b.CreateSExtOrTrunc(v, env.b.getInt64Ty(), "idx.cast");
+  }
+  return v;
+}
+
+static uint64_t integerSizeBytes(const Type& t) {
+  switch (t.base) {
+    case Type::Base::Char:  return 1;
+    case Type::Base::Short: return 2;
+    case Type::Base::Long:  return 8;
+    case Type::Base::Int:   return 4;
+    default: return sizeof(void*);
+  }
+}
+
 static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
   if (v->getType()->isIntegerTy(1)) return v;
   if (v->getType()->isPointerTy()) {
     auto* pty = llvm::cast<llvm::PointerType>(v->getType());
     auto* zero = llvm::ConstantPointerNull::get(pty);
+    return env.b.CreateICmpNE(v, zero, "tobool");
+  }
+  if (v->getType()->isIntegerTy()) {
+    auto* zero = llvm::ConstantInt::get(v->getType(), 0, true);
     return env.b.CreateICmpNE(v, zero, "tobool");
   }
   return env.b.CreateICmpNE(v, i32Const(env, 0), "tobool");
@@ -176,6 +219,9 @@ static llvm::Constant* zeroValue(CGEnv& env, const Type& t) {
   if (t.isArray() || (t.base == Type::Base::Struct && t.ptrDepth == 0)) {
     return llvm::ConstantAggregateZero::get(ty);
   }
+  if (t.isInteger()) {
+    return llvm::ConstantInt::get(ty, 0, true);
+  }
   return llvm::ConstantInt::get(env.i32Ty(), 0, true);
 }
 
@@ -196,7 +242,7 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
 
 static llvm::Value* emitEqualByAddr(
     CGEnv& env, const Type& ty, llvm::Value* lhsAddr, llvm::Value* rhsAddr) {
-  if (ty.isPointer() || ty.isInt()) {
+  if (ty.isPointer() || ty.isInteger()) {
     llvm::Type* elemTy = llvmType(env, ty);
     llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
     llvm::Value* R = env.b.CreateLoad(elemTy, rhsAddr, "cmp.r");
@@ -249,7 +295,7 @@ static llvm::Value* emitEqualByAddr(
 }
 
 static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm::Value* rhs) {
-  if (ty.isPointer() || ty.isInt()) {
+  if (ty.isPointer() || ty.isInteger()) {
     return env.b.CreateICmpEQ(lhs, rhs, "cmp");
   }
   if (ty.isArray() || (ty.base == Type::Base::Struct && ty.ptrDepth == 0)) {
@@ -312,6 +358,8 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
   } else if (ty.isPointer() && exprType(init).isPointer()) {
     llvm::Type* ptrTy = llvmType(env, ty);
     initV = castPointerIfNeeded(env, initV, ptrTy);
+  } else if (ty.isInteger() && initV->getType()->isIntegerTy()) {
+    initV = castInteger(env, initV, llvmType(env, ty));
   }
   env.b.CreateStore(initV, addr);
 }
@@ -331,12 +379,26 @@ static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
       llvm::Type* elemTy = opnd->getType()->getPointerElementType();
       return env.b.CreateLoad(elemTy, opnd, "deref");
     }
-    case TokenKind::Plus:
-      return emitExpr(env, *u.operand);
-    case TokenKind::Minus:
-      return env.b.CreateSub(i32Const(env, 0), emitExpr(env, *u.operand), "neg");
-    case TokenKind::Tilde:
-      return env.b.CreateNot(emitExpr(env, *u.operand), "bitnot");
+    case TokenKind::Plus: {
+      llvm::Value* v = emitExpr(env, *u.operand);
+      const Type& resTy = exprType(u);
+      if (resTy.isInteger()) v = castInteger(env, v, llvmType(env, resTy));
+      return v;
+    }
+    case TokenKind::Minus: {
+      llvm::Value* v = emitExpr(env, *u.operand);
+      const Type& resTy = exprType(u);
+      llvm::Type* resLlvmTy = llvmType(env, resTy);
+      if (resTy.isInteger()) v = castInteger(env, v, resLlvmTy);
+      llvm::Value* zero = llvm::ConstantInt::get(resLlvmTy, 0, true);
+      return env.b.CreateSub(zero, v, "neg");
+    }
+    case TokenKind::Tilde: {
+      llvm::Value* v = emitExpr(env, *u.operand);
+      const Type& resTy = exprType(u);
+      if (resTy.isInteger()) v = castInteger(env, v, llvmType(env, resTy));
+      return env.b.CreateNot(v, "bitnot");
+    }
     case TokenKind::Bang: {
       llvm::Value* b = asBoolI1(env, emitExpr(env, *u.operand));
       llvm::Value* inv = env.b.CreateNot(b, "lnot");
@@ -409,69 +471,142 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
 
   switch (bin.op) {
     case TokenKind::Plus: {
-      if (lhsTy.isPointer() && rhsTy.isInt()) {
+      if (lhsTy.isPointer() && rhsTy.isInteger()) {
         llvm::Type* elemTy = L->getType()->getPointerElementType();
-        return env.b.CreateGEP(elemTy, L, R, "ptr.add");
+        llvm::Value* idx = castIndex(env, R);
+        return env.b.CreateGEP(elemTy, L, idx, "ptr.add");
       }
-      if (lhsTy.isInt() && rhsTy.isPointer()) {
+      if (lhsTy.isInteger() && rhsTy.isPointer()) {
         llvm::Type* elemTy = R->getType()->getPointerElementType();
-        return env.b.CreateGEP(elemTy, R, L, "ptr.add");
+        llvm::Value* idx = castIndex(env, L);
+        return env.b.CreateGEP(elemTy, R, idx, "ptr.add");
+      }
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        const Type& resTy = exprType(bin);
+        llvm::Type* resLlvmTy = llvmType(env, resTy);
+        L = castInteger(env, L, resLlvmTy);
+        R = castInteger(env, R, resLlvmTy);
       }
       return env.b.CreateAdd(L, R, "add");
     }
     case TokenKind::Minus: {
-      if (lhsTy.isPointer() && rhsTy.isInt()) {
+      if (lhsTy.isPointer() && rhsTy.isInteger()) {
         llvm::Type* elemTy = L->getType()->getPointerElementType();
-        llvm::Value* neg = env.b.CreateSub(i32Const(env, 0), R, "neg");
+        llvm::Value* idx = castIndex(env, R);
+        llvm::Value* zero = llvm::ConstantInt::get(idx->getType(), 0, true);
+        llvm::Value* neg = env.b.CreateSub(zero, idx, "neg");
         return env.b.CreateGEP(elemTy, L, neg, "ptr.sub");
       }
       if (lhsTy.isPointer() && rhsTy.isPointer()) {
         llvm::Value* Li = env.b.CreatePtrToInt(L, env.b.getInt64Ty(), "ptrtoi.l");
         llvm::Value* Ri = env.b.CreatePtrToInt(R, env.b.getInt64Ty(), "ptrtoi.r");
         llvm::Value* diffBytes = env.b.CreateSub(Li, Ri, "ptrdiff.bytes");
-        uint64_t elemSize = (lhsTy.ptrDepth == 1 && lhsTy.base == Type::Base::Int)
-                                ? sizeof(int)
-                                : sizeof(void*);
+        Type elemTy = lhsTy.pointee();
+        uint64_t elemSize = elemTy.isInteger() ? integerSizeBytes(elemTy) : sizeof(void*);
         llvm::Value* elemSizeV = llvm::ConstantInt::get(env.b.getInt64Ty(), elemSize, false);
         llvm::Value* diffElems = env.b.CreateSDiv(diffBytes, elemSizeV, "ptrdiff");
         return env.b.CreateTrunc(diffElems, env.i32Ty(), "ptrdiff.i32");
       }
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        const Type& resTy = exprType(bin);
+        llvm::Type* resLlvmTy = llvmType(env, resTy);
+        L = castInteger(env, L, resLlvmTy);
+        R = castInteger(env, R, resLlvmTy);
+      }
       return env.b.CreateSub(L, R, "sub");
     }
-    case TokenKind::Star:  return env.b.CreateMul(L, R, "mul");
-    case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
+    case TokenKind::Star: {
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        const Type& resTy = exprType(bin);
+        llvm::Type* resLlvmTy = llvmType(env, resTy);
+        L = castInteger(env, L, resLlvmTy);
+        R = castInteger(env, R, resLlvmTy);
+      }
+      return env.b.CreateMul(L, R, "mul");
+    }
+    case TokenKind::Slash: {
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        const Type& resTy = exprType(bin);
+        llvm::Type* resLlvmTy = llvmType(env, resTy);
+        L = castInteger(env, L, resLlvmTy);
+        R = castInteger(env, R, resLlvmTy);
+      }
+      return env.b.CreateSDiv(L, R, "div");
+    }
 
     case TokenKind::Comma:
       return R;
 
     case TokenKind::Less: {
       llvm::Value* c = nullptr;
-      if (lhsTy.isPointer()) c = env.b.CreateICmpULT(L, R, "cmp");
-      else c = env.b.CreateICmpSLT(L, R, "cmp");
+      if (lhsTy.isPointer()) {
+        c = env.b.CreateICmpULT(L, R, "cmp");
+      } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
+        c = env.b.CreateICmpSLT(L, R, "cmp");
+      } else {
+        c = env.b.CreateICmpSLT(L, R, "cmp");
+      }
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::LessEqual: {
       llvm::Value* c = nullptr;
-      if (lhsTy.isPointer()) c = env.b.CreateICmpULE(L, R, "cmp");
-      else c = env.b.CreateICmpSLE(L, R, "cmp");
+      if (lhsTy.isPointer()) {
+        c = env.b.CreateICmpULE(L, R, "cmp");
+      } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
+        c = env.b.CreateICmpSLE(L, R, "cmp");
+      } else {
+        c = env.b.CreateICmpSLE(L, R, "cmp");
+      }
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::Greater: {
       llvm::Value* c = nullptr;
-      if (lhsTy.isPointer()) c = env.b.CreateICmpUGT(L, R, "cmp");
-      else c = env.b.CreateICmpSGT(L, R, "cmp");
+      if (lhsTy.isPointer()) {
+        c = env.b.CreateICmpUGT(L, R, "cmp");
+      } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
+        c = env.b.CreateICmpSGT(L, R, "cmp");
+      } else {
+        c = env.b.CreateICmpSGT(L, R, "cmp");
+      }
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::GreaterEqual: {
       llvm::Value* c = nullptr;
-      if (lhsTy.isPointer()) c = env.b.CreateICmpUGE(L, R, "cmp");
-      else c = env.b.CreateICmpSGE(L, R, "cmp");
+      if (lhsTy.isPointer()) {
+        c = env.b.CreateICmpUGE(L, R, "cmp");
+      } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
+        c = env.b.CreateICmpSGE(L, R, "cmp");
+      } else {
+        c = env.b.CreateICmpSGE(L, R, "cmp");
+      }
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::EqualEqual: {
       if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         return env.b.CreateZExt(eq, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
       }
       if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
         auto* pty = llvm::cast<llvm::PointerType>(L->getType());
@@ -493,6 +628,12 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         llvm::Value* ne = env.b.CreateNot(eq, "cmp.not");
         return env.b.CreateZExt(ne, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        Type cmpTy = commonIntegerType(lhsTy, rhsTy);
+        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
+        L = castInteger(env, L, cmpLlvmTy);
+        R = castInteger(env, R, cmpLlvmTy);
       }
       if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
         auto* pty = llvm::cast<llvm::PointerType>(L->getType());
@@ -533,7 +674,8 @@ static llvm::Value* emitLValue(CGEnv& env, const Expr& e) {
     if (baseTy.isArray() && !baseTy.ptrOutsideArrays) baseTy = baseTy.decayType();
     Type elemTy = baseTy.pointee();
     llvm::Type* llvmElemTy = llvmType(env, elemTy);
-    return env.b.CreateGEP(llvmElemTy, basePtr, idx, "sub.addr");
+    llvm::Value* adjIdx = castIndex(env, idx);
+    return env.b.CreateGEP(llvmElemTy, basePtr, adjIdx, "sub.addr");
   }
 
   if (auto* mem = dynamic_cast<const MemberExpr*>(&e)) {
@@ -610,6 +752,11 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
           argsV.push_back(castPointerIfNeeded(env, v, paramTy));
           continue;
         }
+        if (paramTy->isIntegerTy() && exprType(*a).isInteger()) {
+          llvm::Value* v = emitExpr(env, *a);
+          argsV.push_back(castInteger(env, v, paramTy));
+          continue;
+        }
       }
       argsV.push_back(emitExpr(env, *a));
     }
@@ -648,6 +795,9 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
       if (isNullPointerLiteral(*ter->elseExpr)) {
         elseV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(resLlvmTy));
       }
+    } else if (resTy.isInteger()) {
+      thenV = castInteger(env, thenV, resLlvmTy);
+      elseV = castInteger(env, elseV, resLlvmTy);
     }
     llvm::PHINode* phi = env.b.CreatePHI(resLlvmTy, 2, "ternary");
     phi->addIncoming(thenV, thenBB);
@@ -705,6 +855,8 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     } else if (lhsTy.isPointer() && exprType(*asn->rhs).isPointer()) {
       llvm::Type* ptrTy = llvmType(env, lhsTy);
       rhsV = castPointerIfNeeded(env, rhsV, ptrTy);
+    } else if (lhsTy.isInteger() && rhsV->getType()->isIntegerTy()) {
+      rhsV = castInteger(env, rhsV, llvmType(env, lhsTy));
     }
     env.b.CreateStore(rhsV, addr);
     return rhsV;
@@ -732,6 +884,9 @@ static bool emitSwitch(CGEnv& env, const SwitchStmt& s) {
   llvm::Function* F = env.fn;
 
   llvm::Value* condV = emitExpr(env, *s.cond);
+  if (condV->getType()->isIntegerTy() && !condV->getType()->isIntegerTy(32)) {
+    condV = castInteger(env, condV, env.i32Ty());
+  }
   llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "switch.end", F);
 
   std::vector<llvm::BasicBlock*> caseBBs;
@@ -934,6 +1089,8 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     } else if (env.currentReturnType.isPointer() && exprType(*r->valueExpr).isPointer()) {
       llvm::Type* ptrTy = llvmType(env, env.currentReturnType);
       retV = castPointerIfNeeded(env, retV, ptrTy);
+    } else if (env.currentReturnType.isInteger() && retV->getType()->isIntegerTy()) {
+      retV = castInteger(env, retV, llvmType(env, env.currentReturnType));
     }
     env.b.CreateRet(retV);
     return true;
@@ -1023,7 +1180,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       } else if (decl.type.isPointer()) {
         init = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(gvTy));
       } else {
-        init = llvm::ConstantInt::get(env.i32Ty(), 0, true);
+        init = zeroValue(env, decl.type);
       }
       auto* gv = new llvm::GlobalVariable(
           *mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::ExternalLinkage, init, decl.name);
@@ -1127,7 +1284,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
         llvm::Type* ptrTy = llvmType(env, p.returnType);
         builder.CreateRet(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
       } else {
-        builder.CreateRet(i32Const(env, 0));
+        builder.CreateRet(zeroValue(env, p.returnType));
       }
     }
 

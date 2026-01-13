@@ -21,9 +21,24 @@ int Parser::parsePointerDepth() {
 
 std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef) {
   ParsedTypeSpec spec;
+  if (cur_.kind == TokenKind::KwChar) {
+    advance();
+    spec.type.base = Type::Base::Char;
+    return spec;
+  }
+  if (cur_.kind == TokenKind::KwShort) {
+    advance();
+    spec.type.base = Type::Base::Short;
+    return spec;
+  }
   if (cur_.kind == TokenKind::KwInt) {
     advance();
     spec.type.base = Type::Base::Int;
+    return spec;
+  }
+  if (cur_.kind == TokenKind::KwLong) {
+    advance();
+    spec.type.base = Type::Base::Long;
     return spec;
   }
   if (cur_.kind == TokenKind::KwVoid) {
@@ -373,8 +388,9 @@ std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
 // -------------------- statements --------------------
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
-  if (cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwVoid ||
-      cur_.kind == TokenKind::KwStruct) {
+  if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
+      cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
+      cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
     return parseDeclStmt();
   }
   if (cur_.kind == TokenKind::KwReturn) return parseReturnStmt();
@@ -605,7 +621,9 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
 
   if (cur_.kind == TokenKind::Semicolon) {
     advance();
-  } else if (cur_.kind == TokenKind::KwInt) {
+  } else if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
+             cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
+             cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
     auto d = parseDeclStmt();
     if (!d) return std::nullopt;
     init = std::move(*d);

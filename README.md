@@ -17,6 +17,9 @@
 ### **类型系统（当前支持）**
 
 - `int`
+- `char`
+- `short`
+- `long`
 - 指针（多级）：`int*`, `int**`, `void*`
 - 数组（含多维）
 - `struct`（定义、变量、成员访问、按值传参/返回/赋值、比较）
@@ -269,7 +272,7 @@ echo $?
 
 ## **已知限制（尚未实现）**
 
-- 仅支持 `int` 与指针/数组/struct 子集（无 `char/float/double/long`）
+- 支持 `char/short/int/long` 与指针/数组/struct 子集（无 `float/double`）
 - 无显式类型转换、`sizeof`、`typedef`、`enum`、`union`、位域
 - 仅支持 `==`/`!=` 的结构体比较（无排序比较）
 - 无数组对象的独立初始化列表（但结构体内数组字段可初始化）

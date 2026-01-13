@@ -44,7 +44,10 @@ Token Lexer::lexIdentifierOrKeyword() {
     else break;
   }
 
+  if (s == "char")     return Token{TokenKind::KwChar, s, loc};
+  if (s == "short")    return Token{TokenKind::KwShort, s, loc};
   if (s == "int")      return Token{TokenKind::KwInt, s, loc};
+  if (s == "long")     return Token{TokenKind::KwLong, s, loc};
   if (s == "void")     return Token{TokenKind::KwVoid, s, loc};
   if (s == "struct")   return Token{TokenKind::KwStruct, s, loc};
   if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
