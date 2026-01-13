@@ -10,6 +10,8 @@ enum class TokenKind {
   IntegerLiteral,
 
   KwInt,
+  KwVoid,
+  KwStruct,
   KwReturn,
   KwIf,
   KwElse,
@@ -18,13 +20,19 @@ enum class TokenKind {
   KwFor,
   KwBreak,
   KwContinue,
+  KwSwitch,
+  KwCase,
+  KwDefault,
 
   LParen, RParen,
   LBrace, RBrace,
+  LBracket, RBracket,
   Semicolon,
+  Colon,
 
   Plus, Minus, Star, Slash,
   Assign,
+  Amp,    // &
 
   Comma,
 
@@ -39,6 +47,11 @@ enum class TokenKind {
 
   AmpAmp,   // &&
   PipePipe, // ||
+
+  Question, // ?
+
+  Dot,      // .
+  Arrow,    // ->
 };
 
 struct Token {

@@ -27,12 +27,30 @@ struct CGEnv {
   llvm::IRBuilder<>& b;
 
   llvm::Function* fn = nullptr;
+  Type currentReturnType{};
 
   // function table: name -> llvm::Function*
   std::unordered_map<std::string, llvm::Function*> functions;
 
-  // local scopes: name -> alloca
-  std::vector<std::unordered_map<std::string, llvm::AllocaInst*>> scopes;
+  // struct table: name -> llvm::StructType*
+  std::unordered_map<std::string, llvm::StructType*> structs;
+  std::unordered_map<std::string, std::vector<StructField>> structFields;
+
+  struct GlobalBinding {
+    llvm::GlobalVariable* gv = nullptr;
+    Type type;
+  };
+
+  struct LocalBinding {
+    llvm::AllocaInst* slot = nullptr;
+    Type type;
+  };
+
+  // global variables: name -> binding
+  std::unordered_map<std::string, GlobalBinding> globals;
+
+  // local scopes: name -> binding
+  std::vector<std::unordered_map<std::string, LocalBinding>> scopes;
 
   // loop stack: {breakTarget, continueTarget}
   std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loops;
@@ -45,29 +63,74 @@ struct CGEnv {
 
   void resetFunctionState(llvm::Function* f) {
     fn = f;
+    currentReturnType = Type{};
     scopes.clear();
     loops.clear();
   }
 
-  llvm::AllocaInst* lookup(const std::string& name) {
+  LocalBinding* lookupLocal(const std::string& name) {
     for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
       auto f = it->find(name);
-      if (f != it->end()) return f->second;
+      if (f != it->end()) return &f->second;
     }
     return nullptr;
   }
 
-  bool insertLocal(const std::string& name, llvm::AllocaInst* slot) {
+  GlobalBinding* lookupGlobal(const std::string& name) {
+    auto it = globals.find(name);
+    if (it == globals.end()) return nullptr;
+    return &it->second;
+  }
+
+  bool insertLocal(const std::string& name, llvm::AllocaInst* slot, const Type& type) {
     auto& cur = scopes.back();
     if (cur.count(name)) return false;
-    cur[name] = slot;
+    cur.emplace(name, LocalBinding{slot, type});
+    return true;
+  }
+
+  bool insertGlobal(const std::string& name, llvm::GlobalVariable* gv, const Type& type) {
+    if (globals.count(name)) return false;
+    globals.emplace(name, GlobalBinding{gv, type});
     return true;
   }
 };
 
-static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name) {
+static llvm::Type* llvmType(CGEnv& env, const Type& t) {
+  llvm::Type* baseTy = nullptr;
+  if (t.base == Type::Base::Void) {
+    baseTy = llvm::Type::getInt8Ty(env.ctx);
+  } else if (t.base == Type::Base::Struct) {
+    auto it = env.structs.find(t.structName);
+    assert(it != env.structs.end());
+    baseTy = it->second;
+  } else {
+    baseTy = env.i32Ty();
+  }
+  llvm::Type* ty = baseTy;
+  if (t.ptrOutsideArrays) {
+    for (auto it = t.arrayDims.rbegin(); it != t.arrayDims.rend(); ++it) {
+      size_t dim = it->value_or(0);
+      ty = llvm::ArrayType::get(ty, dim);
+    }
+    for (int i = 0; i < t.ptrDepth; ++i) {
+      ty = llvm::PointerType::getUnqual(ty);
+    }
+  } else {
+    for (int i = 0; i < t.ptrDepth; ++i) {
+      ty = llvm::PointerType::getUnqual(ty);
+    }
+    for (auto it = t.arrayDims.rbegin(); it != t.arrayDims.rend(); ++it) {
+      size_t dim = it->value_or(0);
+      ty = llvm::ArrayType::get(ty, dim);
+    }
+  }
+  return ty;
+}
+
+static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name, const Type& type) {
   llvm::IRBuilder<> tmp(&env.fn->getEntryBlock(), env.fn->getEntryBlock().begin());
-  return tmp.CreateAlloca(env.i32Ty(), nullptr, name);
+  return tmp.CreateAlloca(llvmType(env, type), nullptr, name);
 }
 
 static llvm::Value* i32Const(CGEnv& env, int64_t v) {
@@ -76,11 +139,12 @@ static llvm::Value* i32Const(CGEnv& env, int64_t v) {
 
 static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
   if (v->getType()->isIntegerTy(1)) return v;
+  if (v->getType()->isPointerTy()) {
+    auto* pty = llvm::cast<llvm::PointerType>(v->getType());
+    auto* zero = llvm::ConstantPointerNull::get(pty);
+    return env.b.CreateICmpNE(v, zero, "tobool");
+  }
   return env.b.CreateICmpNE(v, i32Const(env, 0), "tobool");
-}
-
-static size_t arityOfProto(const FunctionProto& p) {
-  return p.params.size();
 }
 
 static const FunctionProto* getProto(const TopLevelItem& item) {
@@ -89,23 +153,192 @@ static const FunctionProto* getProto(const TopLevelItem& item) {
   return nullptr;
 }
 
+static const Type& exprType(const Expr& e) {
+  assert(e.semaType.has_value());
+  return *e.semaType;
+}
+
+static bool isNullPointerLiteral(const Expr& e) {
+  if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) return lit->value == 0;
+  return false;
+}
+
+static llvm::Value* castPointerIfNeeded(CGEnv& env, llvm::Value* v, llvm::Type* dstTy) {
+  if (v->getType() == dstTy) return v;
+  return env.b.CreateBitCast(v, dstTy, "ptr.cast");
+}
+
+static llvm::Constant* zeroValue(CGEnv& env, const Type& t) {
+  llvm::Type* ty = llvmType(env, t);
+  if (t.isPointer()) {
+    return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty));
+  }
+  if (t.isArray() || (t.base == Type::Base::Struct && t.ptrDepth == 0)) {
+    return llvm::ConstantAggregateZero::get(ty);
+  }
+  return llvm::ConstantInt::get(env.i32Ty(), 0, true);
+}
+
+static Type adjustParamType(const Type& t) {
+  if (!t.isArray()) return t;
+  return t.decayType();
+}
+
+static llvm::Value* decayArrayToPointer(CGEnv& env, llvm::Value* addr, const Type& arrayTy) {
+  llvm::Value* zero = i32Const(env, 0);
+  llvm::Value* idxs[] = {zero, zero};
+  llvm::Type* arrTy = llvmType(env, arrayTy);
+  return env.b.CreateGEP(arrTy, addr, idxs, "arr.decay");
+}
+
 // forward decl
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
+
+static llvm::Value* emitEqualByAddr(
+    CGEnv& env, const Type& ty, llvm::Value* lhsAddr, llvm::Value* rhsAddr) {
+  if (ty.isPointer() || ty.isInt()) {
+    llvm::Type* elemTy = llvmType(env, ty);
+    llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
+    llvm::Value* R = env.b.CreateLoad(elemTy, rhsAddr, "cmp.r");
+    return env.b.CreateICmpEQ(L, R, "cmp");
+  }
+
+  if (ty.isArray() && !ty.ptrOutsideArrays) {
+    if (ty.arrayDims.empty() || !ty.arrayDims[0].has_value()) {
+      return llvm::ConstantInt::getTrue(env.ctx);
+    }
+    size_t size = *ty.arrayDims[0];
+    Type elemTy = ty.elementType();
+    llvm::Type* arrTy = llvmType(env, ty);
+    llvm::Value* acc = nullptr;
+    for (size_t i = 0; i < size; ++i) {
+      llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(i))};
+      llvm::Value* l = env.b.CreateGEP(arrTy, lhsAddr, idxs, "arr.l");
+      llvm::Value* r = env.b.CreateGEP(arrTy, rhsAddr, idxs, "arr.r");
+      llvm::Value* eq = emitEqualByAddr(env, elemTy, l, r);
+      acc = acc ? env.b.CreateAnd(acc, eq, "cmp.and") : eq;
+    }
+    if (!acc) return llvm::ConstantInt::getTrue(env.ctx);
+    return acc;
+  }
+
+  if (ty.base == Type::Base::Struct && ty.ptrDepth == 0) {
+    auto it = env.structFields.find(ty.structName);
+    auto stIt = env.structs.find(ty.structName);
+    if (it == env.structFields.end() || stIt == env.structs.end()) {
+      return llvm::ConstantInt::getTrue(env.ctx);
+    }
+    llvm::Value* acc = nullptr;
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      const Type& fieldTy = it->second[i].type;
+      llvm::Value* l = env.b.CreateStructGEP(
+          stIt->second, lhsAddr, static_cast<unsigned>(i), "fld.l");
+      llvm::Value* r = env.b.CreateStructGEP(
+          stIt->second, rhsAddr, static_cast<unsigned>(i), "fld.r");
+      llvm::Value* eq = emitEqualByAddr(env, fieldTy, l, r);
+      acc = acc ? env.b.CreateAnd(acc, eq, "cmp.and") : eq;
+    }
+    if (!acc) return llvm::ConstantInt::getTrue(env.ctx);
+    return acc;
+  }
+
+  llvm::Type* elemTy = llvmType(env, ty);
+  llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
+  llvm::Value* R = env.b.CreateLoad(elemTy, rhsAddr, "cmp.r");
+  return env.b.CreateICmpEQ(L, R, "cmp");
+}
+
+static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm::Value* rhs) {
+  if (ty.isPointer() || ty.isInt()) {
+    return env.b.CreateICmpEQ(lhs, rhs, "cmp");
+  }
+  if (ty.isArray() || (ty.base == Type::Base::Struct && ty.ptrDepth == 0)) {
+    llvm::AllocaInst* ltmp = createEntryAlloca(env, "cmp.lhs", ty);
+    llvm::AllocaInst* rtmp = createEntryAlloca(env, "cmp.rhs", ty);
+    env.b.CreateStore(lhs, ltmp);
+    env.b.CreateStore(rhs, rtmp);
+    return emitEqualByAddr(env, ty, ltmp, rtmp);
+  }
+  return env.b.CreateICmpEQ(lhs, rhs, "cmp");
+}
+
+static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const Expr& init) {
+  if (auto* list = dynamic_cast<const InitListExpr*>(&init)) {
+    if (ty.base == Type::Base::Struct && ty.ptrDepth == 0) {
+      auto it = env.structFields.find(ty.structName);
+      if (it == env.structFields.end()) return;
+      auto stIt = env.structs.find(ty.structName);
+      if (stIt == env.structs.end()) return;
+      size_t count = it->second.size();
+      for (size_t i = 0; i < count; ++i) {
+        llvm::Value* fieldAddr = env.b.CreateStructGEP(
+            stIt->second, addr, static_cast<unsigned>(i), "init.fld");
+        if (i < list->elems.size()) {
+          emitInitToAddr(env, it->second[i].type, fieldAddr, *list->elems[i]);
+        } else {
+          env.b.CreateStore(zeroValue(env, it->second[i].type), fieldAddr);
+        }
+      }
+      return;
+    }
+    if (ty.isArray() && !ty.ptrOutsideArrays) {
+      if (ty.arrayDims.empty() || !ty.arrayDims[0].has_value()) return;
+      size_t size = *ty.arrayDims[0];
+      Type elemTy = ty.elementType();
+      llvm::Type* arrTy = llvmType(env, ty);
+      for (size_t i = 0; i < size; ++i) {
+        llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(i))};
+        llvm::Value* elemAddr = env.b.CreateGEP(arrTy, addr, idxs, "init.arr");
+        if (i < list->elems.size()) {
+          emitInitToAddr(env, elemTy, elemAddr, *list->elems[i]);
+        } else {
+          env.b.CreateStore(zeroValue(env, elemTy), elemAddr);
+        }
+      }
+      return;
+    }
+    if (!list->elems.empty()) {
+      emitInitToAddr(env, ty, addr, *list->elems[0]);
+      return;
+    }
+    env.b.CreateStore(zeroValue(env, ty), addr);
+    return;
+  }
+
+  llvm::Value* initV = emitExpr(env, init);
+  if (ty.isPointer() && isNullPointerLiteral(init)) {
+    llvm::Type* ptrTy = llvmType(env, ty);
+    initV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
+  } else if (ty.isPointer() && exprType(init).isPointer()) {
+    llvm::Type* ptrTy = llvmType(env, ty);
+    initV = castPointerIfNeeded(env, initV, ptrTy);
+  }
+  env.b.CreateStore(initV, addr);
+}
+
+// forward decl
+static llvm::Value* emitLValue(CGEnv& env, const Expr& e);
 static bool emitStmt(CGEnv& env, const Stmt& s);
 
 // -------------------- Expr --------------------
 
 static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
-  llvm::Value* opnd = emitExpr(env, *u.operand);
   switch (u.op) {
+    case TokenKind::Amp:
+      return emitLValue(env, *u.operand);
+    case TokenKind::Star: {
+      llvm::Value* opnd = emitExpr(env, *u.operand);
+      llvm::Type* elemTy = opnd->getType()->getPointerElementType();
+      return env.b.CreateLoad(elemTy, opnd, "deref");
+    }
     case TokenKind::Plus:
-      return opnd;
+      return emitExpr(env, *u.operand);
     case TokenKind::Minus:
-      return env.b.CreateSub(i32Const(env, 0), opnd, "neg");
+      return env.b.CreateSub(i32Const(env, 0), emitExpr(env, *u.operand), "neg");
     case TokenKind::Tilde:
-      return env.b.CreateNot(opnd, "bitnot");
+      return env.b.CreateNot(emitExpr(env, *u.operand), "bitnot");
     case TokenKind::Bang: {
-      llvm::Value* b = asBoolI1(env, opnd);
+      llvm::Value* b = asBoolI1(env, emitExpr(env, *u.operand));
       llvm::Value* inv = env.b.CreateNot(b, "lnot");
       return env.b.CreateZExt(inv, env.i32Ty(), "lnot.i32");
     }
@@ -168,12 +401,43 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
   if (bin.op == TokenKind::AmpAmp) return emitShortCircuitAnd(env, bin);
   if (bin.op == TokenKind::PipePipe) return emitShortCircuitOr(env, bin);
 
+  const Type& lhsTy = exprType(*bin.lhs);
+  const Type& rhsTy = exprType(*bin.rhs);
+
   llvm::Value* L = emitExpr(env, *bin.lhs);
   llvm::Value* R = emitExpr(env, *bin.rhs);
 
   switch (bin.op) {
-    case TokenKind::Plus:  return env.b.CreateAdd(L, R, "add");
-    case TokenKind::Minus: return env.b.CreateSub(L, R, "sub");
+    case TokenKind::Plus: {
+      if (lhsTy.isPointer() && rhsTy.isInt()) {
+        llvm::Type* elemTy = L->getType()->getPointerElementType();
+        return env.b.CreateGEP(elemTy, L, R, "ptr.add");
+      }
+      if (lhsTy.isInt() && rhsTy.isPointer()) {
+        llvm::Type* elemTy = R->getType()->getPointerElementType();
+        return env.b.CreateGEP(elemTy, R, L, "ptr.add");
+      }
+      return env.b.CreateAdd(L, R, "add");
+    }
+    case TokenKind::Minus: {
+      if (lhsTy.isPointer() && rhsTy.isInt()) {
+        llvm::Type* elemTy = L->getType()->getPointerElementType();
+        llvm::Value* neg = env.b.CreateSub(i32Const(env, 0), R, "neg");
+        return env.b.CreateGEP(elemTy, L, neg, "ptr.sub");
+      }
+      if (lhsTy.isPointer() && rhsTy.isPointer()) {
+        llvm::Value* Li = env.b.CreatePtrToInt(L, env.b.getInt64Ty(), "ptrtoi.l");
+        llvm::Value* Ri = env.b.CreatePtrToInt(R, env.b.getInt64Ty(), "ptrtoi.r");
+        llvm::Value* diffBytes = env.b.CreateSub(Li, Ri, "ptrdiff.bytes");
+        uint64_t elemSize = (lhsTy.ptrDepth == 1 && lhsTy.base == Type::Base::Int)
+                                ? sizeof(int)
+                                : sizeof(void*);
+        llvm::Value* elemSizeV = llvm::ConstantInt::get(env.b.getInt64Ty(), elemSize, false);
+        llvm::Value* diffElems = env.b.CreateSDiv(diffBytes, elemSizeV, "ptrdiff");
+        return env.b.CreateTrunc(diffElems, env.i32Ty(), "ptrdiff.i32");
+      }
+      return env.b.CreateSub(L, R, "sub");
+    }
     case TokenKind::Star:  return env.b.CreateMul(L, R, "mul");
     case TokenKind::Slash: return env.b.CreateSDiv(L, R, "div");
 
@@ -181,26 +445,67 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       return R;
 
     case TokenKind::Less: {
-      auto* c = env.b.CreateICmpSLT(L, R, "cmp");
+      llvm::Value* c = nullptr;
+      if (lhsTy.isPointer()) c = env.b.CreateICmpULT(L, R, "cmp");
+      else c = env.b.CreateICmpSLT(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::LessEqual: {
-      auto* c = env.b.CreateICmpSLE(L, R, "cmp");
+      llvm::Value* c = nullptr;
+      if (lhsTy.isPointer()) c = env.b.CreateICmpULE(L, R, "cmp");
+      else c = env.b.CreateICmpSLE(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::Greater: {
-      auto* c = env.b.CreateICmpSGT(L, R, "cmp");
+      llvm::Value* c = nullptr;
+      if (lhsTy.isPointer()) c = env.b.CreateICmpUGT(L, R, "cmp");
+      else c = env.b.CreateICmpSGT(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::GreaterEqual: {
-      auto* c = env.b.CreateICmpSGE(L, R, "cmp");
+      llvm::Value* c = nullptr;
+      if (lhsTy.isPointer()) c = env.b.CreateICmpUGE(L, R, "cmp");
+      else c = env.b.CreateICmpSGE(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::EqualEqual: {
+      if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
+        llvm::Value* eq = emitEqual(env, lhsTy, L, R);
+        return env.b.CreateZExt(eq, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
+        auto* pty = llvm::cast<llvm::PointerType>(L->getType());
+        R = llvm::ConstantPointerNull::get(pty);
+      } else if (rhsTy.isPointer() && lhsTy.isInt() && isNullPointerLiteral(*bin.lhs)) {
+        auto* pty = llvm::cast<llvm::PointerType>(R->getType());
+        L = llvm::ConstantPointerNull::get(pty);
+      } else if (L->getType()->isPointerTy() && R->getType()->isPointerTy() &&
+                 L->getType() != R->getType()) {
+        llvm::Type* i8ptr = llvm::Type::getInt8PtrTy(env.ctx);
+        L = castPointerIfNeeded(env, L, i8ptr);
+        R = castPointerIfNeeded(env, R, i8ptr);
+      }
       auto* c = env.b.CreateICmpEQ(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::BangEqual: {
+      if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
+        llvm::Value* eq = emitEqual(env, lhsTy, L, R);
+        llvm::Value* ne = env.b.CreateNot(eq, "cmp.not");
+        return env.b.CreateZExt(ne, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
+        auto* pty = llvm::cast<llvm::PointerType>(L->getType());
+        R = llvm::ConstantPointerNull::get(pty);
+      } else if (rhsTy.isPointer() && lhsTy.isInt() && isNullPointerLiteral(*bin.lhs)) {
+        auto* pty = llvm::cast<llvm::PointerType>(R->getType());
+        L = llvm::ConstantPointerNull::get(pty);
+      } else if (L->getType()->isPointerTy() && R->getType()->isPointerTy() &&
+                 L->getType() != R->getType()) {
+        llvm::Type* i8ptr = llvm::Type::getInt8PtrTy(env.ctx);
+        L = castPointerIfNeeded(env, L, i8ptr);
+        R = castPointerIfNeeded(env, R, i8ptr);
+      }
       auto* c = env.b.CreateICmpNE(L, R, "cmp");
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
@@ -210,15 +515,78 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
   }
 }
 
+static llvm::Value* emitLValue(CGEnv& env, const Expr& e) {
+  if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
+    if (auto* local = env.lookupLocal(vr->name)) return local->slot;
+    if (auto* global = env.lookupGlobal(vr->name)) return global->gv;
+    return nullptr;
+  }
+
+  if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
+    if (un->op == TokenKind::Star) return emitExpr(env, *un->operand);
+  }
+
+  if (auto* sub = dynamic_cast<const SubscriptExpr*>(&e)) {
+    llvm::Value* basePtr = emitExpr(env, *sub->base);
+    llvm::Value* idx = emitExpr(env, *sub->index);
+    Type baseTy = exprType(*sub->base);
+    if (baseTy.isArray() && !baseTy.ptrOutsideArrays) baseTy = baseTy.decayType();
+    Type elemTy = baseTy.pointee();
+    llvm::Type* llvmElemTy = llvmType(env, elemTy);
+    return env.b.CreateGEP(llvmElemTy, basePtr, idx, "sub.addr");
+  }
+
+  if (auto* mem = dynamic_cast<const MemberExpr*>(&e)) {
+    Type baseTy = exprType(*mem->base);
+    Type structTy = baseTy;
+    llvm::Value* basePtr = nullptr;
+    if (mem->isArrow) {
+      basePtr = emitExpr(env, *mem->base);
+      structTy = baseTy.pointee();
+    } else {
+      basePtr = emitLValue(env, *mem->base);
+    }
+
+    auto it = env.structFields.find(structTy.structName);
+    if (it == env.structFields.end()) return nullptr;
+    size_t fieldIndex = 0;
+    bool found = false;
+    for (size_t i = 0; i < it->second.size(); ++i) {
+      if (it->second[i].name == mem->member) {
+        fieldIndex = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return nullptr;
+    auto stIt = env.structs.find(structTy.structName);
+    if (stIt == env.structs.end()) return nullptr;
+    return env.b.CreateStructGEP(stIt->second, basePtr,
+                                 static_cast<unsigned>(fieldIndex), "member.addr");
+  }
+
+  return nullptr;
+}
+
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
     return i32Const(env, lit->value);
   }
 
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
-    llvm::AllocaInst* slot = env.lookup(vr->name);
-    if (!slot) return i32Const(env, 0);
-    return env.b.CreateLoad(env.i32Ty(), slot, vr->name + ".val");
+    if (auto* local = env.lookupLocal(vr->name)) {
+      if (local->type.isArray() && !local->type.ptrOutsideArrays) {
+        return decayArrayToPointer(env, local->slot, local->type);
+      }
+      return env.b.CreateLoad(llvmType(env, local->type), local->slot, vr->name + ".val");
+    }
+    if (auto* global = env.lookupGlobal(vr->name)) {
+      if (global->type.isArray() && !global->type.ptrOutsideArrays) {
+        return decayArrayToPointer(env, global->gv, global->type);
+      }
+      return env.b.CreateLoad(llvmType(env, global->type), global->gv, vr->name + ".gval");
+    }
+    return i32Const(env, 0);
   }
 
   if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
@@ -229,13 +597,98 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
 
     std::vector<llvm::Value*> argsV;
     argsV.reserve(call->args.size());
-    for (const auto& a : call->args) argsV.push_back(emitExpr(env, *a));
+    for (size_t i = 0; i < call->args.size(); ++i) {
+      const auto& a = call->args[i];
+      if (i < callee->arg_size()) {
+        llvm::Type* paramTy = callee->getFunctionType()->getParamType(i);
+        if (paramTy->isPointerTy() && isNullPointerLiteral(*a)) {
+          argsV.push_back(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(paramTy)));
+          continue;
+        }
+        if (paramTy->isPointerTy() && exprType(*a).isPointer()) {
+          llvm::Value* v = emitExpr(env, *a);
+          argsV.push_back(castPointerIfNeeded(env, v, paramTy));
+          continue;
+        }
+      }
+      argsV.push_back(emitExpr(env, *a));
+    }
 
     return env.b.CreateCall(callee, argsV, "calltmp");
   }
 
+  if (auto* ter = dynamic_cast<const TernaryExpr*>(&e)) {
+    llvm::Value* condV = emitExpr(env, *ter->cond);
+    llvm::Value* condB = asBoolI1(env, condV);
+
+    llvm::Function* F = env.fn;
+    llvm::BasicBlock* thenBB = llvm::BasicBlock::Create(env.ctx, "ternary.then", F);
+    llvm::BasicBlock* elseBB = llvm::BasicBlock::Create(env.ctx, "ternary.else", F);
+    llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "ternary.end", F);
+
+    env.b.CreateCondBr(condB, thenBB, elseBB);
+
+    env.b.SetInsertPoint(thenBB);
+    llvm::Value* thenV = emitExpr(env, *ter->thenExpr);
+    if (!env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(endBB);
+    thenBB = env.b.GetInsertBlock();
+
+    env.b.SetInsertPoint(elseBB);
+    llvm::Value* elseV = emitExpr(env, *ter->elseExpr);
+    if (!env.b.GetInsertBlock()->getTerminator()) env.b.CreateBr(endBB);
+    elseBB = env.b.GetInsertBlock();
+
+    env.b.SetInsertPoint(endBB);
+    const Type& resTy = exprType(*ter);
+    llvm::Type* resLlvmTy = llvmType(env, resTy);
+    if (resTy.isPointer()) {
+      if (isNullPointerLiteral(*ter->thenExpr)) {
+        thenV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(resLlvmTy));
+      }
+      if (isNullPointerLiteral(*ter->elseExpr)) {
+        elseV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(resLlvmTy));
+      }
+    }
+    llvm::PHINode* phi = env.b.CreatePHI(resLlvmTy, 2, "ternary");
+    phi->addIncoming(thenV, thenBB);
+    phi->addIncoming(elseV, elseBB);
+    return phi;
+  }
+
   if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
     return emitUnary(env, *un);
+  }
+
+  if (auto* sub = dynamic_cast<const SubscriptExpr*>(&e)) {
+    llvm::Value* addr = emitLValue(env, *sub);
+    const Type& elemTy = exprType(e);
+    if (elemTy.isArray()) {
+      return decayArrayToPointer(env, addr, elemTy);
+    }
+    return env.b.CreateLoad(llvmType(env, elemTy), addr, "sub.val");
+  }
+
+  if (auto* mem = dynamic_cast<const MemberExpr*>(&e)) {
+    llvm::Value* addr = emitLValue(env, *mem);
+    Type baseTy = exprType(*mem->base);
+    Type structTy = mem->isArrow ? baseTy.pointee() : baseTy;
+    Type fieldTy;
+    bool found = false;
+    auto it = env.structFields.find(structTy.structName);
+    if (it != env.structFields.end()) {
+      for (const auto& field : it->second) {
+        if (field.name == mem->member) {
+          fieldTy = field.type;
+          found = true;
+          break;
+        }
+      }
+    }
+    const Type& elemTy = found ? fieldTy : exprType(e);
+    if (elemTy.isArray() && !elemTy.ptrOutsideArrays) {
+      return decayArrayToPointer(env, addr, elemTy);
+    }
+    return env.b.CreateLoad(llvmType(env, elemTy), addr, "member.val");
   }
 
   if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
@@ -243,9 +696,17 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   }
 
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
-    llvm::AllocaInst* slot = env.lookup(asn->name);
+    llvm::Value* addr = emitLValue(env, *asn->lhs);
+    const Type& lhsTy = exprType(*asn->lhs);
     llvm::Value* rhsV = emitExpr(env, *asn->rhs);
-    if (slot) env.b.CreateStore(rhsV, slot);
+    if (lhsTy.isPointer() && isNullPointerLiteral(*asn->rhs)) {
+      llvm::Type* ptrTy = llvmType(env, lhsTy);
+      rhsV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
+    } else if (lhsTy.isPointer() && exprType(*asn->rhs).isPointer()) {
+      llvm::Type* ptrTy = llvmType(env, lhsTy);
+      rhsV = castPointerIfNeeded(env, rhsV, ptrTy);
+    }
+    env.b.CreateStore(rhsV, addr);
     return rhsV;
   }
 
@@ -267,6 +728,54 @@ static bool emitBlock(CGEnv& env, const BlockStmt& blk) {
   return terminated;
 }
 
+static bool emitSwitch(CGEnv& env, const SwitchStmt& s) {
+  llvm::Function* F = env.fn;
+
+  llvm::Value* condV = emitExpr(env, *s.cond);
+  llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "switch.end", F);
+
+  std::vector<llvm::BasicBlock*> caseBBs;
+  caseBBs.reserve(s.cases.size());
+
+  llvm::BasicBlock* defaultBB = endBB;
+  for (const auto& c : s.cases) {
+    llvm::BasicBlock* bb = llvm::BasicBlock::Create(env.ctx, "switch.case", F);
+    caseBBs.push_back(bb);
+    if (!c.value.has_value()) defaultBB = bb;
+  }
+
+  llvm::SwitchInst* sw = env.b.CreateSwitch(condV, defaultBB, s.cases.size());
+  for (size_t i = 0; i < s.cases.size(); i++) {
+    if (!s.cases[i].value.has_value()) continue;
+    int64_t v = *s.cases[i].value;
+    sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(env.ctx), (uint64_t)v, true),
+                caseBBs[i]);
+  }
+
+  env.pushScope();
+  env.loops.push_back({endBB, nullptr}); // break target only
+
+  for (size_t i = 0; i < s.cases.size(); i++) {
+    env.b.SetInsertPoint(caseBBs[i]);
+    bool terminated = false;
+    for (const auto& st : s.cases[i].stmts) {
+      terminated = emitStmt(env, *st);
+      if (terminated) break;
+    }
+
+    if (!env.b.GetInsertBlock()->getTerminator()) {
+      llvm::BasicBlock* nextBB = (i + 1 < caseBBs.size()) ? caseBBs[i + 1] : endBB;
+      env.b.CreateBr(nextBB);
+    }
+  }
+
+  env.loops.pop_back();
+  env.popScope();
+
+  env.b.SetInsertPoint(endBB);
+  return false;
+}
+
 static bool emitIf(CGEnv& env, const IfStmt& s) {
   llvm::Function* F = env.fn;
 
@@ -278,7 +787,6 @@ static bool emitIf(CGEnv& env, const IfStmt& s) {
   llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "if.end");
 
   if (s.elseBranch) {
-    F->getBasicBlockList().push_back(elseBB);
     env.b.CreateCondBr(condB, thenBB, elseBB);
   } else {
     env.b.CreateCondBr(condB, thenBB, endBB);
@@ -395,23 +903,39 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) return emitBlock(env, *blk);
 
   if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
-    llvm::AllocaInst* slot = createEntryAlloca(env, d->name);
-    env.insertLocal(d->name, slot);
-    if (d->initExpr) env.b.CreateStore(emitExpr(env, *d->initExpr), slot);
-    else env.b.CreateStore(i32Const(env, 0), slot);
+    for (const auto& item : d->items) {
+      llvm::AllocaInst* slot = createEntryAlloca(env, item.name, item.type);
+      env.insertLocal(item.name, slot, item.type);
+      if (item.initExpr) {
+        emitInitToAddr(env, item.type, slot, *item.initExpr);
+      } else {
+        env.b.CreateStore(zeroValue(env, item.type), slot);
+      }
+    }
     return false;
   }
 
   // legacy AssignStmt
   if (auto* a = dynamic_cast<const AssignStmt*>(&s)) {
-    llvm::AllocaInst* slot = env.lookup(a->name);
     llvm::Value* rhsV = emitExpr(env, *a->valueExpr);
-    if (slot) env.b.CreateStore(rhsV, slot);
+    if (auto* local = env.lookupLocal(a->name)) {
+      env.b.CreateStore(rhsV, local->slot);
+    } else if (auto* global = env.lookupGlobal(a->name)) {
+      env.b.CreateStore(rhsV, global->gv);
+    }
     return false;
   }
 
   if (auto* r = dynamic_cast<const ReturnStmt*>(&s)) {
-    env.b.CreateRet(emitExpr(env, *r->valueExpr));
+    llvm::Value* retV = emitExpr(env, *r->valueExpr);
+    if (env.currentReturnType.isPointer() && isNullPointerLiteral(*r->valueExpr)) {
+      llvm::Type* ptrTy = llvmType(env, env.currentReturnType);
+      retV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
+    } else if (env.currentReturnType.isPointer() && exprType(*r->valueExpr).isPointer()) {
+      llvm::Type* ptrTy = llvmType(env, env.currentReturnType);
+      retV = castPointerIfNeeded(env, retV, ptrTy);
+    }
+    env.b.CreateRet(retV);
     return true;
   }
 
@@ -424,13 +948,16 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   }
 
   if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
-    if (!env.loops.empty()) {
-      env.b.CreateBr(env.loops.back().second);
-      return true;
+    for (auto it = env.loops.rbegin(); it != env.loops.rend(); ++it) {
+      if (it->second) {
+        env.b.CreateBr(it->second);
+        return true;
+      }
     }
     return false;
   }
 
+  if (auto* sw = dynamic_cast<const SwitchStmt*>(&s)) return emitSwitch(env, *sw);
   if (auto* iff = dynamic_cast<const IfStmt*>(&s)) return emitIf(env, *iff);
   if (auto* wh  = dynamic_cast<const WhileStmt*>(&s)) return emitWhile(env, *wh);
   if (auto* dw  = dynamic_cast<const DoWhileStmt*>(&s)) return emitDoWhile(env, *dw);
@@ -458,19 +985,67 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   llvm::IRBuilder<> builder(ctx);
   CGEnv env{ctx, *mod, builder};
 
-  // 1) Predeclare all functions from prototypes (decls + defs)
+  std::vector<std::pair<llvm::GlobalVariable*, const Expr*>> globalInits;
+
+  // 0) Predeclare struct types
+  for (const auto& item : tu.items) {
+    auto* sd = std::get_if<StructDef>(&item);
+    if (!sd) continue;
+    if (env.structs.count(sd->name)) continue;
+    env.structs.emplace(sd->name, llvm::StructType::create(ctx, sd->name));
+    env.structFields.emplace(sd->name, sd->fields);
+  }
+
+  for (const auto& item : tu.items) {
+    auto* sd = std::get_if<StructDef>(&item);
+    if (!sd) continue;
+    auto it = env.structs.find(sd->name);
+    if (it == env.structs.end()) continue;
+    std::vector<llvm::Type*> fieldTys;
+    fieldTys.reserve(sd->fields.size());
+    for (const auto& field : sd->fields) {
+      fieldTys.push_back(llvmType(env, field.type));
+    }
+    it->second->setBody(fieldTys, /*isPacked=*/false);
+  }
+
+  // 1) Emit global variables
+  for (const auto& item : tu.items) {
+    auto* g = std::get_if<GlobalVarDecl>(&item);
+    if (!g) continue;
+    for (const auto& decl : g->items) {
+      llvm::Type* gvTy = llvmType(env, decl.type);
+      llvm::Constant* init = nullptr;
+      if (decl.type.isArray()) {
+        init = llvm::ConstantAggregateZero::get(gvTy);
+      } else if (decl.type.base == Type::Base::Struct && decl.type.ptrDepth == 0) {
+        init = llvm::ConstantAggregateZero::get(gvTy);
+      } else if (decl.type.isPointer()) {
+        init = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(gvTy));
+      } else {
+        init = llvm::ConstantInt::get(env.i32Ty(), 0, true);
+      }
+      auto* gv = new llvm::GlobalVariable(
+          *mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::ExternalLinkage, init, decl.name);
+      env.insertGlobal(decl.name, gv, decl.type);
+      if (decl.initExpr) globalInits.emplace_back(gv, decl.initExpr.get());
+    }
+  }
+
+  // 2) Predeclare all functions from prototypes (decls + defs)
   for (const auto& item : tu.items) {
     const FunctionProto* p = getProto(item);
     if (!p) continue;
 
     const std::string& name = p->name;
-    size_t arity = arityOfProto(*p);
 
     // if already declared, skip (Sema guarantees signature consistency)
     if (env.functions.count(name)) continue;
 
-    std::vector<llvm::Type*> paramTys(arity, llvm::Type::getInt32Ty(ctx));
-    auto* fnTy = llvm::FunctionType::get(llvm::Type::getInt32Ty(ctx), paramTys, false);
+    std::vector<llvm::Type*> paramTys;
+    paramTys.reserve(p->params.size());
+    for (const auto& prm : p->params) paramTys.push_back(llvmType(env, adjustParamType(prm.type)));
+    auto* fnTy = llvm::FunctionType::get(llvmType(env, p->returnType), paramTys, false);
     llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
     env.functions[name] = F;
 
@@ -482,7 +1057,28 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     }
   }
 
-  // 2) Emit bodies only for FunctionDef
+  llvm::Function* initFn = nullptr;
+  if (!globalInits.empty()) {
+    auto* initTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), false);
+    initFn = llvm::Function::Create(
+        initTy, llvm::GlobalValue::InternalLinkage, "__c99cc_init_globals", mod.get());
+
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", initFn);
+    builder.SetInsertPoint(entry);
+    env.resetFunctionState(initFn);
+
+    for (const auto& gi : globalInits) {
+      auto* binding = env.lookupGlobal(gi.first->getName().str());
+      if (binding) {
+        emitInitToAddr(env, binding->type, gi.first, *gi.second);
+      }
+    }
+
+    builder.CreateRetVoid();
+    llvm::verifyFunction(*initFn);
+  }
+
+  // 3) Emit bodies only for FunctionDef
   for (const auto& item : tu.items) {
     auto* def = std::get_if<FunctionDef>(&item);
     if (!def) continue;
@@ -500,6 +1096,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     builder.SetInsertPoint(entry);
 
     env.resetFunctionState(F);
+    env.currentReturnType = p.returnType;
     env.pushScope(); // function scope
 
     // lower parameters: allocate only those with names; still need to accept unnamed params
@@ -507,11 +1104,16 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     for (auto& arg : F->args()) {
       if (idx < p.params.size() && p.params[idx].name.has_value()) {
         std::string pname = *p.params[idx].name;
-        llvm::AllocaInst* slot = createEntryAlloca(env, pname);
-        env.insertLocal(pname, slot);
+        Type prmTy = adjustParamType(p.params[idx].type);
+        llvm::AllocaInst* slot = createEntryAlloca(env, pname, prmTy);
+        env.insertLocal(pname, slot, prmTy);
         builder.CreateStore(&arg, slot);
       }
       ++idx;
+    }
+
+    if (initFn && p.name == "main") {
+      builder.CreateCall(initFn);
     }
 
     bool terminated = false;
@@ -521,7 +1123,12 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     }
 
     if (!builder.GetInsertBlock()->getTerminator()) {
-      builder.CreateRet(i32Const(env, 0));
+      if (p.returnType.isPointer()) {
+        llvm::Type* ptrTy = llvmType(env, p.returnType);
+        builder.CreateRet(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
+      } else {
+        builder.CreateRet(i32Const(env, 0));
+      }
     }
 
     env.popScope();

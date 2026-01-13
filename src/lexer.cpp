@@ -45,6 +45,8 @@ Token Lexer::lexIdentifierOrKeyword() {
   }
 
   if (s == "int")      return Token{TokenKind::KwInt, s, loc};
+  if (s == "void")     return Token{TokenKind::KwVoid, s, loc};
+  if (s == "struct")   return Token{TokenKind::KwStruct, s, loc};
   if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
   if (s == "if")       return Token{TokenKind::KwIf, s, loc};
   if (s == "else")     return Token{TokenKind::KwElse, s, loc};
@@ -53,6 +55,10 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "break")    return Token{TokenKind::KwBreak, s, loc};
   if (s == "continue") return Token{TokenKind::KwContinue, s, loc};
   if (s == "do") return Token{TokenKind::KwDo, s, loc};
+  if (s == "switch")   return Token{TokenKind::KwSwitch, s, loc};
+  if (s == "case")     return Token{TokenKind::KwCase, s, loc};
+  if (s == "default")  return Token{TokenKind::KwDefault, s, loc};
+  if (s == "NULL")     return Token{TokenKind::IntegerLiteral, "0", loc};
 
   return Token{TokenKind::Identifier, s, loc};
 }
@@ -83,18 +89,24 @@ Token Lexer::next() {
     case ')': get(); return Token{TokenKind::RParen, ")", loc};
     case '{': get(); return Token{TokenKind::LBrace, "{", loc};
     case '}': get(); return Token{TokenKind::RBrace, "}", loc};
+    case '[': get(); return Token{TokenKind::LBracket, "[", loc};
+    case ']': get(); return Token{TokenKind::RBracket, "]", loc};
     case ';': get(); return Token{TokenKind::Semicolon, ";", loc};
+    case ':': get(); return Token{TokenKind::Colon, ":", loc};
 
     case '+': get(); return Token{TokenKind::Plus, "+", loc};
-    case '-': get(); return Token{TokenKind::Minus, "-", loc};
+    case '-': {
+      get();
+      if (!eof() && peek() == '>') { get(); return Token{TokenKind::Arrow, "->", loc}; }
+      return Token{TokenKind::Minus, "-", loc};
+    }
     case '*': get(); return Token{TokenKind::Star, "*", loc};
     case '/': get(); return Token{TokenKind::Slash, "/", loc};
 
     case '&': {
       get();
       if (!eof() && peek() == '&') { get(); return Token{TokenKind::AmpAmp, "&&", loc}; }
-      diags_.error(loc, "unexpected character: '&'");
-      return next();
+      return Token{TokenKind::Amp, "&", loc};
     }
 
     case '|': {
@@ -130,8 +142,10 @@ Token Lexer::next() {
 
     case '~': get(); return Token{TokenKind::Tilde, "~", loc};
 
+    case '?': get(); return Token{TokenKind::Question, "?", loc};
 
-    case ',': get(); return Token{TokenKind::Comma, ",", loc};	      
+    case ',': get(); return Token{TokenKind::Comma, ",", loc};
+    case '.': get(); return Token{TokenKind::Dot, ".", loc};
 
     default:
       diags_.error(loc, std::string("unexpected character: '") + c + "'");

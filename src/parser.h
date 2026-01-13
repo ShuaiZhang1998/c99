@@ -20,8 +20,57 @@ struct Node {
   virtual ~Node() = default;
 };
 
+struct Type {
+  enum class Base { Int, Void, Struct };
+  Base base = Base::Int;
+  std::string structName;
+  int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
+  std::vector<std::optional<size_t>> arrayDims;
+  bool ptrOutsideArrays = false;
+  Type() = default;
+  Type(Base b, int d) : base(b), ptrDepth(d) {}
+  Type(Base b, int d, std::vector<std::optional<size_t>> dims)
+      : base(b), ptrDepth(d), arrayDims(std::move(dims)) {}
+  bool isInt() const { return base == Base::Int && ptrDepth == 0 && arrayDims.empty(); }
+  bool isVoid() const { return base == Base::Void && ptrDepth == 0 && arrayDims.empty(); }
+  bool isStruct() const { return base == Base::Struct; }
+  bool isPointer() const { return ptrDepth > 0; }
+  bool isArray() const { return !arrayDims.empty(); }
+  Type pointee() const {
+    Type t{base, ptrDepth - 1, arrayDims};
+    t.structName = structName;
+    t.ptrOutsideArrays = false;
+    return t;
+  }
+  Type elementType() const {
+    if (arrayDims.empty()) {
+      Type t{base, ptrDepth};
+      t.structName = structName;
+      return t;
+    }
+    std::vector<std::optional<size_t>> rest(arrayDims.begin() + 1, arrayDims.end());
+    Type t{base, ptrDepth, std::move(rest)};
+    t.structName = structName;
+    return t;
+  }
+  Type decayType() const {
+    Type elem = elementType();
+    elem.ptrDepth++;
+    elem.ptrOutsideArrays = !elem.arrayDims.empty();
+    return elem;
+  }
+  bool isVoidPointer() const { return base == Base::Void && ptrDepth == 1; }
+  bool isVoidObject() const { return base == Base::Void && ptrDepth == 0; }
+  bool operator==(const Type& other) const {
+    return base == other.base && structName == other.structName && ptrDepth == other.ptrDepth &&
+           arrayDims == other.arrayDims && ptrOutsideArrays == other.ptrOutsideArrays;
+  }
+  bool operator!=(const Type& other) const { return !(*this == other); }
+};
+
 struct Expr : Node {
   using Node::Node;
+  mutable std::optional<Type> semaType;
   virtual ~Expr() = default;
 };
 
@@ -55,6 +104,29 @@ struct UnaryExpr final : Expr {
       : Expr(l), op(o), operand(std::move(e)) {}
 };
 
+struct SubscriptExpr final : Expr {
+  std::unique_ptr<Expr> base;
+  std::unique_ptr<Expr> index;
+  SubscriptExpr(SourceLocation l, std::unique_ptr<Expr> b, std::unique_ptr<Expr> i)
+      : Expr(l), base(std::move(b)), index(std::move(i)) {}
+};
+
+struct MemberExpr final : Expr {
+  std::unique_ptr<Expr> base;
+  std::string member;
+  SourceLocation memberLoc;
+  bool isArrow = false;
+  MemberExpr(SourceLocation l, std::unique_ptr<Expr> b, std::string m, SourceLocation mLoc,
+             bool arrow)
+      : Expr(l), base(std::move(b)), member(std::move(m)), memberLoc(mLoc), isArrow(arrow) {}
+};
+
+struct InitListExpr final : Expr {
+  std::vector<std::unique_ptr<Expr>> elems;
+  InitListExpr(SourceLocation l, std::vector<std::unique_ptr<Expr>> es)
+      : Expr(l), elems(std::move(es)) {}
+};
+
 struct BinaryExpr final : Expr {
   TokenKind op;
   std::unique_ptr<Expr> lhs;
@@ -63,21 +135,40 @@ struct BinaryExpr final : Expr {
       : Expr(l), op(o), lhs(std::move(a)), rhs(std::move(b)) {}
 };
 
+struct TernaryExpr final : Expr {
+  std::unique_ptr<Expr> cond;
+  std::unique_ptr<Expr> thenExpr;
+  std::unique_ptr<Expr> elseExpr;
+  TernaryExpr(SourceLocation l, std::unique_ptr<Expr> c, std::unique_ptr<Expr> t,
+              std::unique_ptr<Expr> e)
+      : Expr(l), cond(std::move(c)), thenExpr(std::move(t)), elseExpr(std::move(e)) {}
+};
+
 struct AssignExpr final : Expr {
-  std::string name;
-  SourceLocation nameLoc;
+  std::unique_ptr<Expr> lhs;
   std::unique_ptr<Expr> rhs;
-  AssignExpr(SourceLocation l, std::string n, SourceLocation nLoc, std::unique_ptr<Expr> r)
-      : Expr(l), name(std::move(n)), nameLoc(nLoc), rhs(std::move(r)) {}
+  AssignExpr(SourceLocation l, std::unique_ptr<Expr> left, std::unique_ptr<Expr> r)
+      : Expr(l), lhs(std::move(left)), rhs(std::move(r)) {}
 };
 
 // statements
-struct DeclStmt final : Stmt {
+struct DeclItem {
+  Type type;
   std::string name;
   SourceLocation nameLoc;
   std::unique_ptr<Expr> initExpr; // nullable
-  DeclStmt(SourceLocation l, std::string n, SourceLocation nLoc, std::unique_ptr<Expr> init)
-      : Stmt(l), name(std::move(n)), nameLoc(nLoc), initExpr(std::move(init)) {}
+};
+
+struct StructField {
+  Type type;
+  std::string name;
+  SourceLocation nameLoc;
+};
+
+struct DeclStmt final : Stmt {
+  std::vector<DeclItem> items;
+  DeclStmt(SourceLocation l, std::vector<DeclItem> d)
+      : Stmt(l), items(std::move(d)) {}
 };
 
 struct AssignStmt final : Stmt {
@@ -148,9 +239,23 @@ struct ForStmt final : Stmt {
       : Stmt(l), init(std::move(i)), cond(std::move(c)), inc(std::move(in)), body(std::move(b)) {}
 };
 
+struct SwitchCase {
+  std::optional<int64_t> value; // nullopt for default
+  SourceLocation loc;
+  std::vector<std::unique_ptr<Stmt>> stmts;
+};
+
+struct SwitchStmt final : Stmt {
+  std::unique_ptr<Expr> cond;
+  std::vector<SwitchCase> cases;
+  SwitchStmt(SourceLocation l, std::unique_ptr<Expr> c, std::vector<SwitchCase> cs)
+      : Stmt(l), cond(std::move(c)), cases(std::move(cs)) {}
+};
+
 // ---- functions / TU ----
 
 struct Param {
+  Type type;
   // param name is optional (prototype can omit names)
   std::optional<std::string> name;
   SourceLocation nameLoc; // valid iff name.has_value()
@@ -158,6 +263,7 @@ struct Param {
 };
 
 struct FunctionProto {
+  Type returnType;
   std::string name;
   SourceLocation nameLoc;
   std::vector<Param> params;
@@ -173,7 +279,17 @@ struct FunctionDef {
   std::vector<std::unique_ptr<Stmt>> body;
 };
 
-using TopLevelItem = std::variant<FunctionDecl, FunctionDef>;
+struct GlobalVarDecl {
+  std::vector<DeclItem> items;
+};
+
+struct StructDef {
+  std::string name;
+  SourceLocation nameLoc;
+  std::vector<StructField> fields;
+};
+
+using TopLevelItem = std::variant<StructDef, FunctionDecl, FunctionDef, GlobalVarDecl>;
 
 struct AstTranslationUnit {
   std::vector<TopLevelItem> items;
@@ -190,9 +306,19 @@ private:
   Lexer& lex_;
   Diagnostics& diags_;
   Token cur_;
+  std::vector<TopLevelItem> pending_;
 
   void advance() { cur_ = lex_.next(); }
   bool expect(TokenKind k, const char* what);
+  int parsePointerDepth();
+  struct ParsedTypeSpec {
+    Type type;
+    std::optional<StructDef> def;
+  };
+  std::optional<ParsedTypeSpec> parseTypeSpec(bool allowStructDef);
+  std::optional<std::vector<StructField>> parseStructFields();
+  std::optional<std::vector<std::optional<size_t>>> parseArrayDims(bool allowFirstEmpty);
+  std::optional<std::unique_ptr<Expr>> parseInitializer();
 
   std::optional<AstTranslationUnit> parseTranslationUnit();
   std::optional<TopLevelItem> parseTopLevelItem();
@@ -211,10 +337,13 @@ private:
   std::optional<std::unique_ptr<Stmt>> parseWhileStmt();
   std::optional<std::unique_ptr<Stmt>> parseDoWhileStmt();
   std::optional<std::unique_ptr<Stmt>> parseForStmt();
+  std::optional<std::unique_ptr<Stmt>> parseSwitchStmt();
 
   std::optional<std::unique_ptr<Expr>> parseExpr();           // comma-expression
   std::optional<std::unique_ptr<Expr>> parseAssignmentExpr(); // assignment (NO comma)
+  std::optional<std::unique_ptr<Expr>> parseConditionalExpr();
   std::optional<std::unique_ptr<Expr>> parseUnary();
+  std::optional<std::unique_ptr<Expr>> parsePostfix();
   std::optional<std::unique_ptr<Expr>> parsePrimary();
 
   // Compatibility (not used)

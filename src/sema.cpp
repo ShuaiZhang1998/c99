@@ -1,5 +1,6 @@
 #include "sema.h"
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -9,20 +10,22 @@ namespace c99cc {
 
 namespace {
 
-using Scope = std::unordered_set<std::string>;
+using Scope = std::unordered_map<std::string, Type>;
 using ScopeStack = std::vector<Scope>;
 
-static bool isDeclaredVar(const ScopeStack& scopes, const std::string& name) {
+static std::optional<Type> lookupVarType(const ScopeStack& scopes, const std::string& name) {
   for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
-    if (it->count(name)) return true;
+    auto found = it->find(name);
+    if (found != it->end()) return found->second;
   }
-  return false;
+  return std::nullopt;
 }
 
 // ---- function table ----
 
 struct FnInfo {
-  size_t arity = 0;
+  std::vector<Type> paramTypes;
+  Type returnType;
   bool hasDecl = false;
   bool hasDef = false;
   SourceLocation firstLoc{};
@@ -30,123 +33,511 @@ struct FnInfo {
 
 using FnTable = std::unordered_map<std::string, FnInfo>;
 
-static bool sameSignature(const FnInfo& info, size_t arity) {
-  return info.arity == arity;
+struct StructInfo {
+  std::vector<StructField> fields;
+  SourceLocation nameLoc{};
+};
+
+using StructTable = std::unordered_map<std::string, StructInfo>;
+
+static const StructInfo* lookupStruct(const StructTable& structs, const std::string& name) {
+  auto it = structs.find(name);
+  if (it == structs.end()) return nullptr;
+  return &it->second;
+}
+
+static Type adjustParamType(const Type& t);
+
+static bool sameSignature(const FnInfo& info, const FunctionProto& proto) {
+  if (info.paramTypes.size() != proto.params.size()) return false;
+  if (info.returnType != proto.returnType) return false;
+  for (size_t i = 0; i < proto.params.size(); ++i) {
+    if (info.paramTypes[i] != adjustParamType(proto.params[i].type)) return false;
+  }
+  return true;
+}
+
+static bool isNullPointerConstant(const Expr& e) {
+  if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) return lit->value == 0;
+  return false;
 }
 
 // ---- expr/stmt checking ----
 
-static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const Expr& e);
+static std::optional<Type> checkExprImpl(
+    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e);
+
+static bool isScalarType(const Type& t) {
+  return t.isInt() || t.isPointer();
+}
+
+static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr);
+
+static bool isPointerCompatibleForAssign(const Type& dst, const Type& src) {
+  if (!dst.isPointer() || !src.isPointer()) return false;
+  if (dst == src) return true;
+  if (dst.ptrDepth == 1 && src.ptrDepth == 1 &&
+      (dst.base == Type::Base::Void || src.base == Type::Base::Void)) {
+    return true;
+  }
+  return false;
+}
+
+static Type adjustParamType(const Type& t) {
+  if (!t.isArray()) return t;
+  return t.decayType();
+}
+
+static bool isArrayElementVoid(const Type& t) {
+  return t.isArray() && t.base == Type::Base::Void && t.ptrDepth == 0;
+}
+
+static bool hasInvalidArraySize(const Type& t, bool allowFirstEmpty) {
+  if (!t.isArray()) return false;
+  for (size_t i = 0; i < t.arrayDims.size(); ++i) {
+    const auto& dim = t.arrayDims[i];
+    if (!dim.has_value()) {
+      if (allowFirstEmpty && i == 0) continue;
+      return true;
+    }
+    if (*dim == 0) return true;
+  }
+  return false;
+}
+
+static bool requiresStructDef(const Type& t) {
+  return t.base == Type::Base::Struct && t.ptrDepth == 0;
+}
+
+static bool checkInitializer(
+    Diagnostics& diags,
+    ScopeStack& scopes,
+    const FnTable& fns,
+    const StructTable& structs,
+    const Type& target,
+    Expr& init,
+    bool allowArrayInit);
+
+static bool checkInitList(
+    Diagnostics& diags,
+    ScopeStack& scopes,
+    const FnTable& fns,
+    const StructTable& structs,
+    const Type& target,
+    InitListExpr& list,
+    bool allowArrayInit) {
+  if (target.isArray() && !target.ptrOutsideArrays) {
+    if (!allowArrayInit) {
+      diags.error(list.loc, "array initializer not supported");
+      return false;
+    }
+    if (target.arrayDims.empty() || !target.arrayDims[0].has_value()) {
+      diags.error(list.loc, "invalid array initializer");
+      return false;
+    }
+    size_t size = *target.arrayDims[0];
+    if (list.elems.size() > size) {
+      diags.error(list.loc, "excess elements in array initializer");
+      return false;
+    }
+    Type elemTy = target.elementType();
+    for (size_t i = 0; i < list.elems.size(); ++i) {
+      if (!checkInitializer(diags, scopes, fns, structs, elemTy, *list.elems[i], true)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (target.base == Type::Base::Struct && target.ptrDepth == 0) {
+    const StructInfo* info = lookupStruct(structs, target.structName);
+    if (!info) {
+      diags.error(list.loc, "unknown struct type '" + target.structName + "'");
+      return false;
+    }
+    if (list.elems.size() > info->fields.size()) {
+      diags.error(list.loc, "excess elements in struct initializer");
+      return false;
+    }
+    for (size_t i = 0; i < list.elems.size(); ++i) {
+      if (!checkInitializer(diags, scopes, fns, structs, info->fields[i].type,
+                            *list.elems[i], true)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (list.elems.empty()) return true;
+  if (list.elems.size() != 1) {
+    diags.error(list.loc, "invalid initializer");
+    return false;
+  }
+  return checkInitializer(diags, scopes, fns, structs, target, *list.elems[0], allowArrayInit);
+}
+
+static bool checkInitializer(
+    Diagnostics& diags,
+    ScopeStack& scopes,
+    const FnTable& fns,
+    const StructTable& structs,
+    const Type& target,
+    Expr& init,
+    bool allowArrayInit) {
+  if (auto* list = dynamic_cast<InitListExpr*>(&init)) {
+    return checkInitList(diags, scopes, fns, structs, target, *list, allowArrayInit);
+  }
+
+  if (target.isArray() && !target.ptrOutsideArrays) {
+    if (allowArrayInit) {
+      diags.error(init.loc, "invalid initializer for array");
+    } else {
+      diags.error(init.loc, "array initializer not supported");
+    }
+    return false;
+  }
+
+  auto initTy = checkExprImpl(diags, scopes, fns, structs, init);
+  if (initTy && !isAssignable(target, *initTy, init)) {
+    diags.error(init.loc, "incompatible initializer");
+    return false;
+  }
+  return true;
+}
+
+static std::optional<Type> resolveMemberType(
+    Diagnostics& diags,
+    const StructTable& structs,
+    const Type& baseTy,
+    const std::string& member,
+    SourceLocation memberLoc,
+    bool isArrow) {
+  Type structTy = baseTy;
+  if (isArrow) {
+    if (!baseTy.isPointer() || baseTy.ptrDepth != 1 || baseTy.base != Type::Base::Struct) {
+      diags.error(memberLoc, "member access requires pointer to struct");
+      return std::nullopt;
+    }
+    structTy = baseTy.pointee();
+  } else {
+    if (baseTy.base != Type::Base::Struct || baseTy.ptrDepth != 0) {
+      diags.error(memberLoc, "member access requires struct");
+      return std::nullopt;
+    }
+  }
+
+  const StructInfo* info = lookupStruct(structs, structTy.structName);
+  if (!info) {
+    diags.error(memberLoc, "unknown struct type '" + structTy.structName + "'");
+    return std::nullopt;
+  }
+
+  for (const auto& field : info->fields) {
+    if (field.name == member) return field.type;
+  }
+
+  diags.error(memberLoc,
+              "unknown field '" + member + "' in struct '" + structTy.structName + "'");
+  return std::nullopt;
+}
 
 static void checkStmtImpl(
     Diagnostics& diags,
     ScopeStack& scopes,
     const FnTable& fns,
+    const StructTable& structs,
+    const Type& returnType,
     int loopDepth,
-    const Stmt& s) {
-  if (auto* blk = dynamic_cast<const BlockStmt*>(&s)) {
+    int switchDepth,
+    Stmt& s) {
+  if (auto* blk = dynamic_cast<BlockStmt*>(&s)) {
     scopes.push_back({});
-    for (const auto& st : blk->stmts) checkStmtImpl(diags, scopes, fns, loopDepth, *st);
+    for (const auto& st : blk->stmts) {
+      checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *st);
+    }
     scopes.pop_back();
     return;
   }
 
-  if (auto* iff = dynamic_cast<const IfStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, *iff->cond);
-    checkStmtImpl(diags, scopes, fns, loopDepth, *iff->thenBranch);
-    if (iff->elseBranch) checkStmtImpl(diags, scopes, fns, loopDepth, *iff->elseBranch);
+  if (auto* iff = dynamic_cast<IfStmt*>(&s)) {
+    checkExprImpl(diags, scopes, fns, structs, *iff->cond);
+    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *iff->thenBranch);
+    if (iff->elseBranch) {
+      checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *iff->elseBranch);
+    }
     return;
   }
 
-  if (auto* wh = dynamic_cast<const WhileStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, *wh->cond);
-    checkStmtImpl(diags, scopes, fns, loopDepth + 1, *wh->body);
+  if (auto* wh = dynamic_cast<WhileStmt*>(&s)) {
+    checkExprImpl(diags, scopes, fns, structs, *wh->cond);
+    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *wh->body);
     return;
   }
 
-  if (auto* dw = dynamic_cast<const DoWhileStmt*>(&s)) {
-    checkStmtImpl(diags, scopes, fns, loopDepth + 1, *dw->body);
-    checkExprImpl(diags, scopes, fns, *dw->cond);
+  if (auto* dw = dynamic_cast<DoWhileStmt*>(&s)) {
+    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *dw->body);
+    checkExprImpl(diags, scopes, fns, structs, *dw->cond);
     return;
   }
 
-  if (auto* fo = dynamic_cast<const ForStmt*>(&s)) {
+  if (auto* fo = dynamic_cast<ForStmt*>(&s)) {
     // for introduces its own scope (matches your existing tests)
     scopes.push_back({});
-    if (fo->init) checkStmtImpl(diags, scopes, fns, loopDepth, *fo->init);
-    if (fo->cond) checkExprImpl(diags, scopes, fns, *fo->cond);
-    if (fo->inc)  checkExprImpl(diags, scopes, fns, *fo->inc);
-    checkStmtImpl(diags, scopes, fns, loopDepth + 1, *fo->body);
+    if (fo->init) checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *fo->init);
+    if (fo->cond) checkExprImpl(diags, scopes, fns, structs, *fo->cond);
+    if (fo->inc)  checkExprImpl(diags, scopes, fns, structs, *fo->inc);
+    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *fo->body);
     scopes.pop_back();
     return;
   }
 
-  if (auto* br = dynamic_cast<const BreakStmt*>(&s)) {
-    if (loopDepth <= 0) diags.error(br->loc, "break statement not within loop");
+  if (auto* br = dynamic_cast<BreakStmt*>(&s)) {
+    if (loopDepth <= 0 && switchDepth <= 0) diags.error(br->loc, "break statement not within loop");
     return;
   }
 
-  if (auto* co = dynamic_cast<const ContinueStmt*>(&s)) {
+  if (auto* co = dynamic_cast<ContinueStmt*>(&s)) {
     if (loopDepth <= 0) diags.error(co->loc, "continue statement not within loop");
     return;
   }
 
-  if (auto* decl = dynamic_cast<const DeclStmt*>(&s)) {
-    auto& cur = scopes.back();
-    if (cur.count(decl->name)) {
-      diags.error(decl->nameLoc, "redefinition of '" + decl->name + "'");
-      return;
+  if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, *sw->cond);
+    if (condTy && !condTy->isInt()) {
+      diags.error(sw->cond->loc, "switch condition must be int");
     }
-
-    // initializer cannot reference the variable being declared:
-    // keep behavior by checking before insertion.
-    if (decl->initExpr) checkExprImpl(diags, scopes, fns, *decl->initExpr);
-
-    cur.insert(decl->name);
+    scopes.push_back({});
+    std::unordered_set<int64_t> seenCases;
+    bool seenDefault = false;
+    for (const auto& c : sw->cases) {
+      if (c.value.has_value()) {
+        int64_t v = *c.value;
+        if (seenCases.count(v)) {
+          diags.error(c.loc, "duplicate case value '" + std::to_string(v) + "'");
+          scopes.pop_back();
+          return;
+        }
+        seenCases.insert(v);
+      } else {
+        if (seenDefault) {
+          diags.error(c.loc, "duplicate default label");
+          scopes.pop_back();
+          return;
+        }
+        seenDefault = true;
+      }
+      for (const auto& st : c.stmts) {
+        checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth + 1, *st);
+      }
+    }
+    scopes.pop_back();
     return;
   }
 
-  if (auto* as = dynamic_cast<const AssignStmt*>(&s)) {
+  if (auto* decl = dynamic_cast<DeclStmt*>(&s)) {
+    auto& cur = scopes.back();
+    for (const auto& item : decl->items) {
+      if (cur.count(item.name)) {
+        diags.error(item.nameLoc, "redefinition of '" + item.name + "'");
+        return;
+      }
+      if (isArrayElementVoid(item.type)) {
+        diags.error(item.nameLoc, "invalid array element type");
+        return;
+      }
+      if (item.type.isVoidObject()) {
+        diags.error(item.nameLoc, "invalid use of void type");
+        return;
+      }
+      if (hasInvalidArraySize(item.type, /*allowFirstEmpty=*/false)) {
+        diags.error(item.nameLoc, "invalid array size");
+        return;
+      }
+      if (requiresStructDef(item.type)) {
+        if (!lookupStruct(structs, item.type.structName)) {
+          diags.error(item.nameLoc, "unknown struct type '" + item.type.structName + "'");
+          return;
+        }
+      }
+
+      // initializer cannot reference the variable being declared:
+      // keep behavior by checking before insertion.
+      if (item.initExpr) {
+        if (item.type.isArray()) {
+          diags.error(item.nameLoc, "array initializer not supported");
+          return;
+        }
+        if (!checkInitializer(diags, scopes, fns, structs, item.type, *item.initExpr, false)) {
+          return;
+        }
+      }
+
+      cur.emplace(item.name, item.type);
+    }
+    return;
+  }
+
+  if (auto* as = dynamic_cast<AssignStmt*>(&s)) {
     // legacy stmt (if still exists somewhere)
-    checkExprImpl(diags, scopes, fns, *as->valueExpr);
-    if (!isDeclaredVar(scopes, as->name)) {
+    checkExprImpl(diags, scopes, fns, structs, *as->valueExpr);
+    if (!lookupVarType(scopes, as->name).has_value()) {
       diags.error(as->nameLoc, "assignment to undeclared identifier '" + as->name + "'");
     }
     return;
   }
 
-  if (auto* ret = dynamic_cast<const ReturnStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, *ret->valueExpr);
-    return;
-  }
-
-  if (auto* es = dynamic_cast<const ExprStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, *es->expr);
-    return;
-  }
-
-  if (dynamic_cast<const EmptyStmt*>(&s)) return;
-}
-
-static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const Expr& e) {
-  if (dynamic_cast<const IntLiteralExpr*>(&e)) return;
-
-  if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
-    if (!isDeclaredVar(scopes, vr->name)) {
-      diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
+  if (auto* ret = dynamic_cast<ReturnStmt*>(&s)) {
+    auto retTy = checkExprImpl(diags, scopes, fns, structs, *ret->valueExpr);
+    if (retTy && !isAssignable(returnType, *retTy, *ret->valueExpr)) {
+      diags.error(ret->loc, "incompatible return type");
     }
     return;
   }
 
-  if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
+  if (auto* es = dynamic_cast<ExprStmt*>(&s)) {
+    checkExprImpl(diags, scopes, fns, structs, *es->expr);
+    return;
+  }
+
+  if (dynamic_cast<EmptyStmt*>(&s)) return;
+}
+
+static std::optional<Type> checkLValue(
+    Diagnostics& diags,
+    ScopeStack& scopes,
+    const FnTable& fns,
+    const StructTable& structs,
+    Expr& e,
+    const char* errMsg,
+    bool isAssign) {
+  if (auto* vr = dynamic_cast<VarRefExpr*>(&e)) {
+    auto ty = lookupVarType(scopes, vr->name);
+    if (!ty) {
+      if (isAssign) {
+        diags.error(vr->loc, "assignment to undeclared identifier '" + vr->name + "'");
+      } else {
+        diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
+      }
+      return std::nullopt;
+    }
+    if (ty->isArray() && !ty->ptrOutsideArrays) {
+      if (isAssign) {
+        diags.error(vr->loc, "cannot assign to array");
+        return std::nullopt;
+      }
+      diags.error(vr->loc, "cannot take address of array");
+      return std::nullopt;
+    }
+    e.semaType = *ty;
+    return *ty;
+  }
+
+  if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
+    if (un->op == TokenKind::Star) {
+      auto opTy = checkExprImpl(diags, scopes, fns, structs, *un->operand);
+      if (!opTy) return std::nullopt;
+      if (!opTy->isPointer()) {
+        diags.error(un->loc, "cannot dereference non-pointer");
+        return std::nullopt;
+      }
+      Type t = opTy->pointee();
+      e.semaType = t;
+      return t;
+    }
+  }
+
+  if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, *sub->index);
+    if (!baseTy || !idxTy) return std::nullopt;
+    if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
+      Type dt = baseTy->decayType();
+      baseTy = dt;
+    }
+    if (!idxTy->isInt()) {
+      diags.error(sub->index->loc, "array subscript must be int");
+      return std::nullopt;
+    }
+    if (baseTy->isPointer() && baseTy->isVoidPointer()) {
+      diags.error(sub->base->loc, "cannot subscript void pointer");
+      return std::nullopt;
+    }
+    if (!baseTy->isPointer()) {
+      diags.error(sub->base->loc, "subscripted value is not pointer");
+      return std::nullopt;
+    }
+    Type elem = baseTy->pointee();
+    e.semaType = elem;
+    return elem;
+  }
+
+  if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *mem->base);
+    if (!baseTy) return std::nullopt;
+    auto fieldTy = resolveMemberType(
+        diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
+    if (!fieldTy) return std::nullopt;
+    if (fieldTy->isArray() && !fieldTy->ptrOutsideArrays) {
+      if (isAssign) {
+        diags.error(mem->memberLoc, "cannot assign to array");
+      } else {
+        diags.error(mem->memberLoc, "cannot take address of array");
+      }
+      return std::nullopt;
+    }
+    e.semaType = *fieldTy;
+    return *fieldTy;
+  }
+
+  diags.error(e.loc, errMsg);
+  return std::nullopt;
+}
+
+static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr) {
+  if (dst == src) return true;
+  if (dst.isPointer() && src.isInt() && isNullPointerConstant(srcExpr)) return true;
+  if (isPointerCompatibleForAssign(dst, src)) return true;
+  return false;
+}
+
+static std::optional<Type> checkExprImpl(
+    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e) {
+  if (auto* lit = dynamic_cast<IntLiteralExpr*>(&e)) {
+    Type t;
+    e.semaType = t;
+    return t;
+  }
+
+  if (dynamic_cast<InitListExpr*>(&e)) {
+    diags.error(e.loc, "initializer list not allowed here");
+    return std::nullopt;
+  }
+
+  if (auto* vr = dynamic_cast<VarRefExpr*>(&e)) {
+    auto ty = lookupVarType(scopes, vr->name);
+    if (!ty) {
+      diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
+      return std::nullopt;
+    }
+    if (ty->isArray() && !ty->ptrOutsideArrays) {
+      Type dt = ty->decayType();
+      e.semaType = dt;
+      return dt;
+    }
+    e.semaType = *ty;
+    return *ty;
+  }
+
+  if (auto* call = dynamic_cast<CallExpr*>(&e)) {
     auto it = fns.find(call->callee);
     if (it == fns.end()) {
       diags.error(call->calleeLoc, "call to undeclared function '" + call->callee + "'");
-      for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, *a);
-      return;
+      for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, *a);
+      return std::nullopt;
     }
 
-    size_t expected = it->second.arity;
+    const FnInfo& info = it->second;
+    size_t expected = info.paramTypes.size();
     size_t have = call->args.size();
     if (expected != have) {
       diags.error(call->calleeLoc,
@@ -154,66 +545,281 @@ static void checkExprImpl(Diagnostics& diags, ScopeStack& scopes, const FnTable&
                       " arguments, have " + std::to_string(have));
     }
 
-    for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, *a);
-    return;
-  }
-
-  if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
-    checkExprImpl(diags, scopes, fns, *asn->rhs);
-    if (!isDeclaredVar(scopes, asn->name)) {
-      diags.error(asn->nameLoc, "assignment to undeclared identifier '" + asn->name + "'");
+    for (size_t i = 0; i < call->args.size(); ++i) {
+      auto argTy = checkExprImpl(diags, scopes, fns, structs, *call->args[i]);
+      if (!argTy || i >= info.paramTypes.size()) continue;
+      if (!isAssignable(info.paramTypes[i], *argTy, *call->args[i])) {
+        diags.error(call->args[i]->loc, "incompatible argument type");
+      }
     }
-    return;
+
+    e.semaType = info.returnType;
+    return info.returnType;
   }
 
-  if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
-    checkExprImpl(diags, scopes, fns, *un->operand);
-    return;
+  if (auto* asn = dynamic_cast<AssignExpr*>(&e)) {
+    auto lhsTy = checkLValue(diags, scopes, fns, structs, *asn->lhs,
+                             "expected lvalue on left-hand side of assignment",
+                             /*isAssign=*/true);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, *asn->rhs);
+    if (lhsTy && rhsTy && !isAssignable(*lhsTy, *rhsTy, *asn->rhs)) {
+      diags.error(asn->loc, "incompatible assignment");
+    }
+    if (lhsTy) e.semaType = *lhsTy;
+    return lhsTy;
   }
 
-  if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
-    checkExprImpl(diags, scopes, fns, *bin->lhs);
-    checkExprImpl(diags, scopes, fns, *bin->rhs);
-    return;
+  if (auto* ter = dynamic_cast<TernaryExpr*>(&e)) {
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, *ter->cond);
+    auto thenTy = checkExprImpl(diags, scopes, fns, structs, *ter->thenExpr);
+    auto elseTy = checkExprImpl(diags, scopes, fns, structs, *ter->elseExpr);
+    if (condTy && !isScalarType(*condTy)) {
+      diags.error(ter->cond->loc, "condition must be scalar");
+    }
+    if (!thenTy || !elseTy) return std::nullopt;
+    if (*thenTy == *elseTy) {
+      e.semaType = *thenTy;
+      return *thenTy;
+    }
+    if (thenTy->isPointer() && elseTy->isInt() && isNullPointerConstant(*ter->elseExpr)) {
+      e.semaType = *thenTy;
+      return *thenTy;
+    }
+    if (elseTy->isPointer() && thenTy->isInt() && isNullPointerConstant(*ter->thenExpr)) {
+      e.semaType = *elseTy;
+      return *elseTy;
+    }
+    diags.error(ter->loc, "incompatible types in conditional operator");
+    return std::nullopt;
   }
-}
 
-static size_t protoArity(const FunctionProto& p) {
-  return p.params.size();
+  if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
+    if (un->op == TokenKind::Amp) {
+      auto lvTy = checkLValue(diags, scopes, fns, structs, *un->operand,
+                              "expected lvalue for address-of operator",
+                              /*isAssign=*/false);
+      if (!lvTy) return std::nullopt;
+      Type t = *lvTy;
+      t.ptrDepth++;
+      t.ptrOutsideArrays = false;
+      e.semaType = t;
+      return t;
+    }
+
+    auto opTy = checkExprImpl(diags, scopes, fns, structs, *un->operand);
+    if (!opTy) return std::nullopt;
+
+    if (un->op == TokenKind::Star) {
+      if (!opTy->isPointer()) {
+        diags.error(un->loc, "cannot dereference non-pointer");
+        return std::nullopt;
+      }
+      if (opTy->isVoidPointer()) {
+        diags.error(un->loc, "cannot dereference void pointer");
+        return std::nullopt;
+      }
+      Type t = opTy->pointee();
+      e.semaType = t;
+      return t;
+    }
+
+    if (un->op == TokenKind::Bang) {
+      if (!isScalarType(*opTy)) {
+        diags.error(un->loc, "invalid operand to '!'");
+        return std::nullopt;
+      }
+      Type t;
+      e.semaType = t;
+      return t;
+    }
+
+    if (un->op == TokenKind::Plus || un->op == TokenKind::Minus || un->op == TokenKind::Tilde) {
+      if (!opTy->isInt()) {
+        diags.error(un->loc, "invalid operand to unary operator");
+        return std::nullopt;
+      }
+      Type t;
+      e.semaType = t;
+      return t;
+    }
+  }
+
+  if (auto* bin = dynamic_cast<BinaryExpr*>(&e)) {
+    auto lhsTy = checkExprImpl(diags, scopes, fns, structs, *bin->lhs);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, *bin->rhs);
+    if (!lhsTy || !rhsTy) return std::nullopt;
+
+    switch (bin->op) {
+      case TokenKind::Comma: {
+        e.semaType = *rhsTy;
+        return *rhsTy;
+      }
+      case TokenKind::AmpAmp:
+      case TokenKind::PipePipe: {
+        if (!isScalarType(*lhsTy) || !isScalarType(*rhsTy)) {
+          diags.error(bin->loc, "invalid operands to logical operator");
+          return std::nullopt;
+        }
+        Type t;
+        e.semaType = t;
+        return t;
+      }
+      case TokenKind::EqualEqual:
+      case TokenKind::BangEqual: {
+        if (*lhsTy == *rhsTy) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        if (lhsTy->isPointer() && rhsTy->isPointer() &&
+            lhsTy->ptrDepth == 1 && rhsTy->ptrDepth == 1 &&
+            (lhsTy->base == Type::Base::Void || rhsTy->base == Type::Base::Void)) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        if (lhsTy->isPointer() && rhsTy->isInt() && isNullPointerConstant(*bin->rhs)) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        if (rhsTy->isPointer() && lhsTy->isInt() && isNullPointerConstant(*bin->lhs)) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        diags.error(bin->loc, "invalid operands to equality operator");
+        return std::nullopt;
+      }
+      case TokenKind::Less:
+      case TokenKind::LessEqual:
+      case TokenKind::Greater:
+      case TokenKind::GreaterEqual: {
+        if (!(lhsTy->isInt() && rhsTy->isInt())) {
+          if (!(lhsTy->isPointer() && rhsTy->isPointer() && *lhsTy == *rhsTy &&
+                !lhsTy->isVoidPointer())) {
+            diags.error(bin->loc, "invalid operands to relational operator");
+            return std::nullopt;
+          }
+        }
+        Type t;
+        e.semaType = t;
+        return t;
+      }
+      case TokenKind::Plus:
+      case TokenKind::Minus: {
+        if (lhsTy->isInt() && rhsTy->isInt()) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        if (lhsTy->isPointer() && rhsTy->isInt() && !lhsTy->isVoidPointer()) {
+          e.semaType = *lhsTy;
+          return *lhsTy;
+        }
+        if (bin->op == TokenKind::Plus && lhsTy->isInt() && rhsTy->isPointer() &&
+            !rhsTy->isVoidPointer()) {
+          e.semaType = *rhsTy;
+          return *rhsTy;
+        }
+        if (bin->op == TokenKind::Minus && lhsTy->isPointer() && rhsTy->isPointer() &&
+            *lhsTy == *rhsTy && !lhsTy->isVoidPointer()) {
+          Type t;
+          e.semaType = t;
+          return t;
+        }
+        diags.error(bin->loc, "invalid operands to pointer arithmetic");
+        return std::nullopt;
+      }
+      case TokenKind::Star:
+      case TokenKind::Slash: {
+        if (!lhsTy->isInt() || !rhsTy->isInt()) {
+          diags.error(bin->loc, "invalid operands to arithmetic operator");
+          return std::nullopt;
+        }
+        Type t;
+        e.semaType = t;
+        return t;
+      }
+      default:
+        break;
+    }
+  }
+
+  if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, *sub->index);
+    if (!baseTy || !idxTy) return std::nullopt;
+    if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
+      Type dt = baseTy->decayType();
+      baseTy = dt;
+    }
+    if (!idxTy->isInt()) {
+      diags.error(sub->index->loc, "array subscript must be int");
+      return std::nullopt;
+    }
+    if (baseTy->isPointer() && baseTy->isVoidPointer()) {
+      diags.error(sub->base->loc, "cannot subscript void pointer");
+      return std::nullopt;
+    }
+    if (!baseTy->isPointer()) {
+      diags.error(sub->base->loc, "subscripted value is not pointer");
+      return std::nullopt;
+    }
+    Type elem = baseTy->pointee();
+    e.semaType = elem;
+    return elem;
+  }
+
+  if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *mem->base);
+    if (!baseTy) return std::nullopt;
+    auto fieldTy = resolveMemberType(
+        diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
+    if (!fieldTy) return std::nullopt;
+    if (fieldTy->isArray() && !fieldTy->ptrOutsideArrays) {
+      Type dt = fieldTy->decayType();
+      e.semaType = dt;
+      return dt;
+    }
+    e.semaType = *fieldTy;
+    return *fieldTy;
+  }
+
+  return std::nullopt;
 }
 
 static void addOrCheckFn(
     Diagnostics& diags,
     FnTable& fns,
-    const std::string& name,
-    SourceLocation nameLoc,
-    size_t arity,
+    const FunctionProto& proto,
     bool isDef) {
-  auto it = fns.find(name);
+  auto it = fns.find(proto.name);
   if (it == fns.end()) {
     FnInfo info;
-    info.arity = arity;
-    info.firstLoc = nameLoc;
+    info.paramTypes.reserve(proto.params.size());
+    for (const auto& prm : proto.params) info.paramTypes.push_back(adjustParamType(prm.type));
+    info.returnType = proto.returnType;
+    info.firstLoc = proto.nameLoc;
     info.hasDecl = !isDef;
     info.hasDef = isDef;
-    fns.emplace(name, info);
+    fns.emplace(proto.name, info);
     return;
   }
 
   FnInfo& info = it->second;
 
   // signature mismatch
-  if (!sameSignature(info, arity)) {
-    diags.error(nameLoc,
-                "conflicting types for '" + name +
-                    "' (previous declaration has different parameter count)");
+  if (!sameSignature(info, proto)) {
+    diags.error(proto.nameLoc,
+                "conflicting types for '" + proto.name + "'");
     return;
   }
 
   // same signature: update decl/def flags
   if (isDef) {
     if (info.hasDef) {
-      diags.error(nameLoc, "redefinition of '" + name + "'");
+      diags.error(proto.nameLoc, "redefinition of '" + proto.name + "'");
       return;
     }
     info.hasDef = true;
@@ -224,26 +830,150 @@ static void addOrCheckFn(
 
 } // namespace
 
-bool Sema::run(const AstTranslationUnit& tu) {
+bool Sema::run(AstTranslationUnit& tu) {
+  // 0) collect struct definitions
+  StructTable structs;
+  for (const auto& item : tu.items) {
+    auto* sd = std::get_if<StructDef>(&item);
+    if (!sd) continue;
+    if (structs.count(sd->name)) {
+      diags_.error(sd->nameLoc, "redefinition of 'struct " + sd->name + "'");
+      return false;
+    }
+    StructInfo info;
+    info.fields = sd->fields;
+    info.nameLoc = sd->nameLoc;
+    structs.emplace(sd->name, std::move(info));
+  }
+
+  for (const auto& item : tu.items) {
+    auto* sd = std::get_if<StructDef>(&item);
+    if (!sd) continue;
+    std::unordered_set<std::string> fieldNames;
+    for (const auto& field : sd->fields) {
+      if (!fieldNames.insert(field.name).second) {
+        diags_.error(field.nameLoc, "duplicate field name '" + field.name + "'");
+        return false;
+      }
+      if (isArrayElementVoid(field.type)) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
+      if (field.type.isVoidObject()) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
+      if (hasInvalidArraySize(field.type, /*allowFirstEmpty=*/false)) {
+        diags_.error(field.nameLoc, "invalid array size");
+        return false;
+      }
+      if (requiresStructDef(field.type)) {
+        if (field.type.structName == sd->name) {
+          diags_.error(field.nameLoc, "field has incomplete type");
+          return false;
+        }
+        if (!lookupStruct(structs, field.type.structName)) {
+          diags_.error(field.nameLoc, "unknown struct type '" + field.type.structName + "'");
+          return false;
+        }
+      }
+    }
+  }
+
   // 1) collect all function prototypes (decls + defs)
   FnTable fns;
   for (const auto& item : tu.items) {
     if (auto* d = std::get_if<FunctionDecl>(&item)) {
-      const auto& p = d->proto;
-      addOrCheckFn(diags_, fns, p.name, p.nameLoc, protoArity(p), /*isDef=*/false);
+      addOrCheckFn(diags_, fns, d->proto, /*isDef=*/false);
     } else if (auto* def = std::get_if<FunctionDef>(&item)) {
-      const auto& p = def->proto;
-      addOrCheckFn(diags_, fns, p.name, p.nameLoc, protoArity(p), /*isDef=*/true);
+      addOrCheckFn(diags_, fns, def->proto, /*isDef=*/true);
     }
   }
 
-  // 2) check bodies of function definitions
+  for (const auto& item : tu.items) {
+    const FunctionProto* p = nullptr;
+    if (auto* d = std::get_if<FunctionDecl>(&item)) p = &d->proto;
+    else if (auto* def = std::get_if<FunctionDef>(&item)) p = &def->proto;
+    if (!p) continue;
+    if (p->returnType.isVoidObject()) {
+      diags_.error(p->nameLoc, "invalid return type");
+      return false;
+    }
+    for (const auto& prm : p->params) {
+      if (prm.type.isVoidObject()) {
+        diags_.error(prm.loc, "invalid parameter type");
+        return false;
+      }
+      if (isArrayElementVoid(prm.type)) {
+        diags_.error(prm.loc, "invalid array element type");
+        return false;
+      }
+      if (hasInvalidArraySize(prm.type, /*allowFirstEmpty=*/true)) {
+        diags_.error(prm.loc, "invalid array size");
+        return false;
+      }
+    }
+  }
+
+  Scope globalScope;
+
+  // 2) check global variable declarations
+  {
+    ScopeStack scopes;
+    scopes.push_back({});
+
+    for (const auto& item : tu.items) {
+      auto* g = std::get_if<GlobalVarDecl>(&item);
+      if (!g) continue;
+
+      for (const auto& decl : g->items) {
+        if (scopes.back().count(decl.name)) {
+          diags_.error(decl.nameLoc, "redefinition of '" + decl.name + "'");
+          return false;
+        }
+        if (isArrayElementVoid(decl.type)) {
+          diags_.error(decl.nameLoc, "invalid array element type");
+          return false;
+        }
+        if (decl.type.isVoidObject()) {
+          diags_.error(decl.nameLoc, "invalid use of void type");
+          return false;
+        }
+        if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/false)) {
+          diags_.error(decl.nameLoc, "invalid array size");
+          return false;
+        }
+        if (requiresStructDef(decl.type)) {
+          if (!lookupStruct(structs, decl.type.structName)) {
+            diags_.error(decl.nameLoc, "unknown struct type '" + decl.type.structName + "'");
+            return false;
+          }
+        }
+
+        if (decl.initExpr) {
+          if (decl.type.isArray()) {
+            diags_.error(decl.nameLoc, "array initializer not supported");
+            return false;
+          }
+          if (!checkInitializer(diags_, scopes, fns, structs, decl.type, *decl.initExpr, false)) {
+            return false;
+          }
+        }
+
+        scopes.back().emplace(decl.name, decl.type);
+        globalScope.emplace(decl.name, decl.type);
+      }
+    }
+  }
+
+  // 3) check bodies of function definitions
   for (const auto& item : tu.items) {
     auto* def = std::get_if<FunctionDef>(&item);
     if (!def) continue;
 
     ScopeStack scopes;
-    scopes.push_back({}); // function scope
+    scopes.push_back(globalScope); // globals
+    scopes.push_back({});          // function scope
 
     // parameters as locals ONLY if they have names
     for (const auto& prm : def->proto.params) {
@@ -254,10 +984,13 @@ bool Sema::run(const AstTranslationUnit& tu) {
         diags_.error(prm.nameLoc, "redefinition of '" + pname + "'");
         continue;
       }
-      cur.insert(pname);
+      cur.emplace(pname, adjustParamType(prm.type));
     }
 
-    for (const auto& st : def->body) checkStmtImpl(diags_, scopes, fns, /*loopDepth=*/0, *st);
+    for (const auto& st : def->body) {
+      checkStmtImpl(diags_, scopes, fns, structs, def->proto.returnType,
+                    /*loopDepth=*/0, /*switchDepth=*/0, *st);
+    }
   }
 
   return !diags_.hasError();
