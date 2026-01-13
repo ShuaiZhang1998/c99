@@ -8,11 +8,14 @@ enum class TokenKind {
   Eof,
   Identifier,
   IntegerLiteral,
+  FloatLiteral,
 
   KwChar,
   KwShort,
   KwInt,
   KwLong,
+  KwFloat,
+  KwDouble,
   KwVoid,
   KwStruct,
   KwReturn,
@@ -75,7 +78,7 @@ private:
 
   void skipWhitespace();
   Token lexIdentifierOrKeyword();
-  Token lexInteger();
+  Token lexNumber();
 
   const std::string& input_;
   Diagnostics& diags_;

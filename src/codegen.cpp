@@ -110,6 +110,10 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
     baseTy = llvm::Type::getInt16Ty(env.ctx);
   } else if (t.base == Type::Base::Long) {
     baseTy = llvm::Type::getInt64Ty(env.ctx);
+  } else if (t.base == Type::Base::Float) {
+    baseTy = llvm::Type::getFloatTy(env.ctx);
+  } else if (t.base == Type::Base::Double) {
+    baseTy = llvm::Type::getDoubleTy(env.ctx);
   } else {
     baseTy = env.i32Ty();
   }
@@ -143,17 +147,33 @@ static llvm::Value* i32Const(CGEnv& env, int64_t v) {
   return llvm::ConstantInt::get(env.i32Ty(), (uint64_t)v, true);
 }
 
-static Type commonIntegerType(const Type& lhs, const Type& rhs) {
-  if (lhs.base == Type::Base::Long || rhs.base == Type::Base::Long) {
-    return Type{Type::Base::Long, 0};
-  }
-  return Type{};
-}
-
 static llvm::Value* castInteger(CGEnv& env, llvm::Value* v, llvm::Type* dstTy) {
   if (v->getType() == dstTy) return v;
   if (v->getType()->isIntegerTy() && dstTy->isIntegerTy()) {
     return env.b.CreateSExtOrTrunc(v, dstTy, "int.cast");
+  }
+  return v;
+}
+
+static llvm::Value* castNumericToType(
+    CGEnv& env, llvm::Value* v, const Type& src, const Type& dst) {
+  if (src == dst) return v;
+  llvm::Type* dstTy = llvmType(env, dst);
+  if (dst.isInteger()) {
+    if (src.isInteger()) return castInteger(env, v, dstTy);
+    if (src.isFloating()) return env.b.CreateFPToSI(v, dstTy, "fp.to.si");
+    return v;
+  }
+  if (dst.isFloating()) {
+    if (src.isInteger()) return env.b.CreateSIToFP(v, dstTy, "si.to.fp");
+    if (src.isFloating()) {
+      if (v->getType() == dstTy) return v;
+      unsigned srcBits = v->getType()->getPrimitiveSizeInBits();
+      unsigned dstBits = dstTy->getPrimitiveSizeInBits();
+      if (srcBits < dstBits) return env.b.CreateFPExt(v, dstTy, "fp.ext");
+      return env.b.CreateFPTrunc(v, dstTy, "fp.trunc");
+    }
+    return v;
   }
   return v;
 }
@@ -172,8 +192,27 @@ static uint64_t integerSizeBytes(const Type& t) {
     case Type::Base::Short: return 2;
     case Type::Base::Long:  return 8;
     case Type::Base::Int:   return 4;
+    case Type::Base::Float: return 4;
+    case Type::Base::Double:return 8;
     default: return sizeof(void*);
   }
+}
+
+static Type commonIntegerType(const Type& lhs, const Type& rhs) {
+  if (lhs.base == Type::Base::Long || rhs.base == Type::Base::Long) {
+    return Type{Type::Base::Long, 0};
+  }
+  return Type{};
+}
+
+static Type commonNumericType(const Type& lhs, const Type& rhs) {
+  if (lhs.isFloating() || rhs.isFloating()) {
+    if (lhs.base == Type::Base::Double || rhs.base == Type::Base::Double) {
+      return Type{Type::Base::Double, 0};
+    }
+    return Type{Type::Base::Float, 0};
+  }
+  return commonIntegerType(lhs, rhs);
 }
 
 static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
@@ -182,6 +221,10 @@ static llvm::Value* asBoolI1(CGEnv& env, llvm::Value* v) {
     auto* pty = llvm::cast<llvm::PointerType>(v->getType());
     auto* zero = llvm::ConstantPointerNull::get(pty);
     return env.b.CreateICmpNE(v, zero, "tobool");
+  }
+  if (v->getType()->isFloatingPointTy()) {
+    auto* zero = llvm::ConstantFP::get(v->getType(), 0.0);
+    return env.b.CreateFCmpONE(v, zero, "tobool");
   }
   if (v->getType()->isIntegerTy()) {
     auto* zero = llvm::ConstantInt::get(v->getType(), 0, true);
@@ -222,6 +265,9 @@ static llvm::Constant* zeroValue(CGEnv& env, const Type& t) {
   if (t.isInteger()) {
     return llvm::ConstantInt::get(ty, 0, true);
   }
+  if (t.isFloating()) {
+    return llvm::ConstantFP::get(ty, 0.0);
+  }
   return llvm::ConstantInt::get(env.i32Ty(), 0, true);
 }
 
@@ -242,10 +288,11 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
 
 static llvm::Value* emitEqualByAddr(
     CGEnv& env, const Type& ty, llvm::Value* lhsAddr, llvm::Value* rhsAddr) {
-  if (ty.isPointer() || ty.isInteger()) {
+  if (ty.isPointer() || ty.isInteger() || ty.isFloating()) {
     llvm::Type* elemTy = llvmType(env, ty);
     llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
     llvm::Value* R = env.b.CreateLoad(elemTy, rhsAddr, "cmp.r");
+    if (ty.isFloating()) return env.b.CreateFCmpOEQ(L, R, "cmp");
     return env.b.CreateICmpEQ(L, R, "cmp");
   }
 
@@ -297,6 +344,9 @@ static llvm::Value* emitEqualByAddr(
 static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm::Value* rhs) {
   if (ty.isPointer() || ty.isInteger()) {
     return env.b.CreateICmpEQ(lhs, rhs, "cmp");
+  }
+  if (ty.isFloating()) {
+    return env.b.CreateFCmpOEQ(lhs, rhs, "cmp");
   }
   if (ty.isArray() || (ty.base == Type::Base::Struct && ty.ptrDepth == 0)) {
     llvm::AllocaInst* ltmp = createEntryAlloca(env, "cmp.lhs", ty);
@@ -358,8 +408,8 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
   } else if (ty.isPointer() && exprType(init).isPointer()) {
     llvm::Type* ptrTy = llvmType(env, ty);
     initV = castPointerIfNeeded(env, initV, ptrTy);
-  } else if (ty.isInteger() && initV->getType()->isIntegerTy()) {
-    initV = castInteger(env, initV, llvmType(env, ty));
+  } else if (ty.isNumeric() && exprType(init).isNumeric()) {
+    initV = castNumericToType(env, initV, exprType(init), ty);
   }
   env.b.CreateStore(initV, addr);
 }
@@ -382,14 +432,17 @@ static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
     case TokenKind::Plus: {
       llvm::Value* v = emitExpr(env, *u.operand);
       const Type& resTy = exprType(u);
-      if (resTy.isInteger()) v = castInteger(env, v, llvmType(env, resTy));
+      if (resTy.isNumeric()) v = castNumericToType(env, v, exprType(*u.operand), resTy);
       return v;
     }
     case TokenKind::Minus: {
       llvm::Value* v = emitExpr(env, *u.operand);
       const Type& resTy = exprType(u);
       llvm::Type* resLlvmTy = llvmType(env, resTy);
-      if (resTy.isInteger()) v = castInteger(env, v, resLlvmTy);
+      if (resTy.isNumeric()) v = castNumericToType(env, v, exprType(*u.operand), resTy);
+      if (resTy.isFloating()) {
+        return env.b.CreateFNeg(v, "neg");
+      }
       llvm::Value* zero = llvm::ConstantInt::get(resLlvmTy, 0, true);
       return env.b.CreateSub(zero, v, "neg");
     }
@@ -481,6 +534,12 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         llvm::Value* idx = castIndex(env, L);
         return env.b.CreateGEP(elemTy, R, idx, "ptr.add");
       }
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type resTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        return env.b.CreateFAdd(L, R, "fadd");
+      }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
         llvm::Type* resLlvmTy = llvmType(env, resTy);
@@ -502,10 +561,18 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         llvm::Value* Ri = env.b.CreatePtrToInt(R, env.b.getInt64Ty(), "ptrtoi.r");
         llvm::Value* diffBytes = env.b.CreateSub(Li, Ri, "ptrdiff.bytes");
         Type elemTy = lhsTy.pointee();
-        uint64_t elemSize = elemTy.isInteger() ? integerSizeBytes(elemTy) : sizeof(void*);
+        uint64_t elemSize = (elemTy.isInteger() || elemTy.isFloating())
+                                ? integerSizeBytes(elemTy)
+                                : sizeof(void*);
         llvm::Value* elemSizeV = llvm::ConstantInt::get(env.b.getInt64Ty(), elemSize, false);
         llvm::Value* diffElems = env.b.CreateSDiv(diffBytes, elemSizeV, "ptrdiff");
         return env.b.CreateTrunc(diffElems, env.i32Ty(), "ptrdiff.i32");
+      }
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type resTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        return env.b.CreateFSub(L, R, "fsub");
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
@@ -516,6 +583,12 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       return env.b.CreateSub(L, R, "sub");
     }
     case TokenKind::Star: {
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type resTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        return env.b.CreateFMul(L, R, "fmul");
+      }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
         llvm::Type* resLlvmTy = llvmType(env, resTy);
@@ -525,6 +598,12 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       return env.b.CreateMul(L, R, "mul");
     }
     case TokenKind::Slash: {
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type resTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        return env.b.CreateFDiv(L, R, "fdiv");
+      }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
         llvm::Type* resLlvmTy = llvmType(env, resTy);
@@ -541,6 +620,11 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       llvm::Value* c = nullptr;
       if (lhsTy.isPointer()) {
         c = env.b.CreateICmpULT(L, R, "cmp");
+      } else if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = env.b.CreateFCmpOLT(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
         llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
@@ -556,6 +640,11 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       llvm::Value* c = nullptr;
       if (lhsTy.isPointer()) {
         c = env.b.CreateICmpULE(L, R, "cmp");
+      } else if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = env.b.CreateFCmpOLE(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
         llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
@@ -571,6 +660,11 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       llvm::Value* c = nullptr;
       if (lhsTy.isPointer()) {
         c = env.b.CreateICmpUGT(L, R, "cmp");
+      } else if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = env.b.CreateFCmpOGT(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
         llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
@@ -586,6 +680,11 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       llvm::Value* c = nullptr;
       if (lhsTy.isPointer()) {
         c = env.b.CreateICmpUGE(L, R, "cmp");
+      } else if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = env.b.CreateFCmpOGE(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
         llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
@@ -601,6 +700,13 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         return env.b.CreateZExt(eq, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        auto* c = env.b.CreateFCmpOEQ(L, R, "cmp");
+        return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
@@ -628,6 +734,13 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         llvm::Value* ne = env.b.CreateNot(eq, "cmp.not");
         return env.b.CreateZExt(ne, env.i32Ty(), "cmp.i32");
+      }
+      if (lhsTy.isFloating() || rhsTy.isFloating()) {
+        Type cmpTy = commonNumericType(lhsTy, rhsTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        auto* c = env.b.CreateFCmpONE(L, R, "cmp");
+        return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
@@ -714,6 +827,11 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
     return i32Const(env, lit->value);
   }
+  if (auto* flt = dynamic_cast<const FloatLiteralExpr*>(&e)) {
+    llvm::Type* ty = flt->isFloat ? llvm::Type::getFloatTy(env.ctx)
+                                  : llvm::Type::getDoubleTy(env.ctx);
+    return llvm::ConstantFP::get(ty, flt->value);
+  }
 
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
     if (auto* local = env.lookupLocal(vr->name)) {
@@ -752,9 +870,21 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
           argsV.push_back(castPointerIfNeeded(env, v, paramTy));
           continue;
         }
-        if (paramTy->isIntegerTy() && exprType(*a).isInteger()) {
+        if (paramTy->isIntegerTy() && exprType(*a).isNumeric()) {
           llvm::Value* v = emitExpr(env, *a);
-          argsV.push_back(castInteger(env, v, paramTy));
+          Type dstTy;
+          if (paramTy->isIntegerTy(64)) dstTy.base = Type::Base::Long;
+          else if (paramTy->isIntegerTy(16)) dstTy.base = Type::Base::Short;
+          else if (paramTy->isIntegerTy(8)) dstTy.base = Type::Base::Char;
+          else dstTy.base = Type::Base::Int;
+          argsV.push_back(castNumericToType(env, v, exprType(*a), dstTy));
+          continue;
+        }
+        if (paramTy->isFloatingPointTy() && exprType(*a).isNumeric()) {
+          llvm::Value* v = emitExpr(env, *a);
+          Type dstTy;
+          dstTy.base = paramTy->isFloatTy() ? Type::Base::Float : Type::Base::Double;
+          argsV.push_back(castNumericToType(env, v, exprType(*a), dstTy));
           continue;
         }
       }
@@ -795,9 +925,9 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
       if (isNullPointerLiteral(*ter->elseExpr)) {
         elseV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(resLlvmTy));
       }
-    } else if (resTy.isInteger()) {
-      thenV = castInteger(env, thenV, resLlvmTy);
-      elseV = castInteger(env, elseV, resLlvmTy);
+    } else if (resTy.isNumeric()) {
+      thenV = castNumericToType(env, thenV, exprType(*ter->thenExpr), resTy);
+      elseV = castNumericToType(env, elseV, exprType(*ter->elseExpr), resTy);
     }
     llvm::PHINode* phi = env.b.CreatePHI(resLlvmTy, 2, "ternary");
     phi->addIncoming(thenV, thenBB);
@@ -855,8 +985,8 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     } else if (lhsTy.isPointer() && exprType(*asn->rhs).isPointer()) {
       llvm::Type* ptrTy = llvmType(env, lhsTy);
       rhsV = castPointerIfNeeded(env, rhsV, ptrTy);
-    } else if (lhsTy.isInteger() && rhsV->getType()->isIntegerTy()) {
-      rhsV = castInteger(env, rhsV, llvmType(env, lhsTy));
+    } else if (lhsTy.isNumeric() && exprType(*asn->rhs).isNumeric()) {
+      rhsV = castNumericToType(env, rhsV, exprType(*asn->rhs), lhsTy);
     }
     env.b.CreateStore(rhsV, addr);
     return rhsV;
@@ -1089,8 +1219,8 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     } else if (env.currentReturnType.isPointer() && exprType(*r->valueExpr).isPointer()) {
       llvm::Type* ptrTy = llvmType(env, env.currentReturnType);
       retV = castPointerIfNeeded(env, retV, ptrTy);
-    } else if (env.currentReturnType.isInteger() && retV->getType()->isIntegerTy()) {
-      retV = castInteger(env, retV, llvmType(env, env.currentReturnType));
+    } else if (env.currentReturnType.isNumeric() && exprType(*r->valueExpr).isNumeric()) {
+      retV = castNumericToType(env, retV, exprType(*r->valueExpr), env.currentReturnType);
     }
     env.b.CreateRet(retV);
     return true;

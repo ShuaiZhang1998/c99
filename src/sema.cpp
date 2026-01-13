@@ -68,7 +68,7 @@ static std::optional<Type> checkExprImpl(
     Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e);
 
 static bool isScalarType(const Type& t) {
-  return t.isInteger() || t.isPointer();
+  return t.isNumeric() || t.isPointer();
 }
 
 static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr);
@@ -89,6 +89,16 @@ static Type commonIntegerType(const Type& lhs, const Type& rhs) {
     return Type{Type::Base::Long, 0};
   }
   return Type{};
+}
+
+static Type commonNumericType(const Type& lhs, const Type& rhs) {
+  if (lhs.isFloating() || rhs.isFloating()) {
+    if (lhs.base == Type::Base::Double || rhs.base == Type::Base::Double) {
+      return Type{Type::Base::Double, 0};
+    }
+    return Type{Type::Base::Float, 0};
+  }
+  return commonIntegerType(lhs, rhs);
 }
 
 static bool isPointerCompatibleForAssign(const Type& dst, const Type& src) {
@@ -513,7 +523,7 @@ static std::optional<Type> checkLValue(
 
 static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr) {
   if (dst == src) return true;
-  if (dst.isInteger() && src.isInteger()) return true;
+  if (dst.isNumeric() && src.isNumeric()) return true;
   if (dst.isPointer() && src.isInt() && isNullPointerConstant(srcExpr)) return true;
   if (isPointerCompatibleForAssign(dst, src)) return true;
   return false;
@@ -523,6 +533,12 @@ static std::optional<Type> checkExprImpl(
     Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e) {
   if (auto* lit = dynamic_cast<IntLiteralExpr*>(&e)) {
     Type t;
+    e.semaType = t;
+    return t;
+  }
+  if (auto* flt = dynamic_cast<FloatLiteralExpr*>(&e)) {
+    Type t;
+    t.base = flt->isFloat ? Type::Base::Float : Type::Base::Double;
     e.semaType = t;
     return t;
   }
@@ -600,8 +616,8 @@ static std::optional<Type> checkExprImpl(
       e.semaType = *thenTy;
       return *thenTy;
     }
-    if (thenTy->isInteger() && elseTy->isInteger()) {
-      Type t = commonIntegerType(*thenTy, *elseTy);
+    if (thenTy->isNumeric() && elseTy->isNumeric()) {
+      Type t = commonNumericType(*thenTy, *elseTy);
       e.semaType = t;
       return t;
     }
@@ -658,11 +674,15 @@ static std::optional<Type> checkExprImpl(
     }
 
     if (un->op == TokenKind::Plus || un->op == TokenKind::Minus || un->op == TokenKind::Tilde) {
-      if (!opTy->isInteger()) {
+      if (un->op == TokenKind::Tilde && !opTy->isInteger()) {
         diags.error(un->loc, "invalid operand to unary operator");
         return std::nullopt;
       }
-      Type t = promoteInteger(*opTy);
+      if (un->op != TokenKind::Tilde && !opTy->isNumeric()) {
+        diags.error(un->loc, "invalid operand to unary operator");
+        return std::nullopt;
+      }
+      Type t = opTy->isFloating() ? *opTy : promoteInteger(*opTy);
       e.semaType = t;
       return t;
     }
@@ -695,7 +715,7 @@ static std::optional<Type> checkExprImpl(
           e.semaType = t;
           return t;
         }
-        if (lhsTy->isInteger() && rhsTy->isInteger()) {
+        if (lhsTy->isNumeric() && rhsTy->isNumeric()) {
           Type t;
           e.semaType = t;
           return t;
@@ -724,7 +744,7 @@ static std::optional<Type> checkExprImpl(
       case TokenKind::LessEqual:
       case TokenKind::Greater:
       case TokenKind::GreaterEqual: {
-        if (!(lhsTy->isInteger() && rhsTy->isInteger())) {
+        if (!(lhsTy->isNumeric() && rhsTy->isNumeric())) {
           if (!(lhsTy->isPointer() && rhsTy->isPointer() && *lhsTy == *rhsTy &&
                 !lhsTy->isVoidPointer())) {
             diags.error(bin->loc, "invalid operands to relational operator");
@@ -737,8 +757,8 @@ static std::optional<Type> checkExprImpl(
       }
       case TokenKind::Plus:
       case TokenKind::Minus: {
-        if (lhsTy->isInteger() && rhsTy->isInteger()) {
-          Type t = commonIntegerType(*lhsTy, *rhsTy);
+        if (lhsTy->isNumeric() && rhsTy->isNumeric()) {
+          Type t = commonNumericType(*lhsTy, *rhsTy);
           e.semaType = t;
           return t;
         }
@@ -762,11 +782,11 @@ static std::optional<Type> checkExprImpl(
       }
       case TokenKind::Star:
       case TokenKind::Slash: {
-        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+        if (!lhsTy->isNumeric() || !rhsTy->isNumeric()) {
           diags.error(bin->loc, "invalid operands to arithmetic operator");
           return std::nullopt;
         }
-        Type t = commonIntegerType(*lhsTy, *rhsTy);
+        Type t = commonNumericType(*lhsTy, *rhsTy);
         e.semaType = t;
         return t;
       }

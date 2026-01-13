@@ -41,6 +41,16 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     spec.type.base = Type::Base::Long;
     return spec;
   }
+  if (cur_.kind == TokenKind::KwFloat) {
+    advance();
+    spec.type.base = Type::Base::Float;
+    return spec;
+  }
+  if (cur_.kind == TokenKind::KwDouble) {
+    advance();
+    spec.type.base = Type::Base::Double;
+    return spec;
+  }
   if (cur_.kind == TokenKind::KwVoid) {
     advance();
     spec.type.base = Type::Base::Void;
@@ -390,6 +400,7 @@ std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
 std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
       cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
+      cur_.kind == TokenKind::KwFloat || cur_.kind == TokenKind::KwDouble ||
       cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
     return parseDeclStmt();
   }
@@ -623,6 +634,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
     advance();
   } else if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
              cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
+             cur_.kind == TokenKind::KwFloat || cur_.kind == TokenKind::KwDouble ||
              cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
     auto d = parseDeclStmt();
     if (!d) return std::nullopt;
@@ -752,6 +764,21 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     int64_t v = std::stoll(cur_.text);
     advance();
     return std::make_unique<IntLiteralExpr>(l, v);
+  }
+  if (cur_.kind == TokenKind::FloatLiteral) {
+    SourceLocation l = cur_.loc;
+    std::string text = cur_.text;
+    bool isFloat = false;
+    if (!text.empty()) {
+      char last = text.back();
+      if (last == 'f' || last == 'F') {
+        isFloat = true;
+        text.pop_back();
+      }
+    }
+    double v = std::stod(text);
+    advance();
+    return std::make_unique<FloatLiteralExpr>(l, v, isFloat);
   }
 
   if (cur_.kind == TokenKind::Identifier) {

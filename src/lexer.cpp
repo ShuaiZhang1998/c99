@@ -48,6 +48,8 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "short")    return Token{TokenKind::KwShort, s, loc};
   if (s == "int")      return Token{TokenKind::KwInt, s, loc};
   if (s == "long")     return Token{TokenKind::KwLong, s, loc};
+  if (s == "float")    return Token{TokenKind::KwFloat, s, loc};
+  if (s == "double")   return Token{TokenKind::KwDouble, s, loc};
   if (s == "void")     return Token{TokenKind::KwVoid, s, loc};
   if (s == "struct")   return Token{TokenKind::KwStruct, s, loc};
   if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
@@ -66,14 +68,52 @@ Token Lexer::lexIdentifierOrKeyword() {
   return Token{TokenKind::Identifier, s, loc};
 }
 
-Token Lexer::lexInteger() {
+Token Lexer::lexNumber() {
   SourceLocation loc{ i_, line_, col_ };
   std::string s;
-  while (!eof()) {
-    char c = peek();
-    if (std::isdigit((unsigned char)c)) s.push_back(get());
-    else break;
+  bool isFloat = false;
+  if (peek() == '.') {
+    isFloat = true;
+    s.push_back(get());
+    while (!eof()) {
+      char c = peek();
+      if (std::isdigit((unsigned char)c)) s.push_back(get());
+      else break;
+    }
+  } else {
+    while (!eof()) {
+      char c = peek();
+      if (std::isdigit((unsigned char)c)) s.push_back(get());
+      else break;
+    }
+    if (!eof() && peek() == '.') {
+      isFloat = true;
+      s.push_back(get());
+      while (!eof()) {
+        char c = peek();
+        if (std::isdigit((unsigned char)c)) s.push_back(get());
+        else break;
+      }
+    }
   }
+
+  if (!eof() && (peek() == 'e' || peek() == 'E')) {
+    isFloat = true;
+    s.push_back(get());
+    if (!eof() && (peek() == '+' || peek() == '-')) s.push_back(get());
+    while (!eof()) {
+      char c = peek();
+      if (std::isdigit((unsigned char)c)) s.push_back(get());
+      else break;
+    }
+  }
+
+  if (!eof() && (peek() == 'f' || peek() == 'F')) {
+    isFloat = true;
+    s.push_back(get());
+  }
+
+  if (isFloat) return Token{TokenKind::FloatLiteral, s, loc};
   return Token{TokenKind::IntegerLiteral, s, loc};
 }
 
@@ -85,7 +125,10 @@ Token Lexer::next() {
 
   char c = peek();
   if (std::isalpha((unsigned char)c) || c == '_') return lexIdentifierOrKeyword();
-  if (std::isdigit((unsigned char)c)) return lexInteger();
+  if (std::isdigit((unsigned char)c)) return lexNumber();
+  if (c == '.' && i_ + 1 < input_.size() && std::isdigit((unsigned char)input_[i_ + 1])) {
+    return lexNumber();
+  }
 
   switch (c) {
     case '(': get(); return Token{TokenKind::LParen, "(", loc};
