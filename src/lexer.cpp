@@ -53,6 +53,9 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "double")   return Token{TokenKind::KwDouble, s, loc};
   if (s == "void")     return Token{TokenKind::KwVoid, s, loc};
   if (s == "struct")   return Token{TokenKind::KwStruct, s, loc};
+  if (s == "enum")     return Token{TokenKind::KwEnum, s, loc};
+  if (s == "typedef")  return Token{TokenKind::KwTypedef, s, loc};
+  if (s == "sizeof")   return Token{TokenKind::KwSizeof, s, loc};
   if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
   if (s == "if")       return Token{TokenKind::KwIf, s, loc};
   if (s == "else")     return Token{TokenKind::KwElse, s, loc};

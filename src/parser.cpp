@@ -4,6 +4,23 @@
 
 namespace c99cc {
 
+void Parser::advance() {
+  if (hasPeek_) {
+    cur_ = peek_;
+    hasPeek_ = false;
+  } else {
+    cur_ = lex_.next();
+  }
+}
+
+const Token& Parser::peekToken() {
+  if (!hasPeek_) {
+    peek_ = lex_.next();
+    hasPeek_ = true;
+  }
+  return peek_;
+}
+
 bool Parser::expect(TokenKind k, const char* what) {
   if (cur_.kind == k) return true;
   diags_.error(cur_.loc, std::string("expected ") + what);
@@ -21,6 +38,7 @@ int Parser::parsePointerDepth() {
 
 std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef) {
   ParsedTypeSpec spec;
+  SourceLocation typeLoc = cur_.loc;
   if (cur_.kind == TokenKind::KwUnsigned) {
     advance();
     spec.type.isUnsigned = true;
@@ -97,6 +115,36 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     spec.type.base = Type::Base::Void;
     return spec;
   }
+  if (cur_.kind == TokenKind::KwEnum) {
+    advance();
+    spec.type.base = Type::Base::Enum;
+    if (cur_.kind == TokenKind::Identifier) {
+      spec.type.enumName = cur_.text;
+      advance();
+    }
+    if (cur_.kind == TokenKind::LBrace) {
+      if (!allowStructDef) {
+        diags_.error(cur_.loc, "enum definition not allowed here");
+        return std::nullopt;
+      }
+      advance();
+      auto items = parseEnumItems();
+      if (!items) return std::nullopt;
+      if (!expect(TokenKind::RBrace, "'}'")) return std::nullopt;
+      advance();
+      EnumDef def;
+      def.name = spec.type.enumName.empty()
+                     ? std::optional<std::string>{}
+                     : std::optional<std::string>{spec.type.enumName};
+      def.nameLoc = typeLoc;
+      def.items = std::move(*items);
+      spec.enumDef = std::move(def);
+    } else if (spec.type.enumName.empty()) {
+      diags_.error(cur_.loc, "expected enum name or definition");
+      return std::nullopt;
+    }
+    return spec;
+  }
   if (cur_.kind == TokenKind::KwStruct) {
     advance();
     if (!expect(TokenKind::Identifier, "struct name")) return std::nullopt;
@@ -119,9 +167,17 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
       def.name = std::move(name);
       def.nameLoc = nameLoc;
       def.fields = std::move(*fields);
-      spec.def = std::move(def);
+      spec.structDef = std::move(def);
     }
     return spec;
+  }
+  if (cur_.kind == TokenKind::Identifier) {
+    auto it = typedefs_.find(cur_.text);
+    if (it != typedefs_.end()) {
+      spec.type = it->second;
+      advance();
+      return spec;
+    }
   }
   return std::nullopt;
 }
@@ -138,7 +194,7 @@ std::optional<std::vector<StructField>> Parser::parseStructFields() {
       if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
       StructField f;
       f.type = baseType;
-      f.type.ptrDepth = depth;
+      f.type.ptrDepth += depth;
       f.name = cur_.text;
       f.nameLoc = cur_.loc;
       advance();
@@ -157,6 +213,59 @@ std::optional<std::vector<StructField>> Parser::parseStructFields() {
     advance();
   }
   return fields;
+}
+
+std::optional<std::vector<EnumItem>> Parser::parseEnumItems() {
+  std::vector<EnumItem> items;
+  int64_t current = -1;
+  while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::Eof) {
+    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    EnumItem item;
+    item.name = cur_.text;
+    item.nameLoc = cur_.loc;
+    advance();
+    int64_t value = current + 1;
+    if (cur_.kind == TokenKind::Assign) {
+      advance();
+      bool neg = false;
+      if (cur_.kind == TokenKind::Minus || cur_.kind == TokenKind::Plus) {
+        neg = (cur_.kind == TokenKind::Minus);
+        advance();
+      }
+      if (cur_.kind == TokenKind::IntegerLiteral) {
+        value = std::stoll(cur_.text);
+        if (neg) value = -value;
+        advance();
+      } else if (cur_.kind == TokenKind::Identifier) {
+        auto it = enumConstants_.find(cur_.text);
+        if (it == enumConstants_.end()) {
+          diags_.error(cur_.loc, "unknown enum constant '" + cur_.text + "'");
+          return std::nullopt;
+        }
+        value = it->second;
+        if (neg) value = -value;
+        advance();
+      } else {
+        diags_.error(cur_.loc, "expected integer literal or enum constant");
+        return std::nullopt;
+      }
+    }
+    if (enumConstants_.count(item.name)) {
+      diags_.error(item.nameLoc, "redefinition of enum constant '" + item.name + "'");
+      return std::nullopt;
+    }
+    item.value = value;
+    enumConstants_.emplace(item.name, value);
+    items.push_back(std::move(item));
+    current = value;
+
+    if (cur_.kind == TokenKind::Comma) {
+      advance();
+      continue;
+    }
+    break;
+  }
+  return items;
 }
 
 std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool allowFirstEmpty) {
@@ -186,6 +295,23 @@ std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool al
   return dims;
 }
 
+std::optional<Type> Parser::parseTypeName(bool allowStructDef) {
+  auto specOpt = parseTypeSpec(allowStructDef);
+  if (!specOpt) return std::nullopt;
+  if (specOpt->structDef || specOpt->enumDef) {
+    diags_.error(cur_.loc, "type definition not allowed here");
+    return std::nullopt;
+  }
+  Type t = specOpt->type;
+  t.ptrDepth += parsePointerDepth();
+  if (cur_.kind == TokenKind::LBracket) {
+    auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
+    if (!dims) return std::nullopt;
+    t.arrayDims = std::move(*dims);
+  }
+  return t;
+}
+
 // -------------------- TU / top-level --------------------
 
 std::optional<std::vector<Param>> Parser::parseParamList() {
@@ -205,7 +331,7 @@ std::optional<std::vector<Param>> Parser::parseParamList() {
       }
       p.loc = typeLoc;
       p.type.base = Type::Base::Void;
-      p.type.ptrDepth = parsePointerDepth();
+      p.type.ptrDepth += parsePointerDepth();
     } else {
       auto specOpt = parseTypeSpec(/*allowStructDef=*/false);
       if (!specOpt) {
@@ -214,7 +340,7 @@ std::optional<std::vector<Param>> Parser::parseParamList() {
       }
       p.loc = typeLoc;
       p.type = specOpt->type;
-      p.type.ptrDepth = parsePointerDepth();
+      p.type.ptrDepth += parsePointerDepth();
     }
 
   if (cur_.kind == TokenKind::Identifier) {
@@ -259,7 +385,7 @@ std::optional<FunctionProto> Parser::parseFunctionProto() {
   if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
   FunctionProto proto;
   proto.returnType = specOpt->type;
-  proto.returnType.ptrDepth = retDepth;
+  proto.returnType.ptrDepth += retDepth;
   proto.name = cur_.text;
   proto.nameLoc = cur_.loc;
   advance();
@@ -303,14 +429,23 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     return item;
   }
 
+  if (cur_.kind == TokenKind::KwTypedef) {
+    return parseTypedefTopLevel();
+  }
+
   auto specOpt = parseTypeSpec(/*allowStructDef=*/true);
   if (!specOpt) {
     diags_.error(cur_.loc, "expected type");
     return std::nullopt;
   }
 
-  if (specOpt->def && cur_.kind == TokenKind::Semicolon) {
-    StructDef def = std::move(*specOpt->def);
+  if (specOpt->structDef && cur_.kind == TokenKind::Semicolon) {
+    StructDef def = std::move(*specOpt->structDef);
+    advance();
+    return TopLevelItem{std::move(def)};
+  }
+  if (specOpt->enumDef && cur_.kind == TokenKind::Semicolon) {
+    EnumDef def = std::move(*specOpt->enumDef);
     advance();
     return TopLevelItem{std::move(def)};
   }
@@ -331,7 +466,7 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
 
     FunctionProto proto;
     proto.returnType = baseType;
-    proto.returnType.ptrDepth = firstDepth;
+    proto.returnType.ptrDepth += firstDepth;
     proto.name = std::move(name);
     proto.nameLoc = nameLoc;
     proto.params = std::move(*params);
@@ -344,9 +479,13 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
       decl.proto = std::move(proto);
       decl.semiLoc = cur_.loc;
       advance();
-      if (specOpt->def) {
+      if (specOpt->structDef) {
         pending_.push_back(TopLevelItem{std::move(decl)});
-        return TopLevelItem{std::move(*specOpt->def)};
+        return TopLevelItem{std::move(*specOpt->structDef)};
+      }
+      if (specOpt->enumDef) {
+        pending_.push_back(TopLevelItem{std::move(decl)});
+        return TopLevelItem{std::move(*specOpt->enumDef)};
       }
       return TopLevelItem{std::move(decl)};
     }
@@ -354,9 +493,13 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     if (cur_.kind == TokenKind::LBrace) {
       auto def = parseFunctionDefAfterProto(std::move(proto));
       if (!def) return std::nullopt;
-      if (specOpt->def) {
+      if (specOpt->structDef) {
         pending_.push_back(TopLevelItem{std::move(*def)});
-        return TopLevelItem{std::move(*specOpt->def)};
+        return TopLevelItem{std::move(*specOpt->structDef)};
+      }
+      if (specOpt->enumDef) {
+        pending_.push_back(TopLevelItem{std::move(*def)});
+        return TopLevelItem{std::move(*specOpt->enumDef)};
       }
       return TopLevelItem{std::move(*def)};
     }
@@ -368,7 +511,7 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
   std::vector<DeclItem> items;
   DeclItem first;
   first.type = baseType;
-  first.type.ptrDepth = firstDepth;
+  first.type.ptrDepth += firstDepth;
   first.name = std::move(name);
   first.nameLoc = nameLoc;
   if (cur_.kind == TokenKind::LBracket) {
@@ -392,7 +535,7 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
     DeclItem item;
     item.type = baseType;
-    item.type.ptrDepth = depth;
+    item.type.ptrDepth += depth;
     item.name = cur_.text;
     item.nameLoc = cur_.loc;
     advance();
@@ -417,9 +560,13 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
 
   GlobalVarDecl decl;
   decl.items = std::move(items);
-  if (specOpt->def) {
+  if (specOpt->structDef) {
     pending_.push_back(TopLevelItem{std::move(decl)});
-    return TopLevelItem{std::move(*specOpt->def)};
+    return TopLevelItem{std::move(*specOpt->structDef)};
+  }
+  if (specOpt->enumDef) {
+    pending_.push_back(TopLevelItem{std::move(decl)});
+    return TopLevelItem{std::move(*specOpt->enumDef)};
   }
   return TopLevelItem{std::move(decl)};
 }
@@ -439,11 +586,14 @@ std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
 // -------------------- statements --------------------
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
+  if (cur_.kind == TokenKind::KwTypedef) return parseTypedefStmt();
   if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
       cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
       cur_.kind == TokenKind::KwUnsigned || cur_.kind == TokenKind::KwFloat ||
       cur_.kind == TokenKind::KwDouble ||
-      cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
+      cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct ||
+      cur_.kind == TokenKind::KwEnum ||
+      (cur_.kind == TokenKind::Identifier && typedefs_.count(cur_.text) > 0)) {
     return parseDeclStmt();
   }
   if (cur_.kind == TokenKind::KwReturn) return parseReturnStmt();
@@ -487,7 +637,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
     if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
     DeclItem item;
     item.type = baseType;
-    item.type.ptrDepth = depth;
+    item.type.ptrDepth += depth;
     item.name = cur_.text;
     item.nameLoc = cur_.loc;
     advance();
@@ -514,6 +664,67 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
   advance();
 
   return std::make_unique<DeclStmt>(l, std::move(items));
+}
+
+std::optional<std::vector<DeclItem>> Parser::parseTypedefItems(bool allowStructDef) {
+  if (!expect(TokenKind::KwTypedef, "'typedef'")) return std::nullopt;
+  advance();
+  auto specOpt = parseTypeSpec(allowStructDef);
+  if (!specOpt) {
+    diags_.error(cur_.loc, "expected type");
+    return std::nullopt;
+  }
+  if (specOpt->structDef) {
+    pending_.push_back(TopLevelItem{std::move(*specOpt->structDef)});
+  }
+  if (specOpt->enumDef) {
+    pending_.push_back(TopLevelItem{std::move(*specOpt->enumDef)});
+  }
+
+  std::vector<DeclItem> items;
+  Type baseType = specOpt->type;
+
+  while (true) {
+    int depth = parsePointerDepth();
+    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    DeclItem item;
+    item.type = baseType;
+    item.type.ptrDepth += depth;
+    item.name = cur_.text;
+    item.nameLoc = cur_.loc;
+    advance();
+    if (cur_.kind == TokenKind::LBracket) {
+      auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
+      if (!dims) return std::nullopt;
+      item.type.arrayDims = std::move(*dims);
+    }
+    if (typedefs_.count(item.name)) {
+      diags_.error(item.nameLoc, "redefinition of typedef '" + item.name + "'");
+      return std::nullopt;
+    }
+    typedefs_.emplace(item.name, item.type);
+    items.push_back(std::move(item));
+    if (cur_.kind != TokenKind::Comma) break;
+    advance();
+  }
+  if (!expect(TokenKind::Semicolon, "';'")) return std::nullopt;
+  advance();
+  return items;
+}
+
+std::optional<TopLevelItem> Parser::parseTypedefTopLevel() {
+  auto items = parseTypedefItems(/*allowStructDef=*/true);
+  if (!items) return std::nullopt;
+  TypedefDecl decl;
+  decl.items = std::move(*items);
+  return TopLevelItem{std::move(decl)};
+}
+
+std::optional<std::unique_ptr<Stmt>> Parser::parseTypedefStmt() {
+  SourceLocation l = cur_.loc;
+  auto items = parseTypedefItems(/*allowStructDef=*/false);
+  if (!items) return std::nullopt;
+  return std::make_unique<TypedefStmt>(l, std::move(*items));
 }
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseAssignStmt() {
@@ -873,6 +1084,48 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
 }
 
 std::optional<std::unique_ptr<Expr>> Parser::parseUnary() {
+  auto isTypeStartToken = [&](const Token& t) {
+    if (t.kind == TokenKind::KwChar || t.kind == TokenKind::KwShort ||
+        t.kind == TokenKind::KwInt || t.kind == TokenKind::KwLong ||
+        t.kind == TokenKind::KwUnsigned || t.kind == TokenKind::KwFloat ||
+        t.kind == TokenKind::KwDouble || t.kind == TokenKind::KwVoid ||
+        t.kind == TokenKind::KwStruct || t.kind == TokenKind::KwEnum) {
+      return true;
+    }
+    if (t.kind == TokenKind::Identifier) {
+      return typedefs_.count(t.text) > 0;
+    }
+    return false;
+  };
+
+  if (cur_.kind == TokenKind::KwSizeof) {
+    SourceLocation l = cur_.loc;
+    advance();
+    if (cur_.kind == TokenKind::LParen && isTypeStartToken(peekToken())) {
+      advance();
+      auto typeOpt = parseTypeName(/*allowStructDef=*/false);
+      if (!typeOpt) return std::nullopt;
+      if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+      advance();
+      return std::make_unique<SizeofExpr>(l, std::move(*typeOpt));
+    }
+    auto rhs = parseUnary();
+    if (!rhs) return std::nullopt;
+    return std::make_unique<SizeofExpr>(l, std::move(*rhs));
+  }
+
+  if (cur_.kind == TokenKind::LParen && isTypeStartToken(peekToken())) {
+    SourceLocation l = cur_.loc;
+    advance();
+    auto typeOpt = parseTypeName(/*allowStructDef=*/false);
+    if (!typeOpt) return std::nullopt;
+    if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+    advance();
+    auto rhs = parseUnary();
+    if (!rhs) return std::nullopt;
+    return std::make_unique<CastExpr>(l, std::move(*typeOpt), std::move(*rhs));
+  }
+
   if (cur_.kind == TokenKind::Plus || cur_.kind == TokenKind::Minus ||
       cur_.kind == TokenKind::Bang || cur_.kind == TokenKind::Tilde ||
       cur_.kind == TokenKind::Star || cur_.kind == TokenKind::Amp) {

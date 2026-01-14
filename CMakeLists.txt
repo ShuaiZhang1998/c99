@@ -18,6 +18,7 @@ add_definitions(${LLVM_DEFINITIONS})
 add_executable(c99cc
   tools/c99cc/main.cpp
   src/diag.cpp
+  src/preprocessor.cpp
   src/lexer.cpp
   src/parser.cpp
   src/sema.cpp

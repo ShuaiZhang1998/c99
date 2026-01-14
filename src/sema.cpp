@@ -12,6 +12,8 @@ namespace {
 
 using Scope = std::unordered_map<std::string, Type>;
 using ScopeStack = std::vector<Scope>;
+using EnumConstTable = std::unordered_map<std::string, int64_t>;
+using EnumTypeTable = std::unordered_set<std::string>;
 
 static std::optional<Type> lookupVarType(const ScopeStack& scopes, const std::string& name) {
   for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
@@ -65,7 +67,8 @@ static bool isNullPointerConstant(const Expr& e) {
 // ---- expr/stmt checking ----
 
 static std::optional<Type> checkExprImpl(
-    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e);
+    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs,
+    const EnumConstTable& enums, Expr& e);
 
 static bool isScalarType(const Type& t) {
   return t.isNumeric() || t.isPointer();
@@ -76,6 +79,11 @@ static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr);
 static Type promoteInteger(const Type& t) {
   Type res = t;
   if (!t.isInteger()) return res;
+  if (t.base == Type::Base::Enum) {
+    res.base = Type::Base::Int;
+    res.enumName.clear();
+    return res;
+  }
   if (t.base == Type::Base::Char || t.base == Type::Base::Short) {
     res.base = Type::Base::Int;
   }
@@ -87,6 +95,7 @@ static int integerRank(const Type& t) {
     case Type::Base::Char: return 1;
     case Type::Base::Short: return 2;
     case Type::Base::Int: return 3;
+    case Type::Base::Enum: return 3;
     case Type::Base::Long: return 4;
     case Type::Base::LongLong: return 5;
     default: return 0;
@@ -165,11 +174,16 @@ static bool requiresStructDef(const Type& t) {
   return t.base == Type::Base::Struct && t.ptrDepth == 0;
 }
 
+static bool requiresEnumDef(const Type& t) {
+  return t.base == Type::Base::Enum && !t.enumName.empty();
+}
+
 static bool checkInitializer(
     Diagnostics& diags,
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const EnumConstTable& enums,
     const Type& target,
     Expr& init,
     bool allowArrayInit);
@@ -179,6 +193,7 @@ static bool checkInitList(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const EnumConstTable& enums,
     const Type& target,
     InitListExpr& list,
     bool allowArrayInit) {
@@ -198,7 +213,7 @@ static bool checkInitList(
     }
     Type elemTy = target.elementType();
     for (size_t i = 0; i < list.elems.size(); ++i) {
-      if (!checkInitializer(diags, scopes, fns, structs, elemTy, *list.elems[i], true)) {
+      if (!checkInitializer(diags, scopes, fns, structs, enums, elemTy, *list.elems[i], true)) {
         return false;
       }
     }
@@ -216,7 +231,7 @@ static bool checkInitList(
       return false;
     }
     for (size_t i = 0; i < list.elems.size(); ++i) {
-      if (!checkInitializer(diags, scopes, fns, structs, info->fields[i].type,
+      if (!checkInitializer(diags, scopes, fns, structs, enums, info->fields[i].type,
                             *list.elems[i], true)) {
         return false;
       }
@@ -229,7 +244,7 @@ static bool checkInitList(
     diags.error(list.loc, "invalid initializer");
     return false;
   }
-  return checkInitializer(diags, scopes, fns, structs, target, *list.elems[0], allowArrayInit);
+  return checkInitializer(diags, scopes, fns, structs, enums, target, *list.elems[0], allowArrayInit);
 }
 
 static bool checkInitializer(
@@ -237,11 +252,12 @@ static bool checkInitializer(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const EnumConstTable& enums,
     const Type& target,
     Expr& init,
     bool allowArrayInit) {
   if (auto* list = dynamic_cast<InitListExpr*>(&init)) {
-    return checkInitList(diags, scopes, fns, structs, target, *list, allowArrayInit);
+    return checkInitList(diags, scopes, fns, structs, enums, target, *list, allowArrayInit);
   }
 
   if (target.isArray() && !target.ptrOutsideArrays) {
@@ -253,7 +269,7 @@ static bool checkInitializer(
     return false;
   }
 
-  auto initTy = checkExprImpl(diags, scopes, fns, structs, init);
+  auto initTy = checkExprImpl(diags, scopes, fns, structs, enums, init);
   if (initTy && !isAssignable(target, *initTy, init)) {
     diags.error(init.loc, "incompatible initializer");
     return false;
@@ -302,6 +318,8 @@ static void checkStmtImpl(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const EnumConstTable& enums,
+    const EnumTypeTable& enumTypes,
     const Type& returnType,
     int loopDepth,
     int switchDepth,
@@ -309,40 +327,47 @@ static void checkStmtImpl(
   if (auto* blk = dynamic_cast<BlockStmt*>(&s)) {
     scopes.push_back({});
     for (const auto& st : blk->stmts) {
-      checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *st);
+      checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                    returnType, loopDepth, switchDepth, *st);
     }
     scopes.pop_back();
     return;
   }
 
   if (auto* iff = dynamic_cast<IfStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, *iff->cond);
-    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *iff->thenBranch);
+    checkExprImpl(diags, scopes, fns, structs, enums, *iff->cond);
+    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                  returnType, loopDepth, switchDepth, *iff->thenBranch);
     if (iff->elseBranch) {
-      checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *iff->elseBranch);
+      checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                    returnType, loopDepth, switchDepth, *iff->elseBranch);
     }
     return;
   }
 
   if (auto* wh = dynamic_cast<WhileStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, *wh->cond);
-    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *wh->body);
+    checkExprImpl(diags, scopes, fns, structs, enums, *wh->cond);
+    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                  returnType, loopDepth + 1, switchDepth, *wh->body);
     return;
   }
 
   if (auto* dw = dynamic_cast<DoWhileStmt*>(&s)) {
-    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *dw->body);
-    checkExprImpl(diags, scopes, fns, structs, *dw->cond);
+    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                  returnType, loopDepth + 1, switchDepth, *dw->body);
+    checkExprImpl(diags, scopes, fns, structs, enums, *dw->cond);
     return;
   }
 
   if (auto* fo = dynamic_cast<ForStmt*>(&s)) {
     // for introduces its own scope (matches your existing tests)
     scopes.push_back({});
-    if (fo->init) checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth, *fo->init);
-    if (fo->cond) checkExprImpl(diags, scopes, fns, structs, *fo->cond);
-    if (fo->inc)  checkExprImpl(diags, scopes, fns, structs, *fo->inc);
-    checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth + 1, switchDepth, *fo->body);
+    if (fo->init) checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                                returnType, loopDepth, switchDepth, *fo->init);
+    if (fo->cond) checkExprImpl(diags, scopes, fns, structs, enums, *fo->cond);
+    if (fo->inc)  checkExprImpl(diags, scopes, fns, structs, enums, *fo->inc);
+    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                  returnType, loopDepth + 1, switchDepth, *fo->body);
     scopes.pop_back();
     return;
   }
@@ -358,7 +383,7 @@ static void checkStmtImpl(
   }
 
   if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
-    auto condTy = checkExprImpl(diags, scopes, fns, structs, *sw->cond);
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, enums, *sw->cond);
     if (condTy && !condTy->isInteger()) {
       diags.error(sw->cond->loc, "switch condition must be int");
     }
@@ -383,7 +408,8 @@ static void checkStmtImpl(
         seenDefault = true;
       }
       for (const auto& st : c.stmts) {
-        checkStmtImpl(diags, scopes, fns, structs, returnType, loopDepth, switchDepth + 1, *st);
+        checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+                      returnType, loopDepth, switchDepth + 1, *st);
       }
     }
     scopes.pop_back();
@@ -419,6 +445,12 @@ static void checkStmtImpl(
           return;
         }
       }
+      if (requiresEnumDef(item.type)) {
+        if (!enumTypes.count(item.type.enumName)) {
+          diags.error(item.nameLoc, "unknown enum type '" + item.type.enumName + "'");
+          return;
+        }
+      }
 
       // initializer cannot reference the variable being declared:
       // keep behavior by checking before insertion.
@@ -427,7 +459,8 @@ static void checkStmtImpl(
           diags.error(item.nameLoc, "array initializer not supported");
           return;
         }
-        if (!checkInitializer(diags, scopes, fns, structs, item.type, *item.initExpr, false)) {
+        if (!checkInitializer(diags, scopes, fns, structs, enums,
+                              item.type, *item.initExpr, false)) {
           return;
         }
       }
@@ -439,7 +472,7 @@ static void checkStmtImpl(
 
   if (auto* as = dynamic_cast<AssignStmt*>(&s)) {
     // legacy stmt (if still exists somewhere)
-    checkExprImpl(diags, scopes, fns, structs, *as->valueExpr);
+    checkExprImpl(diags, scopes, fns, structs, enums, *as->valueExpr);
     if (!lookupVarType(scopes, as->name).has_value()) {
       diags.error(as->nameLoc, "assignment to undeclared identifier '" + as->name + "'");
     }
@@ -447,7 +480,7 @@ static void checkStmtImpl(
   }
 
   if (auto* ret = dynamic_cast<ReturnStmt*>(&s)) {
-    auto retTy = checkExprImpl(diags, scopes, fns, structs, *ret->valueExpr);
+    auto retTy = checkExprImpl(diags, scopes, fns, structs, enums, *ret->valueExpr);
     if (retTy && !isAssignable(returnType, *retTy, *ret->valueExpr)) {
       diags.error(ret->loc, "incompatible return type");
     }
@@ -455,7 +488,12 @@ static void checkStmtImpl(
   }
 
   if (auto* es = dynamic_cast<ExprStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, *es->expr);
+    checkExprImpl(diags, scopes, fns, structs, enums, *es->expr);
+    return;
+  }
+
+  if (auto* td = dynamic_cast<TypedefStmt*>(&s)) {
+    (void)td;
     return;
   }
 
@@ -467,6 +505,7 @@ static std::optional<Type> checkLValue(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const EnumConstTable& enums,
     Expr& e,
     const char* errMsg,
     bool isAssign) {
@@ -494,7 +533,7 @@ static std::optional<Type> checkLValue(
 
   if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
     if (un->op == TokenKind::Star) {
-      auto opTy = checkExprImpl(diags, scopes, fns, structs, *un->operand);
+      auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *un->operand);
       if (!opTy) return std::nullopt;
       if (!opTy->isPointer()) {
         diags.error(un->loc, "cannot dereference non-pointer");
@@ -507,8 +546,8 @@ static std::optional<Type> checkLValue(
   }
 
   if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *sub->base);
-    auto idxTy = checkExprImpl(diags, scopes, fns, structs, *sub->index);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->index);
     if (!baseTy || !idxTy) return std::nullopt;
     if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
       Type dt = baseTy->decayType();
@@ -532,7 +571,7 @@ static std::optional<Type> checkLValue(
   }
 
   if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *mem->base);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *mem->base);
     if (!baseTy) return std::nullopt;
     auto fieldTy = resolveMemberType(
         diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
@@ -562,7 +601,8 @@ static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr) 
 }
 
 static std::optional<Type> checkExprImpl(
-    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs, Expr& e) {
+    Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs,
+    const EnumConstTable& enums, Expr& e) {
   if (auto* lit = dynamic_cast<IntLiteralExpr*>(&e)) {
     Type t;
     e.semaType = t;
@@ -580,9 +620,67 @@ static std::optional<Type> checkExprImpl(
     return std::nullopt;
   }
 
+  if (auto* sz = dynamic_cast<SizeofExpr*>(&e)) {
+    if (sz->isType) {
+      if (sz->type.isVoidObject()) {
+        diags.error(sz->loc, "sizeof of void");
+        return std::nullopt;
+      }
+    } else {
+      auto ty = checkExprImpl(diags, scopes, fns, structs, enums, *sz->expr);
+      if (!ty) return std::nullopt;
+      if (ty->isVoidObject()) {
+        diags.error(sz->loc, "sizeof of void");
+        return std::nullopt;
+      }
+    }
+    Type t;
+    e.semaType = t;
+    return t;
+  }
+
+  if (auto* cast = dynamic_cast<CastExpr*>(&e)) {
+    auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *cast->expr);
+    if (!opTy) return std::nullopt;
+    if (cast->targetType.isArray()) {
+      diags.error(cast->loc, "invalid cast target");
+      return std::nullopt;
+    }
+    if (cast->targetType.isStruct()) {
+      diags.error(cast->loc, "invalid cast target");
+      return std::nullopt;
+    }
+    if (opTy->isVoidObject()) {
+      diags.error(cast->loc, "invalid cast from void");
+      return std::nullopt;
+    }
+    bool ok = false;
+    if (cast->targetType.isVoidObject()) {
+      ok = true;
+    } else if (cast->targetType.isPointer()) {
+      ok = opTy->isPointer() || opTy->isInteger();
+    } else if (cast->targetType.isInteger()) {
+      ok = opTy->isNumeric() || opTy->isPointer();
+    } else if (cast->targetType.isFloating()) {
+      ok = opTy->isNumeric();
+    }
+    if (!ok) {
+      diags.error(cast->loc, "invalid cast");
+      return std::nullopt;
+    }
+    e.semaType = cast->targetType;
+    return cast->targetType;
+  }
+
   if (auto* vr = dynamic_cast<VarRefExpr*>(&e)) {
     auto ty = lookupVarType(scopes, vr->name);
     if (!ty) {
+      auto it = enums.find(vr->name);
+      if (it != enums.end()) {
+        Type t;
+        e.semaType = t;
+        return t;
+      }
       diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
       return std::nullopt;
     }
@@ -599,7 +697,7 @@ static std::optional<Type> checkExprImpl(
     auto it = fns.find(call->callee);
     if (it == fns.end()) {
       diags.error(call->calleeLoc, "call to undeclared function '" + call->callee + "'");
-      for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, *a);
+      for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, enums, *a);
       return std::nullopt;
     }
 
@@ -613,7 +711,7 @@ static std::optional<Type> checkExprImpl(
     }
 
     for (size_t i = 0; i < call->args.size(); ++i) {
-      auto argTy = checkExprImpl(diags, scopes, fns, structs, *call->args[i]);
+      auto argTy = checkExprImpl(diags, scopes, fns, structs, enums, *call->args[i]);
       if (!argTy || i >= info.paramTypes.size()) continue;
       if (!isAssignable(info.paramTypes[i], *argTy, *call->args[i])) {
         diags.error(call->args[i]->loc, "incompatible argument type");
@@ -625,10 +723,10 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* asn = dynamic_cast<AssignExpr*>(&e)) {
-    auto lhsTy = checkLValue(diags, scopes, fns, structs, *asn->lhs,
+    auto lhsTy = checkLValue(diags, scopes, fns, structs, enums, *asn->lhs,
                              "expected lvalue on left-hand side of assignment",
                              /*isAssign=*/true);
-    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, *asn->rhs);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *asn->rhs);
     if (lhsTy && rhsTy && !isAssignable(*lhsTy, *rhsTy, *asn->rhs)) {
       diags.error(asn->loc, "incompatible assignment");
     }
@@ -637,9 +735,9 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* ter = dynamic_cast<TernaryExpr*>(&e)) {
-    auto condTy = checkExprImpl(diags, scopes, fns, structs, *ter->cond);
-    auto thenTy = checkExprImpl(diags, scopes, fns, structs, *ter->thenExpr);
-    auto elseTy = checkExprImpl(diags, scopes, fns, structs, *ter->elseExpr);
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->cond);
+    auto thenTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->thenExpr);
+    auto elseTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->elseExpr);
     if (condTy && !isScalarType(*condTy)) {
       diags.error(ter->cond->loc, "condition must be scalar");
     }
@@ -667,7 +765,7 @@ static std::optional<Type> checkExprImpl(
 
   if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
     if (un->op == TokenKind::Amp) {
-      auto lvTy = checkLValue(diags, scopes, fns, structs, *un->operand,
+      auto lvTy = checkLValue(diags, scopes, fns, structs, enums, *un->operand,
                               "expected lvalue for address-of operator",
                               /*isAssign=*/false);
       if (!lvTy) return std::nullopt;
@@ -678,7 +776,7 @@ static std::optional<Type> checkExprImpl(
       return t;
     }
 
-    auto opTy = checkExprImpl(diags, scopes, fns, structs, *un->operand);
+    auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *un->operand);
     if (!opTy) return std::nullopt;
 
     if (un->op == TokenKind::Star) {
@@ -721,8 +819,8 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* bin = dynamic_cast<BinaryExpr*>(&e)) {
-    auto lhsTy = checkExprImpl(diags, scopes, fns, structs, *bin->lhs);
-    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, *bin->rhs);
+    auto lhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *bin->lhs);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *bin->rhs);
     if (!lhsTy || !rhsTy) return std::nullopt;
 
     switch (bin->op) {
@@ -828,8 +926,8 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *sub->base);
-    auto idxTy = checkExprImpl(diags, scopes, fns, structs, *sub->index);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->index);
     if (!baseTy || !idxTy) return std::nullopt;
     if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
       Type dt = baseTy->decayType();
@@ -853,7 +951,7 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, *mem->base);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *mem->base);
     if (!baseTy) return std::nullopt;
     auto fieldTy = resolveMemberType(
         diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
@@ -914,7 +1012,24 @@ static void addOrCheckFn(
 bool Sema::run(AstTranslationUnit& tu) {
   // 0) collect struct definitions
   StructTable structs;
+  EnumConstTable enumConsts;
+  std::unordered_set<std::string> enumNames;
   for (const auto& item : tu.items) {
+    auto* ed = std::get_if<EnumDef>(&item);
+    if (ed) {
+      if (ed->name.has_value()) {
+        if (!enumNames.insert(*ed->name).second) {
+          diags_.error(ed->nameLoc, "redefinition of 'enum " + *ed->name + "'");
+          return false;
+        }
+      }
+      for (const auto& it : ed->items) {
+        if (!enumConsts.emplace(it.name, it.value).second) {
+          diags_.error(it.nameLoc, "redefinition of enum constant '" + it.name + "'");
+          return false;
+        }
+      }
+    }
     auto* sd = std::get_if<StructDef>(&item);
     if (!sd) continue;
     if (structs.count(sd->name)) {
@@ -962,6 +1077,12 @@ bool Sema::run(AstTranslationUnit& tu) {
           return false;
         }
       }
+      if (requiresEnumDef(field.type)) {
+        if (!enumNames.count(field.type.enumName)) {
+          diags_.error(field.nameLoc, "unknown enum type '" + field.type.enumName + "'");
+          return false;
+        }
+      }
     }
   }
 
@@ -988,6 +1109,12 @@ bool Sema::run(AstTranslationUnit& tu) {
       diags_.error(p->nameLoc, "invalid return type");
       return false;
     }
+    if (requiresEnumDef(p->returnType)) {
+      if (!enumNames.count(p->returnType.enumName)) {
+        diags_.error(p->nameLoc, "unknown enum type '" + p->returnType.enumName + "'");
+        return false;
+      }
+    }
     for (const auto& prm : p->params) {
       if (prm.type.isVoidObject()) {
         diags_.error(prm.loc, "invalid parameter type");
@@ -1004,6 +1131,12 @@ bool Sema::run(AstTranslationUnit& tu) {
       if (hasInvalidArraySize(prm.type, /*allowFirstEmpty=*/true)) {
         diags_.error(prm.loc, "invalid array size");
         return false;
+      }
+      if (requiresEnumDef(prm.type)) {
+        if (!enumNames.count(prm.type.enumName)) {
+          diags_.error(prm.loc, "unknown enum type '" + prm.type.enumName + "'");
+          return false;
+        }
       }
     }
   }
@@ -1046,13 +1179,20 @@ bool Sema::run(AstTranslationUnit& tu) {
             return false;
           }
         }
+        if (requiresEnumDef(decl.type)) {
+          if (!enumNames.count(decl.type.enumName)) {
+            diags_.error(decl.nameLoc, "unknown enum type '" + decl.type.enumName + "'");
+            return false;
+          }
+        }
 
         if (decl.initExpr) {
           if (decl.type.isArray()) {
             diags_.error(decl.nameLoc, "array initializer not supported");
             return false;
           }
-          if (!checkInitializer(diags_, scopes, fns, structs, decl.type, *decl.initExpr, false)) {
+          if (!checkInitializer(diags_, scopes, fns, structs, enumConsts,
+                                decl.type, *decl.initExpr, false)) {
             return false;
           }
         }
@@ -1085,7 +1225,8 @@ bool Sema::run(AstTranslationUnit& tu) {
     }
 
     for (const auto& st : def->body) {
-      checkStmtImpl(diags_, scopes, fns, structs, def->proto.returnType,
+      checkStmtImpl(diags_, scopes, fns, structs, enumConsts, enumNames,
+                    def->proto.returnType,
                     /*loopDepth=*/0, /*switchDepth=*/0, *st);
     }
   }

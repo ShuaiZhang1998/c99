@@ -1,0 +1,5 @@
+// EXPECT: 3
+#define ADD(a, b) ((a) + (b))
+int main() {
+  return ADD(1, 2);
+}

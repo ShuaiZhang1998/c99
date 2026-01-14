@@ -3,6 +3,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -21,10 +22,11 @@ struct Node {
 };
 
 struct Type {
-  enum class Base { Char, Short, Int, Long, LongLong, Float, Double, Void, Struct };
+  enum class Base { Char, Short, Int, Long, LongLong, Float, Double, Void, Struct, Enum };
   Base base = Base::Int;
   bool isUnsigned = false;
   std::string structName;
+  std::string enumName;
   int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
   std::vector<std::optional<size_t>> arrayDims;
   bool ptrOutsideArrays = false;
@@ -41,31 +43,35 @@ struct Type {
   bool isInteger() const {
     if (ptrDepth != 0 || !arrayDims.empty()) return false;
     return base == Base::Char || base == Base::Short || base == Base::Int || base == Base::Long ||
-           base == Base::LongLong;
+           base == Base::LongLong || base == Base::Enum;
   }
   bool isNumeric() const { return isInteger() || isFloating(); }
   bool isVoid() const { return base == Base::Void && ptrDepth == 0 && arrayDims.empty(); }
   bool isStruct() const { return base == Base::Struct; }
+  bool isEnum() const { return base == Base::Enum; }
   bool isPointer() const { return ptrDepth > 0; }
   bool isArray() const { return !arrayDims.empty(); }
   Type pointee() const {
     Type t{base, ptrDepth - 1, arrayDims};
     t.isUnsigned = isUnsigned;
     t.structName = structName;
+    t.enumName = enumName;
     t.ptrOutsideArrays = false;
     return t;
   }
   Type elementType() const {
     if (arrayDims.empty()) {
-      Type t{base, ptrDepth};
-      t.isUnsigned = isUnsigned;
-      t.structName = structName;
-      return t;
-    }
+    Type t{base, ptrDepth};
+    t.isUnsigned = isUnsigned;
+    t.structName = structName;
+    t.enumName = enumName;
+    return t;
+  }
     std::vector<std::optional<size_t>> rest(arrayDims.begin() + 1, arrayDims.end());
     Type t{base, ptrDepth, std::move(rest)};
     t.isUnsigned = isUnsigned;
     t.structName = structName;
+    t.enumName = enumName;
     return t;
   }
   Type decayType() const {
@@ -78,8 +84,9 @@ struct Type {
   bool isVoidObject() const { return base == Base::Void && ptrDepth == 0; }
   bool operator==(const Type& other) const {
     return base == other.base && isUnsigned == other.isUnsigned &&
-           structName == other.structName && ptrDepth == other.ptrDepth &&
-           arrayDims == other.arrayDims && ptrOutsideArrays == other.ptrOutsideArrays;
+           structName == other.structName && enumName == other.enumName &&
+           ptrDepth == other.ptrDepth && arrayDims == other.arrayDims &&
+           ptrOutsideArrays == other.ptrOutsideArrays;
   }
   bool operator!=(const Type& other) const { return !(*this == other); }
 };
@@ -109,6 +116,22 @@ struct FloatLiteralExpr final : Expr {
 struct VarRefExpr final : Expr {
   std::string name;
   VarRefExpr(SourceLocation l, std::string n) : Expr(l), name(std::move(n)) {}
+};
+
+struct CastExpr final : Expr {
+  Type targetType;
+  std::unique_ptr<Expr> expr;
+  CastExpr(SourceLocation l, Type t, std::unique_ptr<Expr> e)
+      : Expr(l), targetType(std::move(t)), expr(std::move(e)) {}
+};
+
+struct SizeofExpr final : Expr {
+  bool isType = false;
+  Type type;
+  std::unique_ptr<Expr> expr;
+  SizeofExpr(SourceLocation l, Type t) : Expr(l), isType(true), type(std::move(t)) {}
+  SizeofExpr(SourceLocation l, std::unique_ptr<Expr> e)
+      : Expr(l), isType(false), expr(std::move(e)) {}
 };
 
 struct CallExpr final : Expr {
@@ -190,6 +213,12 @@ struct StructField {
 struct DeclStmt final : Stmt {
   std::vector<DeclItem> items;
   DeclStmt(SourceLocation l, std::vector<DeclItem> d)
+      : Stmt(l), items(std::move(d)) {}
+};
+
+struct TypedefStmt final : Stmt {
+  std::vector<DeclItem> items;
+  TypedefStmt(SourceLocation l, std::vector<DeclItem> d)
       : Stmt(l), items(std::move(d)) {}
 };
 
@@ -311,7 +340,24 @@ struct StructDef {
   std::vector<StructField> fields;
 };
 
-using TopLevelItem = std::variant<StructDef, FunctionDecl, FunctionDef, GlobalVarDecl>;
+struct EnumItem {
+  std::string name;
+  SourceLocation nameLoc;
+  int64_t value = 0;
+};
+
+struct EnumDef {
+  std::optional<std::string> name;
+  SourceLocation nameLoc;
+  std::vector<EnumItem> items;
+};
+
+struct TypedefDecl {
+  std::vector<DeclItem> items;
+};
+
+using TopLevelItem = std::variant<StructDef, EnumDef, TypedefDecl,
+                                  FunctionDecl, FunctionDef, GlobalVarDecl>;
 
 struct AstTranslationUnit {
   std::vector<TopLevelItem> items;
@@ -328,17 +374,25 @@ private:
   Lexer& lex_;
   Diagnostics& diags_;
   Token cur_;
+  Token peek_{};
+  bool hasPeek_ = false;
   std::vector<TopLevelItem> pending_;
+  std::unordered_map<std::string, Type> typedefs_;
+  std::unordered_map<std::string, int64_t> enumConstants_;
 
-  void advance() { cur_ = lex_.next(); }
+  void advance();
   bool expect(TokenKind k, const char* what);
+  const Token& peekToken();
   int parsePointerDepth();
   struct ParsedTypeSpec {
     Type type;
-    std::optional<StructDef> def;
+    std::optional<StructDef> structDef;
+    std::optional<EnumDef> enumDef;
   };
   std::optional<ParsedTypeSpec> parseTypeSpec(bool allowStructDef);
+  std::optional<Type> parseTypeName(bool allowStructDef);
   std::optional<std::vector<StructField>> parseStructFields();
+  std::optional<std::vector<EnumItem>> parseEnumItems();
   std::optional<std::vector<std::optional<size_t>>> parseArrayDims(bool allowFirstEmpty);
   std::optional<std::unique_ptr<Expr>> parseInitializer();
 
@@ -350,6 +404,7 @@ private:
 
   std::optional<std::unique_ptr<Stmt>> parseStmt();
   std::optional<std::unique_ptr<Stmt>> parseDeclStmt();
+  std::optional<std::unique_ptr<Stmt>> parseTypedefStmt();
   std::optional<std::unique_ptr<Stmt>> parseAssignStmt(); // legacy, may be unused
   std::optional<std::unique_ptr<Stmt>> parseReturnStmt();
   std::optional<std::unique_ptr<Stmt>> parseBreakStmt();
@@ -373,6 +428,9 @@ private:
 
   int precedence(TokenKind k) const;
   bool isBinaryOp(TokenKind k) const;
+
+  std::optional<std::vector<DeclItem>> parseTypedefItems(bool allowStructDef);
+  std::optional<TopLevelItem> parseTypedefTopLevel();
 };
 
 } // namespace c99cc

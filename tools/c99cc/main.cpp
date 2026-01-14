@@ -18,6 +18,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 
 #include "../../src/diag.h"
+#include "../../src/preprocessor.h"
 #include "../../src/lexer.h"
 #include "../../src/parser.h"
 #include "../../src/sema.h"
@@ -88,23 +89,45 @@ static bool tuHasMain(const c99cc::AstTranslationUnit& tu) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr << "usage: c99cc <input.c> [-o <output>]\n";
+    std::cerr << "usage: c99cc <input.c> [-o <output>] [-I <path>] [-isystem <path>]\n";
     return 1;
   }
 
   std::string inputPath = argv[1];
   std::string outPath = "a.out";
+  std::vector<std::string> includePaths;
+  std::vector<std::string> systemIncludePaths;
 
   for (int i = 2; i < argc; i++) {
     std::string a = argv[i];
-    if (a == "-o" && i + 1 < argc) outPath = argv[++i];
-    else {
+    if (a == "-o" && i + 1 < argc) {
+      outPath = argv[++i];
+    } else if (a == "-I" && i + 1 < argc) {
+      includePaths.push_back(argv[++i]);
+    } else if (a == "-I") {
+      std::cerr << "missing path after -I\n";
+      return 1;
+    } else if (a.rfind("-I", 0) == 0 && a.size() > 2) {
+      includePaths.push_back(a.substr(2));
+    } else if (a == "-isystem" && i + 1 < argc) {
+      systemIncludePaths.push_back(argv[++i]);
+    } else if (a == "-isystem") {
+      std::cerr << "missing path after -isystem\n";
+      return 1;
+    } else {
       std::cerr << "unknown arg: " << a << "\n";
       return 1;
     }
   }
 
   std::string source = readFileOrDie(inputPath);
+
+  c99cc::Preprocessor pp(std::move(includePaths), std::move(systemIncludePaths));
+  auto preprocessed = pp.run(inputPath, source);
+  if (!preprocessed) {
+    return 1;
+  }
+  source = *preprocessed;
 
   c99cc::Diagnostics diags;
   c99cc::Lexer lex(source, diags);

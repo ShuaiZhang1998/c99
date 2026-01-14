@@ -28,7 +28,9 @@ run_ok() {
   local exe="${TMP_DIR}/${base}.out"
   local outlog="${TMP_DIR}/${base}.out.log"
   local errlog="${TMP_DIR}/${base}.err.log"
-
+  local args_line
+  args_line="$(grep -Eo '^[[:space:]]*//[[:space:]]*ARGS:[[:space:]].+' "${src}" \
+    | head -n1 | sed -E 's/.*ARGS:[[:space:]]*//' || true)"
   local expect
   expect="$(grep -Eo '^[[:space:]]*//[[:space:]]*EXPECT:[[:space:]]*-?[0-9]+' "${src}" | head -n1 | sed -E 's/.*EXPECT:[[:space:]]*//')"
   if [[ -z "${expect}" ]]; then
@@ -39,7 +41,12 @@ run_ok() {
   fi
 
   set +e
-  "${CC}" "${src}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  if [[ -n "${args_line}" ]]; then
+    read -r -a extra_args <<< "${args_line}"
+    "${CC}" "${src}" "${extra_args[@]}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  else
+    "${CC}" "${src}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  fi
   local rc=$?
   set -e
   if [[ ${rc} -ne 0 ]]; then
@@ -74,7 +81,9 @@ run_err() {
   local exe="${TMP_DIR}/${base}.out"
   local outlog="${TMP_DIR}/${base}.out.log"
   local errlog="${TMP_DIR}/${base}.err.log"
-
+  local args_line
+  args_line="$(grep -Eo '^[[:space:]]*//[[:space:]]*ARGS:[[:space:]].+' "${src}" \
+    | head -n1 | sed -E 's/.*ARGS:[[:space:]]*//' || true)"
   local needle
   needle="$(grep -Eo '^[[:space:]]*//[[:space:]]*ERROR:[[:space:]].+' "${src}" | head -n1 | sed -E 's/.*ERROR:[[:space:]]*//')"
   if [[ -z "${needle}" ]]; then
@@ -85,7 +94,12 @@ run_err() {
   fi
 
   set +e
-  "${CC}" "${src}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  if [[ -n "${args_line}" ]]; then
+    read -r -a extra_args <<< "${args_line}"
+    "${CC}" "${src}" "${extra_args[@]}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  else
+    "${CC}" "${src}" -o "${exe}" >"${outlog}" 2>"${errlog}"
+  fi
   local rc=$?
   set -e
 

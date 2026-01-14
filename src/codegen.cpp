@@ -36,6 +36,7 @@ struct CGEnv {
   // struct table: name -> llvm::StructType*
   std::unordered_map<std::string, llvm::StructType*> structs;
   std::unordered_map<std::string, std::vector<StructField>> structFields;
+  std::unordered_map<std::string, int64_t> enumConstants;
 
   struct GlobalBinding {
     llvm::GlobalVariable* gv = nullptr;
@@ -105,6 +106,8 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
     auto it = env.structs.find(t.structName);
     assert(it != env.structs.end());
     baseTy = it->second;
+  } else if (t.base == Type::Base::Enum) {
+    baseTy = env.i32Ty();
   } else if (t.base == Type::Base::Char) {
     baseTy = llvm::Type::getInt8Ty(env.ctx);
   } else if (t.base == Type::Base::Short) {
@@ -205,10 +208,35 @@ static uint64_t integerSizeBytes(const Type& t) {
     case Type::Base::Long:  return 8;
     case Type::Base::LongLong: return 8;
     case Type::Base::Int:   return 4;
+    case Type::Base::Enum:  return 4;
     case Type::Base::Float: return 4;
     case Type::Base::Double:return 8;
     default: return sizeof(void*);
   }
+}
+
+static uint64_t sizeOfType(const Type& t, const CGEnv& env) {
+  if (t.isPointer() || (t.ptrOutsideArrays && t.ptrDepth > 0)) return sizeof(void*);
+  if (t.isArray() && !t.ptrOutsideArrays) {
+    uint64_t elemSize = sizeOfType(t.elementType(), env);
+    uint64_t total = elemSize;
+    for (const auto& dim : t.arrayDims) {
+      if (!dim.has_value()) return sizeof(void*);
+      total *= *dim;
+    }
+    return total;
+  }
+  if (t.base == Type::Base::Struct && t.ptrDepth == 0) {
+    auto it = env.structFields.find(t.structName);
+    if (it == env.structFields.end()) return sizeof(void*);
+    uint64_t total = 0;
+    for (const auto& field : it->second) {
+      total += sizeOfType(field.type, env);
+    }
+    return total;
+  }
+  if (t.isNumeric()) return integerSizeBytes(t);
+  return sizeof(void*);
 }
 
 static int integerRank(const Type& t) {
@@ -216,6 +244,7 @@ static int integerRank(const Type& t) {
     case Type::Base::Char: return 1;
     case Type::Base::Short: return 2;
     case Type::Base::Int: return 3;
+    case Type::Base::Enum: return 3;
     case Type::Base::Long: return 4;
     case Type::Base::LongLong: return 5;
     default: return 0;
@@ -866,6 +895,37 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     return llvm::ConstantFP::get(ty, flt->value);
   }
 
+  if (auto* sz = dynamic_cast<const SizeofExpr*>(&e)) {
+    Type t = sz->isType ? sz->type : exprType(*sz->expr);
+    uint64_t size = sizeOfType(t, env);
+    return i32Const(env, static_cast<int64_t>(size));
+  }
+
+  if (auto* cast = dynamic_cast<const CastExpr*>(&e)) {
+    llvm::Value* v = emitExpr(env, *cast->expr);
+    const Type& srcTy = exprType(*cast->expr);
+    const Type& dstTy = cast->targetType;
+    if (dstTy.isPointer()) {
+      llvm::Type* llvmDst = llvmType(env, dstTy);
+      if (srcTy.isPointer()) return castPointerIfNeeded(env, v, llvmDst);
+      if (srcTy.isInteger()) return env.b.CreateIntToPtr(v, llvmDst, "int.to.ptr");
+      return v;
+    }
+    if (dstTy.isInteger()) {
+      if (srcTy.isPointer()) {
+        llvm::Value* asInt = env.b.CreatePtrToInt(v, env.b.getInt64Ty(), "ptr.to.int");
+        return castIntegerToType(env, asInt, Type{Type::Base::LongLong, 0}, dstTy);
+      }
+      if (srcTy.isNumeric()) return castNumericToType(env, v, srcTy, dstTy);
+      return v;
+    }
+    if (dstTy.isFloating()) {
+      if (srcTy.isNumeric()) return castNumericToType(env, v, srcTy, dstTy);
+      return v;
+    }
+    return v;
+  }
+
   if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
     if (auto* local = env.lookupLocal(vr->name)) {
       if (local->type.isArray() && !local->type.ptrOutsideArrays) {
@@ -878,6 +938,10 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
         return decayArrayToPointer(env, global->gv, global->type);
       }
       return env.b.CreateLoad(llvmType(env, global->type), global->gv, vr->name + ".gval");
+    }
+    auto it = env.enumConstants.find(vr->name);
+    if (it != env.enumConstants.end()) {
+      return i32Const(env, it->second);
     }
     return i32Const(env, 0);
   }
@@ -1285,6 +1349,8 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     return false;
   }
 
+  if (dynamic_cast<const TypedefStmt*>(&s)) return false;
+
   if (dynamic_cast<const EmptyStmt*>(&s)) return false;
 
   return false;
@@ -1303,6 +1369,14 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   CGEnv env{ctx, *mod, builder};
 
   std::vector<std::pair<llvm::GlobalVariable*, const Expr*>> globalInits;
+
+  for (const auto& item : tu.items) {
+    auto* ed = std::get_if<EnumDef>(&item);
+    if (!ed) continue;
+    for (const auto& it : ed->items) {
+      env.enumConstants.emplace(it.name, it.value);
+    }
+  }
 
   // 0) Predeclare struct types
   for (const auto& item : tu.items) {
