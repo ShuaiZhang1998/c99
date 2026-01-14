@@ -20,6 +20,8 @@
 - `char`
 - `short`
 - `long`
+- `long long`
+- `unsigned`（`unsigned char/short/int/long/long long`）
 - `float`
 - `double`
 - 指针（多级）：`int*`, `int**`, `void*`
@@ -68,6 +70,8 @@ struct Outer o = {{1}, {2, 3}};
 x          // 变量引用
 (expr)     // 括号分组
 ```
+
+> 字面量当前仅支持十进制；整数无 U/L/LL 等后缀，浮点仅支持十进制与科学计数法及 `f/F` 后缀。
 
 #### **一元运算**
 
@@ -278,7 +282,8 @@ echo $?
 
 ## **已知限制（尚未实现）**
 
-- 支持 `char/short/int/long/float/double` 与指针/数组/struct 子集
+- 数值字面量不支持十六进制/八进制、整数 U/L/LL 后缀、十六进制浮点
+- 整数提升与常规算术转换规则仍是简化版（与完整 C99 存在差异）
 - 无显式类型转换、`sizeof`、`typedef`、`enum`、`union`、位域
 - 仅支持 `==`/`!=` 的结构体比较（无排序比较）
 - 无数组对象的独立初始化列表（但结构体内数组字段可初始化）

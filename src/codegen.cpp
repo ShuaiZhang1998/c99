@@ -31,6 +31,7 @@ struct CGEnv {
 
   // function table: name -> llvm::Function*
   std::unordered_map<std::string, llvm::Function*> functions;
+  std::unordered_map<std::string, std::vector<Type>> functionParamTypes;
 
   // struct table: name -> llvm::StructType*
   std::unordered_map<std::string, llvm::StructType*> structs;
@@ -110,6 +111,8 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
     baseTy = llvm::Type::getInt16Ty(env.ctx);
   } else if (t.base == Type::Base::Long) {
     baseTy = llvm::Type::getInt64Ty(env.ctx);
+  } else if (t.base == Type::Base::LongLong) {
+    baseTy = llvm::Type::getInt64Ty(env.ctx);
   } else if (t.base == Type::Base::Float) {
     baseTy = llvm::Type::getFloatTy(env.ctx);
   } else if (t.base == Type::Base::Double) {
@@ -147,9 +150,11 @@ static llvm::Value* i32Const(CGEnv& env, int64_t v) {
   return llvm::ConstantInt::get(env.i32Ty(), (uint64_t)v, true);
 }
 
-static llvm::Value* castInteger(CGEnv& env, llvm::Value* v, llvm::Type* dstTy) {
+static llvm::Value* castIntegerToType(CGEnv& env, llvm::Value* v, const Type& src, const Type& dst) {
+  llvm::Type* dstTy = llvmType(env, dst);
   if (v->getType() == dstTy) return v;
   if (v->getType()->isIntegerTy() && dstTy->isIntegerTy()) {
+    if (src.isUnsigned) return env.b.CreateZExtOrTrunc(v, dstTy, "int.cast");
     return env.b.CreateSExtOrTrunc(v, dstTy, "int.cast");
   }
   return v;
@@ -160,12 +165,18 @@ static llvm::Value* castNumericToType(
   if (src == dst) return v;
   llvm::Type* dstTy = llvmType(env, dst);
   if (dst.isInteger()) {
-    if (src.isInteger()) return castInteger(env, v, dstTy);
-    if (src.isFloating()) return env.b.CreateFPToSI(v, dstTy, "fp.to.si");
+    if (src.isInteger()) return castIntegerToType(env, v, src, dst);
+    if (src.isFloating()) {
+      if (dst.isUnsigned) return env.b.CreateFPToUI(v, dstTy, "fp.to.ui");
+      return env.b.CreateFPToSI(v, dstTy, "fp.to.si");
+    }
     return v;
   }
   if (dst.isFloating()) {
-    if (src.isInteger()) return env.b.CreateSIToFP(v, dstTy, "si.to.fp");
+    if (src.isInteger()) {
+      if (src.isUnsigned) return env.b.CreateUIToFP(v, dstTy, "ui.to.fp");
+      return env.b.CreateSIToFP(v, dstTy, "si.to.fp");
+    }
     if (src.isFloating()) {
       if (v->getType() == dstTy) return v;
       unsigned srcBits = v->getType()->getPrimitiveSizeInBits();
@@ -178,9 +189,10 @@ static llvm::Value* castNumericToType(
   return v;
 }
 
-static llvm::Value* castIndex(CGEnv& env, llvm::Value* v) {
+static llvm::Value* castIndex(CGEnv& env, llvm::Value* v, const Type& idxTy) {
   if (v->getType()->isIntegerTy(64)) return v;
   if (v->getType()->isIntegerTy()) {
+    if (idxTy.isUnsigned) return env.b.CreateZExtOrTrunc(v, env.b.getInt64Ty(), "idx.cast");
     return env.b.CreateSExtOrTrunc(v, env.b.getInt64Ty(), "idx.cast");
   }
   return v;
@@ -191,6 +203,7 @@ static uint64_t integerSizeBytes(const Type& t) {
     case Type::Base::Char:  return 1;
     case Type::Base::Short: return 2;
     case Type::Base::Long:  return 8;
+    case Type::Base::LongLong: return 8;
     case Type::Base::Int:   return 4;
     case Type::Base::Float: return 4;
     case Type::Base::Double:return 8;
@@ -198,11 +211,35 @@ static uint64_t integerSizeBytes(const Type& t) {
   }
 }
 
-static Type commonIntegerType(const Type& lhs, const Type& rhs) {
-  if (lhs.base == Type::Base::Long || rhs.base == Type::Base::Long) {
-    return Type{Type::Base::Long, 0};
+static int integerRank(const Type& t) {
+  switch (t.base) {
+    case Type::Base::Char: return 1;
+    case Type::Base::Short: return 2;
+    case Type::Base::Int: return 3;
+    case Type::Base::Long: return 4;
+    case Type::Base::LongLong: return 5;
+    default: return 0;
   }
-  return Type{};
+}
+
+static Type typeFromRank(int rank) {
+  Type t;
+  switch (rank) {
+    case 1: t.base = Type::Base::Char; break;
+    case 2: t.base = Type::Base::Short; break;
+    case 4: t.base = Type::Base::Long; break;
+    case 5: t.base = Type::Base::LongLong; break;
+    case 3:
+    default: t.base = Type::Base::Int; break;
+  }
+  return t;
+}
+
+static Type commonIntegerType(const Type& lhs, const Type& rhs) {
+  int rank = std::max(integerRank(lhs), integerRank(rhs));
+  Type t = typeFromRank(rank);
+  t.isUnsigned = lhs.isUnsigned || rhs.isUnsigned;
+  return t;
 }
 
 static Type commonNumericType(const Type& lhs, const Type& rhs) {
@@ -449,7 +486,7 @@ static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
     case TokenKind::Tilde: {
       llvm::Value* v = emitExpr(env, *u.operand);
       const Type& resTy = exprType(u);
-      if (resTy.isInteger()) v = castInteger(env, v, llvmType(env, resTy));
+      if (resTy.isInteger()) v = castIntegerToType(env, v, exprType(*u.operand), resTy);
       return env.b.CreateNot(v, "bitnot");
     }
     case TokenKind::Bang: {
@@ -526,12 +563,12 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
     case TokenKind::Plus: {
       if (lhsTy.isPointer() && rhsTy.isInteger()) {
         llvm::Type* elemTy = L->getType()->getPointerElementType();
-        llvm::Value* idx = castIndex(env, R);
+        llvm::Value* idx = castIndex(env, R, rhsTy);
         return env.b.CreateGEP(elemTy, L, idx, "ptr.add");
       }
       if (lhsTy.isInteger() && rhsTy.isPointer()) {
         llvm::Type* elemTy = R->getType()->getPointerElementType();
-        llvm::Value* idx = castIndex(env, L);
+        llvm::Value* idx = castIndex(env, L, lhsTy);
         return env.b.CreateGEP(elemTy, R, idx, "ptr.add");
       }
       if (lhsTy.isFloating() || rhsTy.isFloating()) {
@@ -542,16 +579,15 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
-        llvm::Type* resLlvmTy = llvmType(env, resTy);
-        L = castInteger(env, L, resLlvmTy);
-        R = castInteger(env, R, resLlvmTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
       }
       return env.b.CreateAdd(L, R, "add");
     }
     case TokenKind::Minus: {
       if (lhsTy.isPointer() && rhsTy.isInteger()) {
         llvm::Type* elemTy = L->getType()->getPointerElementType();
-        llvm::Value* idx = castIndex(env, R);
+        llvm::Value* idx = castIndex(env, R, rhsTy);
         llvm::Value* zero = llvm::ConstantInt::get(idx->getType(), 0, true);
         llvm::Value* neg = env.b.CreateSub(zero, idx, "neg");
         return env.b.CreateGEP(elemTy, L, neg, "ptr.sub");
@@ -576,9 +612,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
-        llvm::Type* resLlvmTy = llvmType(env, resTy);
-        L = castInteger(env, L, resLlvmTy);
-        R = castInteger(env, R, resLlvmTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
       }
       return env.b.CreateSub(L, R, "sub");
     }
@@ -591,9 +626,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
-        llvm::Type* resLlvmTy = llvmType(env, resTy);
-        L = castInteger(env, L, resLlvmTy);
-        R = castInteger(env, R, resLlvmTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
       }
       return env.b.CreateMul(L, R, "mul");
     }
@@ -606,9 +640,9 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         const Type& resTy = exprType(bin);
-        llvm::Type* resLlvmTy = llvmType(env, resTy);
-        L = castInteger(env, L, resLlvmTy);
-        R = castInteger(env, R, resLlvmTy);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        if (resTy.isUnsigned) return env.b.CreateUDiv(L, R, "udiv");
       }
       return env.b.CreateSDiv(L, R, "div");
     }
@@ -627,10 +661,10 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         c = env.b.CreateFCmpOLT(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
-        c = env.b.CreateICmpSLT(L, R, "cmp");
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = cmpTy.isUnsigned ? env.b.CreateICmpULT(L, R, "cmp")
+                             : env.b.CreateICmpSLT(L, R, "cmp");
       } else {
         c = env.b.CreateICmpSLT(L, R, "cmp");
       }
@@ -647,10 +681,10 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         c = env.b.CreateFCmpOLE(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
-        c = env.b.CreateICmpSLE(L, R, "cmp");
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = cmpTy.isUnsigned ? env.b.CreateICmpULE(L, R, "cmp")
+                             : env.b.CreateICmpSLE(L, R, "cmp");
       } else {
         c = env.b.CreateICmpSLE(L, R, "cmp");
       }
@@ -667,10 +701,10 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         c = env.b.CreateFCmpOGT(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
-        c = env.b.CreateICmpSGT(L, R, "cmp");
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = cmpTy.isUnsigned ? env.b.CreateICmpUGT(L, R, "cmp")
+                             : env.b.CreateICmpSGT(L, R, "cmp");
       } else {
         c = env.b.CreateICmpSGT(L, R, "cmp");
       }
@@ -687,10 +721,10 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
         c = env.b.CreateFCmpOGE(L, R, "cmp");
       } else if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
-        c = env.b.CreateICmpSGE(L, R, "cmp");
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
+        c = cmpTy.isUnsigned ? env.b.CreateICmpUGE(L, R, "cmp")
+                             : env.b.CreateICmpSGE(L, R, "cmp");
       } else {
         c = env.b.CreateICmpSGE(L, R, "cmp");
       }
@@ -710,9 +744,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
       }
       if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
         auto* pty = llvm::cast<llvm::PointerType>(L->getType());
@@ -744,9 +777,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       if (lhsTy.isInteger() && rhsTy.isInteger()) {
         Type cmpTy = commonIntegerType(lhsTy, rhsTy);
-        llvm::Type* cmpLlvmTy = llvmType(env, cmpTy);
-        L = castInteger(env, L, cmpLlvmTy);
-        R = castInteger(env, R, cmpLlvmTy);
+        L = castNumericToType(env, L, lhsTy, cmpTy);
+        R = castNumericToType(env, R, rhsTy, cmpTy);
       }
       if (lhsTy.isPointer() && rhsTy.isInt() && isNullPointerLiteral(*bin.rhs)) {
         auto* pty = llvm::cast<llvm::PointerType>(L->getType());
@@ -787,7 +819,8 @@ static llvm::Value* emitLValue(CGEnv& env, const Expr& e) {
     if (baseTy.isArray() && !baseTy.ptrOutsideArrays) baseTy = baseTy.decayType();
     Type elemTy = baseTy.pointee();
     llvm::Type* llvmElemTy = llvmType(env, elemTy);
-    llvm::Value* adjIdx = castIndex(env, idx);
+    Type idxTy = exprType(*sub->index);
+    llvm::Value* adjIdx = castIndex(env, idx, idxTy);
     return env.b.CreateGEP(llvmElemTy, basePtr, adjIdx, "sub.addr");
   }
 
@@ -855,35 +888,28 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     if (it != env.functions.end()) callee = it->second;
     if (!callee) return i32Const(env, 0);
 
+    const std::vector<Type>* paramTypes = nullptr;
+    auto pit = env.functionParamTypes.find(call->callee);
+    if (pit != env.functionParamTypes.end()) paramTypes = &pit->second;
+
     std::vector<llvm::Value*> argsV;
     argsV.reserve(call->args.size());
     for (size_t i = 0; i < call->args.size(); ++i) {
       const auto& a = call->args[i];
-      if (i < callee->arg_size()) {
-        llvm::Type* paramTy = callee->getFunctionType()->getParamType(i);
-        if (paramTy->isPointerTy() && isNullPointerLiteral(*a)) {
+      if (paramTypes && i < paramTypes->size()) {
+        const Type& dstTy = (*paramTypes)[i];
+        llvm::Type* paramTy = llvmType(env, dstTy);
+        if (dstTy.isPointer() && isNullPointerLiteral(*a)) {
           argsV.push_back(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(paramTy)));
           continue;
         }
-        if (paramTy->isPointerTy() && exprType(*a).isPointer()) {
+        if (dstTy.isPointer() && exprType(*a).isPointer()) {
           llvm::Value* v = emitExpr(env, *a);
           argsV.push_back(castPointerIfNeeded(env, v, paramTy));
           continue;
         }
-        if (paramTy->isIntegerTy() && exprType(*a).isNumeric()) {
+        if (dstTy.isNumeric() && exprType(*a).isNumeric()) {
           llvm::Value* v = emitExpr(env, *a);
-          Type dstTy;
-          if (paramTy->isIntegerTy(64)) dstTy.base = Type::Base::Long;
-          else if (paramTy->isIntegerTy(16)) dstTy.base = Type::Base::Short;
-          else if (paramTy->isIntegerTy(8)) dstTy.base = Type::Base::Char;
-          else dstTy.base = Type::Base::Int;
-          argsV.push_back(castNumericToType(env, v, exprType(*a), dstTy));
-          continue;
-        }
-        if (paramTy->isFloatingPointTy() && exprType(*a).isNumeric()) {
-          llvm::Value* v = emitExpr(env, *a);
-          Type dstTy;
-          dstTy.base = paramTy->isFloatTy() ? Type::Base::Float : Type::Base::Double;
           argsV.push_back(castNumericToType(env, v, exprType(*a), dstTy));
           continue;
         }
@@ -1015,7 +1041,11 @@ static bool emitSwitch(CGEnv& env, const SwitchStmt& s) {
 
   llvm::Value* condV = emitExpr(env, *s.cond);
   if (condV->getType()->isIntegerTy() && !condV->getType()->isIntegerTy(32)) {
-    condV = castInteger(env, condV, env.i32Ty());
+    Type condTy = exprType(*s.cond);
+    Type dstTy;
+    dstTy.base = Type::Base::Int;
+    dstTy.isUnsigned = condTy.isUnsigned;
+    condV = castNumericToType(env, condV, condTy, dstTy);
   }
   llvm::BasicBlock* endBB  = llvm::BasicBlock::Create(env.ctx, "switch.end", F);
 
@@ -1331,10 +1361,17 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
 
     std::vector<llvm::Type*> paramTys;
     paramTys.reserve(p->params.size());
-    for (const auto& prm : p->params) paramTys.push_back(llvmType(env, adjustParamType(prm.type)));
+    std::vector<Type> paramTypes;
+    paramTypes.reserve(p->params.size());
+    for (const auto& prm : p->params) {
+      Type adj = adjustParamType(prm.type);
+      paramTypes.push_back(adj);
+      paramTys.push_back(llvmType(env, adj));
+    }
     auto* fnTy = llvm::FunctionType::get(llvmType(env, p->returnType), paramTys, false);
     llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
     env.functions[name] = F;
+    env.functionParamTypes.emplace(name, std::move(paramTypes));
 
     // name args if we have parameter names (definition may have names even if earlier decl didn't)
     unsigned i = 0;

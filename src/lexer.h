@@ -14,6 +14,7 @@ enum class TokenKind {
   KwShort,
   KwInt,
   KwLong,
+  KwUnsigned,
   KwFloat,
   KwDouble,
   KwVoid,

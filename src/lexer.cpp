@@ -48,6 +48,7 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "short")    return Token{TokenKind::KwShort, s, loc};
   if (s == "int")      return Token{TokenKind::KwInt, s, loc};
   if (s == "long")     return Token{TokenKind::KwLong, s, loc};
+  if (s == "unsigned") return Token{TokenKind::KwUnsigned, s, loc};
   if (s == "float")    return Token{TokenKind::KwFloat, s, loc};
   if (s == "double")   return Token{TokenKind::KwDouble, s, loc};
   if (s == "void")     return Token{TokenKind::KwVoid, s, loc};

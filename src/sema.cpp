@@ -82,13 +82,37 @@ static Type promoteInteger(const Type& t) {
   return res;
 }
 
+static int integerRank(const Type& t) {
+  switch (t.base) {
+    case Type::Base::Char: return 1;
+    case Type::Base::Short: return 2;
+    case Type::Base::Int: return 3;
+    case Type::Base::Long: return 4;
+    case Type::Base::LongLong: return 5;
+    default: return 0;
+  }
+}
+
+static Type typeFromRank(int rank) {
+  Type t;
+  switch (rank) {
+    case 1: t.base = Type::Base::Char; break;
+    case 2: t.base = Type::Base::Short; break;
+    case 4: t.base = Type::Base::Long; break;
+    case 5: t.base = Type::Base::LongLong; break;
+    case 3:
+    default: t.base = Type::Base::Int; break;
+  }
+  return t;
+}
+
 static Type commonIntegerType(const Type& lhs, const Type& rhs) {
   Type L = promoteInteger(lhs);
   Type R = promoteInteger(rhs);
-  if (L.base == Type::Base::Long || R.base == Type::Base::Long) {
-    return Type{Type::Base::Long, 0};
-  }
-  return Type{};
+  int rank = std::max(integerRank(L), integerRank(R));
+  Type res = typeFromRank(rank);
+  res.isUnsigned = L.isUnsigned || R.isUnsigned;
+  return res;
 }
 
 static Type commonNumericType(const Type& lhs, const Type& rhs) {
@@ -99,6 +123,10 @@ static Type commonNumericType(const Type& lhs, const Type& rhs) {
     return Type{Type::Base::Float, 0};
   }
   return commonIntegerType(lhs, rhs);
+}
+
+static bool isValidUnsignedUse(const Type& t) {
+  return !t.isUnsigned || t.isInteger();
 }
 
 static bool isPointerCompatibleForAssign(const Type& dst, const Type& src) {
@@ -367,6 +395,10 @@ static void checkStmtImpl(
     for (const auto& item : decl->items) {
       if (cur.count(item.name)) {
         diags.error(item.nameLoc, "redefinition of '" + item.name + "'");
+        return;
+      }
+      if (!isValidUnsignedUse(item.type)) {
+        diags.error(item.nameLoc, "invalid use of unsigned type");
         return;
       }
       if (isArrayElementVoid(item.type)) {
@@ -904,6 +936,10 @@ bool Sema::run(AstTranslationUnit& tu) {
         diags_.error(field.nameLoc, "duplicate field name '" + field.name + "'");
         return false;
       }
+      if (!isValidUnsignedUse(field.type)) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
       if (isArrayElementVoid(field.type)) {
         diags_.error(field.nameLoc, "invalid field type");
         return false;
@@ -948,8 +984,16 @@ bool Sema::run(AstTranslationUnit& tu) {
       diags_.error(p->nameLoc, "invalid return type");
       return false;
     }
+    if (!isValidUnsignedUse(p->returnType)) {
+      diags_.error(p->nameLoc, "invalid return type");
+      return false;
+    }
     for (const auto& prm : p->params) {
       if (prm.type.isVoidObject()) {
+        diags_.error(prm.loc, "invalid parameter type");
+        return false;
+      }
+      if (!isValidUnsignedUse(prm.type)) {
         diags_.error(prm.loc, "invalid parameter type");
         return false;
       }
@@ -986,6 +1030,10 @@ bool Sema::run(AstTranslationUnit& tu) {
         }
         if (decl.type.isVoidObject()) {
           diags_.error(decl.nameLoc, "invalid use of void type");
+          return false;
+        }
+        if (!isValidUnsignedUse(decl.type)) {
+          diags_.error(decl.nameLoc, "invalid use of unsigned type");
           return false;
         }
         if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/false)) {

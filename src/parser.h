@@ -21,8 +21,9 @@ struct Node {
 };
 
 struct Type {
-  enum class Base { Char, Short, Int, Long, Float, Double, Void, Struct };
+  enum class Base { Char, Short, Int, Long, LongLong, Float, Double, Void, Struct };
   Base base = Base::Int;
+  bool isUnsigned = false;
   std::string structName;
   int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
   std::vector<std::optional<size_t>> arrayDims;
@@ -39,7 +40,8 @@ struct Type {
   }
   bool isInteger() const {
     if (ptrDepth != 0 || !arrayDims.empty()) return false;
-    return base == Base::Char || base == Base::Short || base == Base::Int || base == Base::Long;
+    return base == Base::Char || base == Base::Short || base == Base::Int || base == Base::Long ||
+           base == Base::LongLong;
   }
   bool isNumeric() const { return isInteger() || isFloating(); }
   bool isVoid() const { return base == Base::Void && ptrDepth == 0 && arrayDims.empty(); }
@@ -48,6 +50,7 @@ struct Type {
   bool isArray() const { return !arrayDims.empty(); }
   Type pointee() const {
     Type t{base, ptrDepth - 1, arrayDims};
+    t.isUnsigned = isUnsigned;
     t.structName = structName;
     t.ptrOutsideArrays = false;
     return t;
@@ -55,11 +58,13 @@ struct Type {
   Type elementType() const {
     if (arrayDims.empty()) {
       Type t{base, ptrDepth};
+      t.isUnsigned = isUnsigned;
       t.structName = structName;
       return t;
     }
     std::vector<std::optional<size_t>> rest(arrayDims.begin() + 1, arrayDims.end());
     Type t{base, ptrDepth, std::move(rest)};
+    t.isUnsigned = isUnsigned;
     t.structName = structName;
     return t;
   }
@@ -72,7 +77,8 @@ struct Type {
   bool isVoidPointer() const { return base == Base::Void && ptrDepth == 1; }
   bool isVoidObject() const { return base == Base::Void && ptrDepth == 0; }
   bool operator==(const Type& other) const {
-    return base == other.base && structName == other.structName && ptrDepth == other.ptrDepth &&
+    return base == other.base && isUnsigned == other.isUnsigned &&
+           structName == other.structName && ptrDepth == other.ptrDepth &&
            arrayDims == other.arrayDims && ptrOutsideArrays == other.ptrOutsideArrays;
   }
   bool operator!=(const Type& other) const { return !(*this == other); }
