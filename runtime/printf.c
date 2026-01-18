@@ -174,11 +174,17 @@ int printf(const char* fmt, ...) {
     }
     if (*p == 's') {
       const char* s = va_arg(ap, const char*);
-      int len = 0;
       const char* t = s ? s : "(null)";
+      int len = 0;
       while (t[len]) len++;
+      if (precision >= 0 && precision < len) {
+        len = precision;
+      }
       if (width > len) count += write_spaces(width - len);
-      count += write_str(s);
+      for (int i = 0; i < len; ++i) {
+        write_char(t[i]);
+      }
+      count += len;
       continue;
     }
     write_char('%');
