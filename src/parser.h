@@ -363,6 +363,7 @@ struct FunctionProto {
   std::string name;
   SourceLocation nameLoc;
   std::vector<Param> params;
+  bool isVariadic = false;
 };
 
 struct FunctionDecl {
@@ -444,7 +445,11 @@ private:
   std::optional<AstTranslationUnit> parseTranslationUnit();
   std::optional<TopLevelItem> parseTopLevelItem();
   std::optional<FunctionProto> parseFunctionProto();         // parses: int name '(' params ')'
-  std::optional<std::vector<Param>> parseParamList();        // parses inside (...) ; allows nameless params
+  struct ParamList {
+    std::vector<Param> params;
+    bool isVariadic = false;
+  };
+  std::optional<ParamList> parseParamList();        // parses inside (...) ; allows nameless params
   std::optional<FunctionDef> parseFunctionDefAfterProto(FunctionProto proto);
 
   std::optional<std::unique_ptr<Stmt>> parseStmt();

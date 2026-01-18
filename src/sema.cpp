@@ -28,6 +28,7 @@ static std::optional<Type> lookupVarType(const ScopeStack& scopes, const std::st
 struct FnInfo {
   std::vector<Type> paramTypes;
   Type returnType;
+  bool isVariadic = false;
   bool hasDecl = false;
   bool hasDef = false;
   SourceLocation firstLoc{};
@@ -53,6 +54,7 @@ static Type adjustParamType(const Type& t);
 static bool sameSignature(const FnInfo& info, const FunctionProto& proto) {
   if (info.paramTypes.size() != proto.params.size()) return false;
   if (info.returnType != proto.returnType) return false;
+  if (info.isVariadic != proto.isVariadic) return false;
   for (size_t i = 0; i < proto.params.size(); ++i) {
     if (info.paramTypes[i] != adjustParamType(proto.params[i].type)) return false;
   }
@@ -955,7 +957,13 @@ static std::optional<Type> checkExprImpl(
     const FnInfo& info = it->second;
     size_t expected = info.paramTypes.size();
     size_t have = call->args.size();
-    if (expected != have) {
+    if (info.isVariadic) {
+      if (have < expected) {
+        diags.error(call->calleeLoc,
+                    "expected at least " + std::to_string(expected) +
+                        " arguments, have " + std::to_string(have));
+      }
+    } else if (expected != have) {
       diags.error(call->calleeLoc,
                   "expected " + std::to_string(expected) +
                       " arguments, have " + std::to_string(have));
@@ -1317,6 +1325,7 @@ static void addOrCheckFn(
     info.paramTypes.reserve(proto.params.size());
     for (const auto& prm : proto.params) info.paramTypes.push_back(adjustParamType(prm.type));
     info.returnType = proto.returnType;
+    info.isVariadic = proto.isVariadic;
     info.firstLoc = proto.nameLoc;
     info.hasDecl = !isDef;
     info.hasDef = isDef;

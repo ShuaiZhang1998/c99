@@ -84,7 +84,8 @@ enum class TokenKind {
   LessLess,       // <<
   GreaterGreater, // >>
   LessLessAssign, // <<=
-  GreaterGreaterAssign // >>=
+  GreaterGreaterAssign, // >>=
+  Ellipsis // ...
 };
 
 struct Token {

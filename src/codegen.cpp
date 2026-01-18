@@ -1699,7 +1699,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       paramTypes.push_back(adj);
       paramTys.push_back(llvmType(env, adj));
     }
-    auto* fnTy = llvm::FunctionType::get(llvmType(env, p->returnType), paramTys, false);
+    auto* fnTy = llvm::FunctionType::get(llvmType(env, p->returnType), paramTys, p->isVariadic);
     llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
     env.functions[name] = F;
     env.functionParamTypes.emplace(name, std::move(paramTypes));

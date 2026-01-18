@@ -106,6 +106,17 @@ static std::string createTempObjPath() {
   return tmp.str().str();
 }
 
+static std::string buildRuntimeObj() {
+  std::string objPath = createTempObjPath();
+  std::string cmd = "clang -c \"runtime/printf.c\" -o \"" + objPath + "\"";
+  int rc = std::system(cmd.c_str());
+  if (rc != 0) {
+    std::cerr << "runtime compile failed (cmd=" << cmd << ")\n";
+    std::exit(1);
+  }
+  return objPath;
+}
+
 static bool compileToObject(
     const std::string& inputPath,
     const std::vector<std::string>& includePaths,
@@ -222,6 +233,9 @@ int main(int argc, char** argv) {
       std::cerr << "error: no 'main' function defined\n";
       return 1;
     }
+
+    std::string rtObj = buildRuntimeObj();
+    objPaths.push_back(rtObj);
 
     std::string cmd = "clang";
     for (const auto& obj : objPaths) {

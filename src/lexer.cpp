@@ -303,7 +303,13 @@ Token Lexer::next() {
     case '?': get(); return Token{TokenKind::Question, "?", loc};
 
     case ',': get(); return Token{TokenKind::Comma, ",", loc};
-    case '.': get(); return Token{TokenKind::Dot, ".", loc};
+    case '.':
+      if (i_ + 2 < input_.size() && input_[i_ + 1] == '.' && input_[i_ + 2] == '.') {
+        get(); get(); get();
+        return Token{TokenKind::Ellipsis, "...", loc};
+      }
+      get();
+      return Token{TokenKind::Dot, ".", loc};
 
     default:
       diags_.error(loc, std::string("unexpected character: '") + c + "'");

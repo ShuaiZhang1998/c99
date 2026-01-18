@@ -261,6 +261,22 @@ echo $?
 # 期望输出：3
 ```
 
+带 `printf` 的示例（需要 `-I include`）：
+
+```
+cat > hello.c << 'EOS'
+#include <stdio.h>
+int main() {
+  printf("sum=%d\n", 3);
+  return 0;
+}
+EOS
+
+./build/c99cc hello.c -I include -o hello
+./hello
+# 期望输出：sum=3
+```
+
 ## **编译方式**
 
 单文件：
@@ -379,7 +395,7 @@ echo $?
 - 作用域与存储期：块内 `struct` 定义、`extern`/`static` 等
 - 错误恢复与诊断增强
 
-## **如果目标是编译一个经典而简单的 C99 项目，还缺什么（当前状态）**
+## **目标是编译一个经典而简单的 C99 项目，还缺什么（当前状态）**
 
 - 标准库与头文件体系：`stdio.h`/`stdlib.h`/`string.h` 等常用头文件与符号
 - 预处理器完善：完整 include guard、宏展开细节一致性
