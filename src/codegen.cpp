@@ -442,6 +442,43 @@ static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm
   return env.b.CreateICmpEQ(lhs, rhs, "cmp");
 }
 
+static bool resolveDesignatorAddr(
+    CGEnv& env, const Type& baseTy, llvm::Value* baseAddr,
+    const std::vector<Designator>& designators, Type& outTy, llvm::Value*& outAddr) {
+  Type curTy = baseTy;
+  llvm::Value* curAddr = baseAddr;
+  for (const auto& d : designators) {
+    if (d.kind == Designator::Kind::Index) {
+      if (!curTy.isArray() || curTy.ptrOutsideArrays) return false;
+      llvm::Type* arrTy = llvmType(env, curTy);
+      llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(d.index))};
+      curAddr = env.b.CreateGEP(arrTy, curAddr, idxs, "init.idx");
+      curTy = curTy.elementType();
+      continue;
+    }
+    if (curTy.base != Type::Base::Struct || curTy.ptrDepth != 0) return false;
+    auto fieldsIt = env.structFields.find(curTy.structName);
+    auto stIt = env.structs.find(curTy.structName);
+    if (fieldsIt == env.structFields.end() || stIt == env.structs.end()) return false;
+    size_t fieldIndex = 0;
+    bool found = false;
+    for (size_t i = 0; i < fieldsIt->second.size(); ++i) {
+      if (fieldsIt->second[i].name == d.field) {
+        fieldIndex = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+    curAddr = env.b.CreateStructGEP(stIt->second, curAddr, static_cast<unsigned>(fieldIndex),
+                                    "init.fld");
+    curTy = fieldsIt->second[fieldIndex].type;
+  }
+  outTy = curTy;
+  outAddr = curAddr;
+  return true;
+}
+
 static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const Expr& init) {
   if (auto* str = dynamic_cast<const StringLiteralExpr*>(&init)) {
     if (ty.isArray() && !ty.ptrOutsideArrays) {
@@ -463,6 +500,13 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
     }
   }
   if (auto* list = dynamic_cast<const InitListExpr*>(&init)) {
+    if (ty.isArray() && !ty.ptrOutsideArrays && list->elems.size() == 1 &&
+        list->elems[0].designators.empty()) {
+      if (auto* str = dynamic_cast<const StringLiteralExpr*>(list->elems[0].expr.get())) {
+        emitInitToAddr(env, ty, addr, *str);
+        return;
+      }
+    }
     if (ty.base == Type::Base::Struct && ty.ptrDepth == 0) {
       auto it = env.structFields.find(ty.structName);
       if (it == env.structFields.end()) return;
@@ -472,11 +516,32 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
       for (size_t i = 0; i < count; ++i) {
         llvm::Value* fieldAddr = env.b.CreateStructGEP(
             stIt->second, addr, static_cast<unsigned>(i), "init.fld");
-        if (i < list->elems.size()) {
-          emitInitToAddr(env, it->second[i].type, fieldAddr, *list->elems[i]);
+        env.b.CreateStore(zeroValue(env, it->second[i].type), fieldAddr);
+      }
+      size_t nextField = 0;
+      for (const auto& elem : list->elems) {
+        Type targetTy;
+        llvm::Value* targetAddr = nullptr;
+        if (!elem.designators.empty()) {
+          if (elem.designators[0].kind == Designator::Kind::Field) {
+            for (size_t fi = 0; fi < it->second.size(); ++fi) {
+              if (it->second[fi].name == elem.designators[0].field) {
+                nextField = fi + 1;
+                break;
+              }
+            }
+          }
+          if (!resolveDesignatorAddr(env, ty, addr, elem.designators, targetTy, targetAddr)) {
+            continue;
+          }
         } else {
-          env.b.CreateStore(zeroValue(env, it->second[i].type), fieldAddr);
+          size_t idx = nextField++;
+          if (idx >= it->second.size()) continue;
+          targetTy = it->second[idx].type;
+          targetAddr = env.b.CreateStructGEP(
+              stIt->second, addr, static_cast<unsigned>(idx), "init.fld");
         }
+        if (targetAddr) emitInitToAddr(env, targetTy, targetAddr, *elem.expr);
       }
       return;
     }
@@ -488,16 +553,32 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
       for (size_t i = 0; i < size; ++i) {
         llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(i))};
         llvm::Value* elemAddr = env.b.CreateGEP(arrTy, addr, idxs, "init.arr");
-        if (i < list->elems.size()) {
-          emitInitToAddr(env, elemTy, elemAddr, *list->elems[i]);
+        env.b.CreateStore(zeroValue(env, elemTy), elemAddr);
+      }
+      size_t nextIndex = 0;
+      for (const auto& elem : list->elems) {
+        Type targetTy;
+        llvm::Value* targetAddr = nullptr;
+        if (!elem.designators.empty()) {
+          if (elem.designators[0].kind == Designator::Kind::Index) {
+            nextIndex = elem.designators[0].index + 1;
+          }
+          if (!resolveDesignatorAddr(env, ty, addr, elem.designators, targetTy, targetAddr)) {
+            continue;
+          }
         } else {
-          env.b.CreateStore(zeroValue(env, elemTy), elemAddr);
+          size_t idx = nextIndex++;
+          if (idx >= size) continue;
+          llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(idx))};
+          targetAddr = env.b.CreateGEP(arrTy, addr, idxs, "init.arr");
+          targetTy = elemTy;
         }
+        if (targetAddr) emitInitToAddr(env, targetTy, targetAddr, *elem.expr);
       }
       return;
     }
-    if (!list->elems.empty()) {
-      emitInitToAddr(env, ty, addr, *list->elems[0]);
+    if (!list->elems.empty() && list->elems[0].designators.empty()) {
+      emitInitToAddr(env, ty, addr, *list->elems[0].expr);
       return;
     }
     env.b.CreateStore(zeroValue(env, ty), addr);
@@ -1478,6 +1559,10 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
   }
 
   if (auto* r = dynamic_cast<const ReturnStmt*>(&s)) {
+    if (!r->valueExpr) {
+      env.b.CreateRetVoid();
+      return true;
+    }
     llvm::Value* retV = emitExpr(env, *r->valueExpr);
     if (env.currentReturnType.isPointer() && isNullPointerLiteral(*r->valueExpr)) {
       llvm::Type* ptrTy = llvmType(env, env.currentReturnType);

@@ -118,6 +118,36 @@ struct StringLiteralExpr final : Expr {
   StringLiteralExpr(SourceLocation l, std::string v) : Expr(l), value(std::move(v)) {}
 };
 
+struct Designator {
+  enum class Kind { Field, Index };
+  Kind kind = Kind::Index;
+  SourceLocation loc;
+  std::string field;
+  size_t index = 0;
+  static Designator fieldName(SourceLocation l, std::string name) {
+    Designator d;
+    d.kind = Kind::Field;
+    d.loc = l;
+    d.field = std::move(name);
+    return d;
+  }
+  static Designator arrayIndex(SourceLocation l, size_t idx) {
+    Designator d;
+    d.kind = Kind::Index;
+    d.loc = l;
+    d.index = idx;
+    return d;
+  }
+};
+
+struct InitElem {
+  SourceLocation loc;
+  std::vector<Designator> designators;
+  std::unique_ptr<Expr> expr;
+  InitElem(SourceLocation l, std::vector<Designator> ds, std::unique_ptr<Expr> e)
+      : loc(l), designators(std::move(ds)), expr(std::move(e)) {}
+};
+
 struct VarRefExpr final : Expr {
   std::string name;
   VarRefExpr(SourceLocation l, std::string n) : Expr(l), name(std::move(n)) {}
@@ -180,8 +210,8 @@ struct MemberExpr final : Expr {
 };
 
 struct InitListExpr final : Expr {
-  std::vector<std::unique_ptr<Expr>> elems;
-  InitListExpr(SourceLocation l, std::vector<std::unique_ptr<Expr>> es)
+  std::vector<InitElem> elems;
+  InitListExpr(SourceLocation l, std::vector<InitElem> es)
       : Expr(l), elems(std::move(es)) {}
 };
 
@@ -245,8 +275,9 @@ struct AssignStmt final : Stmt {
 };
 
 struct ReturnStmt final : Stmt {
-  std::unique_ptr<Expr> valueExpr;
+  std::unique_ptr<Expr> valueExpr; // nullable for 'return;'
   ReturnStmt(SourceLocation l, std::unique_ptr<Expr> v) : Stmt(l), valueExpr(std::move(v)) {}
+  explicit ReturnStmt(SourceLocation l) : Stmt(l) {}
 };
 
 struct ExprStmt final : Stmt {

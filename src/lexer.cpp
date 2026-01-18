@@ -136,6 +136,7 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "switch")   return Token{TokenKind::KwSwitch, s, loc};
   if (s == "case")     return Token{TokenKind::KwCase, s, loc};
   if (s == "default")  return Token{TokenKind::KwDefault, s, loc};
+  if (s == "const")    return Token{TokenKind::KwConst, s, loc};
   if (s == "NULL")     return Token{TokenKind::IntegerLiteral, "0", loc};
 
   return Token{TokenKind::Identifier, s, loc};

@@ -522,7 +522,7 @@ bool Preprocessor::evalIfExpr(const std::string& expr, bool& out, std::string& e
       if (i + 1 < s.size()) {
         std::string two = s.substr(i, 2);
         if (two == "&&" || two == "||" || two == "==" || two == "!=" ||
-            two == "<=" || two == ">=") {
+            two == "<=" || two == ">=" || two == "<<" || two == ">>") {
           i += 2;
           return Token{Token::Op, 0, two};
         }
@@ -614,12 +614,14 @@ bool Preprocessor::evalIfExpr(const std::string& expr, bool& out, std::string& e
     }
 
     bool parseUnary(long long& outVal) {
-      if (cur.kind == Token::Op && (cur.text == "!" || cur.text == "+" || cur.text == "-")) {
+      if (cur.kind == Token::Op &&
+          (cur.text == "!" || cur.text == "+" || cur.text == "-" || cur.text == "~")) {
         std::string op = cur.text;
         consume();
         if (!parseUnary(outVal)) return false;
         if (op == "!") outVal = outVal ? 0 : 1;
         else if (op == "-") outVal = -outVal;
+        else if (op == "~") outVal = ~outVal;
         return true;
       }
       return parsePrimary(outVal);
@@ -652,14 +654,27 @@ bool Preprocessor::evalIfExpr(const std::string& expr, bool& out, std::string& e
       return true;
     }
 
-    bool parseRel(long long& outVal) {
+    bool parseShift(long long& outVal) {
       if (!parseAdd(outVal)) return false;
+      while (cur.kind == Token::Op && (cur.text == "<<" || cur.text == ">>")) {
+        std::string op = cur.text;
+        consume();
+        long long rhs = 0;
+        if (!parseAdd(rhs)) return false;
+        if (op == "<<") outVal = outVal << rhs;
+        else outVal = outVal >> rhs;
+      }
+      return true;
+    }
+
+    bool parseRel(long long& outVal) {
+      if (!parseShift(outVal)) return false;
       while (cur.kind == Token::Op &&
              (cur.text == "<" || cur.text == "<=" || cur.text == ">" || cur.text == ">=")) {
         std::string op = cur.text;
         consume();
         long long rhs = 0;
-        if (!parseAdd(rhs)) return false;
+        if (!parseShift(rhs)) return false;
         if (op == "<") outVal = (outVal < rhs) ? 1 : 0;
         else if (op == "<=") outVal = (outVal <= rhs) ? 1 : 0;
         else if (op == ">") outVal = (outVal > rhs) ? 1 : 0;
@@ -681,23 +696,56 @@ bool Preprocessor::evalIfExpr(const std::string& expr, bool& out, std::string& e
       return true;
     }
 
-    bool parseAnd(long long& outVal) {
+    bool parseBitAnd(long long& outVal) {
       if (!parseEq(outVal)) return false;
-      while (cur.kind == Token::Op && cur.text == "&&") {
+      while (cur.kind == Token::Op && cur.text == "&") {
         consume();
         long long rhs = 0;
         if (!parseEq(rhs)) return false;
+        outVal = outVal & rhs;
+      }
+      return true;
+    }
+
+    bool parseBitXor(long long& outVal) {
+      if (!parseBitAnd(outVal)) return false;
+      while (cur.kind == Token::Op && cur.text == "^") {
+        consume();
+        long long rhs = 0;
+        if (!parseBitAnd(rhs)) return false;
+        outVal = outVal ^ rhs;
+      }
+      return true;
+    }
+
+    bool parseBitOr(long long& outVal) {
+      if (!parseBitXor(outVal)) return false;
+      while (cur.kind == Token::Op && cur.text == "|") {
+        consume();
+        long long rhs = 0;
+        if (!parseBitXor(rhs)) return false;
+        outVal = outVal | rhs;
+      }
+      return true;
+    }
+
+    bool parseLogicalAnd(long long& outVal) {
+      if (!parseBitOr(outVal)) return false;
+      while (cur.kind == Token::Op && cur.text == "&&") {
+        consume();
+        long long rhs = 0;
+        if (!parseBitOr(rhs)) return false;
         outVal = (outVal && rhs) ? 1 : 0;
       }
       return true;
     }
 
     bool parseExpr(long long& outVal) {
-      if (!parseAnd(outVal)) return false;
+      if (!parseLogicalAnd(outVal)) return false;
       while (cur.kind == Token::Op && cur.text == "||") {
         consume();
         long long rhs = 0;
-        if (!parseAnd(rhs)) return false;
+        if (!parseLogicalAnd(rhs)) return false;
         outVal = (outVal || rhs) ? 1 : 0;
       }
       return true;

@@ -39,9 +39,15 @@ int Parser::parsePointerDepth() {
 std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef) {
   ParsedTypeSpec spec;
   SourceLocation typeLoc = cur_.loc;
+  while (cur_.kind == TokenKind::KwConst) {
+    advance();
+  }
   if (cur_.kind == TokenKind::KwUnsigned) {
     advance();
     spec.type.isUnsigned = true;
+    while (cur_.kind == TokenKind::KwConst) {
+      advance();
+    }
     if (cur_.kind == TokenKind::KwFloat || cur_.kind == TokenKind::KwDouble ||
         cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
       diags_.error(cur_.loc, "expected integer type after 'unsigned'");
@@ -753,6 +759,11 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseReturnStmt() {
   if (!expect(TokenKind::KwReturn, "'return'")) return std::nullopt;
   advance();
 
+  if (cur_.kind == TokenKind::Semicolon) {
+    advance();
+    return std::make_unique<ReturnStmt>(l);
+  }
+
   auto e = parseExpr();
   if (!e) return std::nullopt;
 
@@ -1044,6 +1055,10 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     SourceLocation l = cur_.loc;
     std::string text = cur_.text;
     advance();
+    while (cur_.kind == TokenKind::StringLiteral) {
+      text += cur_.text;
+      advance();
+    }
     return std::make_unique<StringLiteralExpr>(l, std::move(text));
   }
 
@@ -1222,12 +1237,43 @@ std::optional<std::unique_ptr<Expr>> Parser::parseInitializer() {
   if (cur_.kind == TokenKind::LBrace) {
     SourceLocation l = cur_.loc;
     advance();
-    std::vector<std::unique_ptr<Expr>> elems;
+    std::vector<InitElem> elems;
     if (cur_.kind != TokenKind::RBrace) {
       while (true) {
+        std::vector<Designator> designators;
+        SourceLocation elemLoc = cur_.loc;
+        bool hasDesignator = false;
+        while (cur_.kind == TokenKind::Dot || cur_.kind == TokenKind::LBracket) {
+          hasDesignator = true;
+          if (cur_.kind == TokenKind::Dot) {
+            SourceLocation dLoc = cur_.loc;
+            advance();
+            if (!expect(TokenKind::Identifier, "member name")) return std::nullopt;
+            std::string name = cur_.text;
+            advance();
+            designators.push_back(Designator::fieldName(dLoc, std::move(name)));
+            continue;
+          }
+          SourceLocation dLoc = cur_.loc;
+          advance();
+          if (cur_.kind != TokenKind::IntegerLiteral) {
+            diags_.error(cur_.loc, "expected integer literal in array designator");
+            return std::nullopt;
+          }
+          size_t idx = static_cast<size_t>(std::stoll(cur_.text));
+          advance();
+          if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
+          advance();
+          designators.push_back(Designator::arrayIndex(dLoc, idx));
+        }
+        if (hasDesignator) {
+          if (!expect(TokenKind::Assign, "'='")) return std::nullopt;
+          advance();
+        }
         auto elem = parseInitializer();
         if (!elem) return std::nullopt;
-        elems.push_back(std::move(*elem));
+        if (!hasDesignator) elemLoc = (*elem)->loc;
+        elems.emplace_back(elemLoc, std::move(designators), std::move(*elem));
         if (cur_.kind == TokenKind::Comma) {
           advance();
           if (cur_.kind == TokenKind::RBrace) break;

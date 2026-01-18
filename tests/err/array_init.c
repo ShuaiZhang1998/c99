@@ -1,4 +1,4 @@
-// ERROR: array initializer not supported
+// ERROR: invalid initializer for array
 int main() {
   int a[2] = 1;
   return 0;

@@ -1,2 +1,2 @@
-// ERROR: expected primary expression
+// ERROR: missing return value
 int main() { return; }

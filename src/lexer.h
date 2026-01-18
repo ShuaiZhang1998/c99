@@ -36,6 +36,7 @@ enum class TokenKind {
   KwSwitch,
   KwCase,
   KwDefault,
+  KwConst,
 
   LParen, RParen,
   LBrace, RBrace,

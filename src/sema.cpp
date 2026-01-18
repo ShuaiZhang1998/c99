@@ -182,16 +182,53 @@ static bool fillArraySizeFromString(DeclItem& item, Diagnostics& diags) {
     return false;
   }
   auto* str = dynamic_cast<StringLiteralExpr*>(item.initExpr.get());
-  if (!str) {
-    diags.error(item.nameLoc, "invalid array size");
-    return false;
-  }
+  if (!str) return true;
   Type elem = item.type.elementType();
   if (elem.base != Type::Base::Char || elem.ptrDepth != 0 || !elem.arrayDims.empty()) {
     diags.error(item.nameLoc, "invalid array size");
     return false;
   }
   item.type.arrayDims[0] = str->value.size() + 1;
+  return true;
+}
+
+static bool fillArraySizeFromInitList(DeclItem& item, Diagnostics& diags) {
+  if (!item.type.isArray() || item.type.arrayDims.empty()) return true;
+  if (item.type.arrayDims[0].has_value()) return true;
+  if (!item.initExpr) {
+    diags.error(item.nameLoc, "invalid array size");
+    return false;
+  }
+  if (dynamic_cast<StringLiteralExpr*>(item.initExpr.get())) return true;
+  auto* list = dynamic_cast<InitListExpr*>(item.initExpr.get());
+  if (!list) {
+    diags.error(item.nameLoc, "invalid array size");
+    return false;
+  }
+  if (list->elems.size() == 1 && list->elems[0].designators.empty()) {
+    if (auto* str = dynamic_cast<StringLiteralExpr*>(list->elems[0].expr.get())) {
+      item.type.arrayDims[0] = str->value.size() + 1;
+      return true;
+    }
+  }
+  size_t next = 0;
+  size_t max = 0;
+  for (const auto& elem : list->elems) {
+    if (elem.designators.empty()) {
+      size_t idx = next;
+      next = idx + 1;
+      if (idx + 1 > max) max = idx + 1;
+      continue;
+    }
+    if (elem.designators[0].kind != Designator::Kind::Index) {
+      diags.error(item.nameLoc, "invalid array size");
+      return false;
+    }
+    size_t idx = elem.designators[0].index;
+    next = idx + 1;
+    if (idx + 1 > max) max = idx + 1;
+  }
+  item.type.arrayDims[0] = max;
   return true;
 }
 
@@ -232,13 +269,81 @@ static bool checkInitList(
       return false;
     }
     size_t size = *target.arrayDims[0];
-    if (list.elems.size() > size) {
-      diags.error(list.loc, "excess elements in array initializer");
-      return false;
-    }
     Type elemTy = target.elementType();
-    for (size_t i = 0; i < list.elems.size(); ++i) {
-      if (!checkInitializer(diags, scopes, fns, structs, enums, elemTy, *list.elems[i], true)) {
+    if (elemTy.base == Type::Base::Char && elemTy.ptrDepth == 0 &&
+        elemTy.arrayDims.empty() && list.elems.size() == 1 &&
+        list.elems[0].designators.empty()) {
+      if (auto* str = asStringLiteral(*list.elems[0].expr)) {
+        size_t need = str->value.size() + 1;
+        if (size < need) {
+          diags.error(list.loc, "string initializer too long");
+          return false;
+        }
+        return true;
+      }
+    }
+    size_t nextIndex = 0;
+    for (const auto& elem : list.elems) {
+      size_t idx = nextIndex;
+      Type targetTy = elemTy;
+      if (!elem.designators.empty()) {
+        const auto& first = elem.designators[0];
+        if (first.kind != Designator::Kind::Index) {
+          diags.error(first.loc, "invalid array designator");
+          return false;
+        }
+        idx = first.index;
+        nextIndex = idx + 1;
+        targetTy = target;
+        for (const auto& d : elem.designators) {
+          if (d.kind == Designator::Kind::Index) {
+            if (!targetTy.isArray() || targetTy.ptrOutsideArrays) {
+              diags.error(d.loc, "invalid array designator");
+              return false;
+            }
+            if (targetTy.arrayDims.empty() || !targetTy.arrayDims[0].has_value()) {
+              diags.error(d.loc, "invalid array initializer");
+              return false;
+            }
+            size_t arrSize = *targetTy.arrayDims[0];
+            if (d.index >= arrSize) {
+              diags.error(d.loc, "array designator out of range");
+              return false;
+            }
+            targetTy = targetTy.elementType();
+          } else {
+            if (targetTy.base != Type::Base::Struct || targetTy.ptrDepth != 0) {
+              diags.error(d.loc, "invalid struct designator");
+              return false;
+            }
+            const StructInfo* info = lookupStruct(structs, targetTy.structName);
+            if (!info) {
+              diags.error(d.loc, "unknown struct type '" + targetTy.structName + "'");
+              return false;
+            }
+            bool found = false;
+            for (const auto& field : info->fields) {
+              if (field.name == d.field) {
+                targetTy = field.type;
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              diags.error(d.loc,
+                          "unknown field '" + d.field + "' in struct '" + targetTy.structName + "'");
+              return false;
+            }
+          }
+        }
+      } else {
+        nextIndex = idx + 1;
+      }
+      if (idx >= size) {
+        diags.error(list.loc, "excess elements in array initializer");
+        return false;
+      }
+      if (!checkInitializer(diags, scopes, fns, structs, enums, targetTy, *elem.expr, true)) {
         return false;
       }
     }
@@ -251,13 +356,85 @@ static bool checkInitList(
       diags.error(list.loc, "unknown struct type '" + target.structName + "'");
       return false;
     }
-    if (list.elems.size() > info->fields.size()) {
-      diags.error(list.loc, "excess elements in struct initializer");
-      return false;
-    }
-    for (size_t i = 0; i < list.elems.size(); ++i) {
-      if (!checkInitializer(diags, scopes, fns, structs, enums, info->fields[i].type,
-                            *list.elems[i], true)) {
+    size_t nextField = 0;
+    for (const auto& elem : list.elems) {
+      size_t idx = nextField;
+      Type targetTy;
+      if (!elem.designators.empty()) {
+        const auto& first = elem.designators[0];
+        if (first.kind != Designator::Kind::Field) {
+          diags.error(first.loc, "invalid struct designator");
+          return false;
+        }
+        bool found = false;
+        for (size_t fi = 0; fi < info->fields.size(); ++fi) {
+          if (info->fields[fi].name == first.field) {
+            idx = fi;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          diags.error(first.loc,
+                      "unknown field '" + first.field + "' in struct '" + target.structName + "'");
+          return false;
+        }
+        nextField = idx + 1;
+        targetTy = target;
+        for (const auto& d : elem.designators) {
+          if (d.kind == Designator::Kind::Field) {
+            if (targetTy.base != Type::Base::Struct || targetTy.ptrDepth != 0) {
+              diags.error(d.loc, "invalid struct designator");
+              return false;
+            }
+            const StructInfo* curInfo = lookupStruct(structs, targetTy.structName);
+            if (!curInfo) {
+              diags.error(d.loc, "unknown struct type '" + targetTy.structName + "'");
+              return false;
+            }
+            bool fieldFound = false;
+            for (const auto& field : curInfo->fields) {
+              if (field.name == d.field) {
+                targetTy = field.type;
+                fieldFound = true;
+                break;
+              }
+            }
+            if (!fieldFound) {
+              diags.error(d.loc,
+                          "unknown field '" + d.field + "' in struct '" + targetTy.structName + "'");
+              return false;
+            }
+          } else {
+            if (!targetTy.isArray() || targetTy.ptrOutsideArrays) {
+              diags.error(d.loc, "invalid array designator");
+              return false;
+            }
+            if (targetTy.arrayDims.empty() || !targetTy.arrayDims[0].has_value()) {
+              diags.error(d.loc, "invalid array initializer");
+              return false;
+            }
+            size_t arrSize = *targetTy.arrayDims[0];
+            if (d.index >= arrSize) {
+              diags.error(d.loc, "array designator out of range");
+              return false;
+            }
+            targetTy = targetTy.elementType();
+          }
+        }
+      } else {
+        nextField = idx + 1;
+        if (idx >= info->fields.size()) {
+          diags.error(list.loc, "excess elements in struct initializer");
+          return false;
+        }
+        targetTy = info->fields[idx].type;
+      }
+      if (idx >= info->fields.size()) {
+        diags.error(list.loc, "excess elements in struct initializer");
+        return false;
+      }
+      if (!checkInitializer(diags, scopes, fns, structs, enums, targetTy, *elem.expr, true)) {
         return false;
       }
     }
@@ -265,11 +442,12 @@ static bool checkInitList(
   }
 
   if (list.elems.empty()) return true;
-  if (list.elems.size() != 1) {
+  if (list.elems.size() != 1 || !list.elems[0].designators.empty()) {
     diags.error(list.loc, "invalid initializer");
     return false;
   }
-  return checkInitializer(diags, scopes, fns, structs, enums, target, *list.elems[0], allowArrayInit);
+  return checkInitializer(diags, scopes, fns, structs, enums,
+                          target, *list.elems[0].expr, allowArrayInit);
 }
 
 static bool checkInitializer(
@@ -478,6 +656,9 @@ static void checkStmtImpl(
       if (!fillArraySizeFromString(item, diags)) {
         return;
       }
+      if (!fillArraySizeFromInitList(item, diags)) {
+        return;
+      }
       if (hasInvalidArraySize(item.type, /*allowFirstEmpty=*/false)) {
         diags.error(item.nameLoc, "invalid array size");
         return;
@@ -498,14 +679,9 @@ static void checkStmtImpl(
       // initializer cannot reference the variable being declared:
       // keep behavior by checking before insertion.
       if (item.initExpr) {
-        if (item.type.isArray() && !item.type.ptrOutsideArrays) {
-          if (!asStringLiteral(*item.initExpr)) {
-            diags.error(item.nameLoc, "array initializer not supported");
-            return;
-          }
-        }
+        bool allowArrayInit = item.type.isArray() && !item.type.ptrOutsideArrays;
         if (!checkInitializer(diags, scopes, fns, structs, enums,
-                              item.type, *item.initExpr, false)) {
+                              item.type, *item.initExpr, allowArrayInit)) {
           return;
         }
       }
@@ -525,6 +701,12 @@ static void checkStmtImpl(
   }
 
   if (auto* ret = dynamic_cast<ReturnStmt*>(&s)) {
+    if (!ret->valueExpr) {
+      if (!returnType.isVoidObject()) {
+        diags.error(ret->loc, "missing return value");
+      }
+      return;
+    }
     auto retTy = checkExprImpl(diags, scopes, fns, structs, enums, *ret->valueExpr);
     if (retTy && !isAssignable(returnType, *retTy, *ret->valueExpr)) {
       diags.error(ret->loc, "incompatible return type");
@@ -1257,10 +1439,6 @@ bool Sema::run(AstTranslationUnit& tu) {
     if (auto* d = std::get_if<FunctionDecl>(&item)) p = &d->proto;
     else if (auto* def = std::get_if<FunctionDef>(&item)) p = &def->proto;
     if (!p) continue;
-    if (p->returnType.isVoidObject()) {
-      diags_.error(p->nameLoc, "invalid return type");
-      return false;
-    }
     if (!isValidUnsignedUse(p->returnType)) {
       diags_.error(p->nameLoc, "invalid return type");
       return false;
@@ -1328,6 +1506,9 @@ bool Sema::run(AstTranslationUnit& tu) {
         if (!fillArraySizeFromString(decl, diags_)) {
           return false;
         }
+        if (!fillArraySizeFromInitList(decl, diags_)) {
+          return false;
+        }
         if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/false)) {
           diags_.error(decl.nameLoc, "invalid array size");
           return false;
@@ -1346,14 +1527,9 @@ bool Sema::run(AstTranslationUnit& tu) {
         }
 
         if (decl.initExpr) {
-          if (decl.type.isArray() && !decl.type.ptrOutsideArrays) {
-            if (!asStringLiteral(*decl.initExpr)) {
-              diags_.error(decl.nameLoc, "array initializer not supported");
-              return false;
-            }
-          }
+          bool allowArrayInit = decl.type.isArray() && !decl.type.ptrOutsideArrays;
           if (!checkInitializer(diags_, scopes, fns, structs, enumConsts,
-                                decl.type, *decl.initExpr, false)) {
+                                decl.type, *decl.initExpr, allowArrayInit)) {
             return false;
           }
         }
