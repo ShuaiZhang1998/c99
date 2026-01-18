@@ -320,20 +320,25 @@ std::optional<Type> Parser::parseTypeName(bool allowStructDef) {
 
 // -------------------- TU / top-level --------------------
 
-std::optional<std::vector<Param>> Parser::parseParamList() {
+std::optional<Parser::ParamList> Parser::parseParamList() {
   // params := ε | type_spec '*'* [ident]? (',' type_spec '*'* [ident]?)*
-  std::vector<Param> params;
+  ParamList list;
 
-  if (cur_.kind == TokenKind::RParen) return params; // empty
+  if (cur_.kind == TokenKind::RParen) return list; // empty
 
   while (true) {
+    if (cur_.kind == TokenKind::Ellipsis) {
+      list.isVariadic = true;
+      advance();
+      break;
+    }
     SourceLocation typeLoc = cur_.loc;
     Param p;
     if (cur_.kind == TokenKind::KwVoid) {
       advance();
       if (cur_.kind == TokenKind::RParen) {
         // "void)" means no parameters
-        return params;
+        return list;
       }
       p.loc = typeLoc;
       p.type.base = Type::Base::Void;
@@ -363,7 +368,7 @@ std::optional<std::vector<Param>> Parser::parseParamList() {
     p.nameLoc = SourceLocation{}; // unused
   }
 
-    params.push_back(std::move(p));
+    list.params.push_back(std::move(p));
 
     if (cur_.kind == TokenKind::Comma) {
       advance();
@@ -376,7 +381,7 @@ std::optional<std::vector<Param>> Parser::parseParamList() {
     break;
   }
 
-  return params;
+  return list;
 }
 
 std::optional<FunctionProto> Parser::parseFunctionProto() {
@@ -401,7 +406,8 @@ std::optional<FunctionProto> Parser::parseFunctionProto() {
 
   auto params = parseParamList();
   if (!params) return std::nullopt;
-  proto.params = std::move(*params);
+  proto.params = std::move(params->params);
+  proto.isVariadic = params->isVariadic;
 
   if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
   advance();
@@ -475,7 +481,8 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     proto.returnType.ptrDepth += firstDepth;
     proto.name = std::move(name);
     proto.nameLoc = nameLoc;
-    proto.params = std::move(*params);
+    proto.params = std::move(params->params);
+    proto.isVariadic = params->isVariadic;
 
     if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
     advance();

@@ -261,6 +261,22 @@ echo $?
 # 期望输出：3
 ```
 
+带 `printf` 的示例（需要 `-I include`）：
+
+```
+cat > hello.c << 'EOS'
+#include <stdio.h>
+int main() {
+  printf("sum=%d\n", 3);
+  return 0;
+}
+EOS
+
+./build/c99cc hello.c -I include -o hello
+./hello
+# 期望输出：sum=3
+```
+
 ## **编译方式**
 
 单文件：
@@ -385,4 +401,3 @@ echo $?
 - 预处理器完善：完整 include guard、宏展开细节一致性
 - 字面量与转义：十六/八进制整数、更多转义序列
 - 类型与初始化语义：更完整的整数提升/常规算术转换
-
