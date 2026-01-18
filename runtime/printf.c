@@ -67,12 +67,23 @@ static int write_spaces(int n) {
   return n;
 }
 
+static double apply_rounding(double v, int precision) {
+  int prec = (precision < 0) ? 6 : precision;
+  if (prec == 0) return v + 0.5;
+  double rounder = 0.5;
+  for (int i = 0; i < prec; ++i) {
+    rounder /= 10.0;
+  }
+  return v + rounder;
+}
+
 static int float_len(double v, int precision) {
   int len = 0;
   if (v < 0) {
     len++;
     v = -v;
   }
+  v = apply_rounding(v, precision);
   unsigned long long ip = (unsigned long long)v;
   len += count_uint(ip);
   if (precision > 0 || precision < 0) {
@@ -88,6 +99,7 @@ static int write_float(double v, int precision) {
     count++;
     v = -v;
   }
+  v = apply_rounding(v, precision);
   unsigned long long ip = (unsigned long long)v;
   double frac = v - (double)ip;
   count += write_uint(ip);
