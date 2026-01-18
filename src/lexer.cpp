@@ -1,5 +1,6 @@
 #include "lexer.h"
 #include <cctype>
+#include <optional>
 
 namespace c99cc {
 
@@ -33,6 +34,74 @@ void Lexer::skipWhitespace() {
     }
     break;
   }
+}
+
+std::optional<char> Lexer::parseEscapeChar(SourceLocation loc) {
+  if (peek() == '\0') {
+    diags_.error(loc, "unterminated escape sequence");
+    return std::nullopt;
+  }
+  char c = get();
+  switch (c) {
+    case 'n': return '\n';
+    case 't': return '\t';
+    case 'r': return '\r';
+    case '0': return '\0';
+    case '\\': return '\\';
+    case '\'': return '\'';
+    case '"': return '"';
+    default:
+      diags_.error(loc, std::string("unsupported escape sequence: \\") + c);
+      return std::nullopt;
+  }
+}
+
+Token Lexer::lexStringLiteral() {
+  SourceLocation loc{ i_, line_, col_ };
+  std::string value;
+  get(); // opening "
+  while (true) {
+    if (eof()) {
+      diags_.error(loc, "unterminated string literal");
+      return Token{TokenKind::StringLiteral, value, loc};
+    }
+    char c = get();
+    if (c == '"') break;
+    if (c == '\\') {
+      auto esc = parseEscapeChar(loc);
+      if (esc.has_value()) value.push_back(*esc);
+      continue;
+    }
+    if (c == '\n') {
+      diags_.error(loc, "unterminated string literal");
+      return Token{TokenKind::StringLiteral, value, loc};
+    }
+    value.push_back(c);
+  }
+  return Token{TokenKind::StringLiteral, value, loc};
+}
+
+Token Lexer::lexCharLiteral() {
+  SourceLocation loc{ i_, line_, col_ };
+  get(); // opening '
+  if (eof()) {
+    diags_.error(loc, "unterminated char literal");
+    return Token{TokenKind::CharLiteral, "0", loc};
+  }
+  char value = '\0';
+  char c = get();
+  if (c == '\\') {
+    auto esc = parseEscapeChar(loc);
+    value = esc.value_or('\0');
+  } else if (c == '\'' || c == '\n') {
+    diags_.error(loc, "empty char literal");
+  } else {
+    value = c;
+  }
+  if (eof() || get() != '\'') {
+    diags_.error(loc, "unterminated char literal");
+  }
+  return Token{TokenKind::CharLiteral, std::to_string(static_cast<unsigned char>(value)), loc};
 }
 
 Token Lexer::lexIdentifierOrKeyword() {
@@ -133,6 +202,8 @@ Token Lexer::next() {
   if (c == '.' && i_ + 1 < input_.size() && std::isdigit((unsigned char)input_[i_ + 1])) {
     return lexNumber();
   }
+  if (c == '"') return lexStringLiteral();
+  if (c == '\'') return lexCharLiteral();
 
   switch (c) {
     case '(': get(); return Token{TokenKind::LParen, "(", loc};
@@ -144,26 +215,52 @@ Token Lexer::next() {
     case ';': get(); return Token{TokenKind::Semicolon, ";", loc};
     case ':': get(); return Token{TokenKind::Colon, ":", loc};
 
-    case '+': get(); return Token{TokenKind::Plus, "+", loc};
+    case '+': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::PlusAssign, "+=", loc}; }
+      if (!eof() && peek() == '+') { get(); return Token{TokenKind::PlusPlus, "++", loc}; }
+      return Token{TokenKind::Plus, "+", loc};
+    }
     case '-': {
       get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::MinusAssign, "-=", loc}; }
+      if (!eof() && peek() == '-') { get(); return Token{TokenKind::MinusMinus, "--", loc}; }
       if (!eof() && peek() == '>') { get(); return Token{TokenKind::Arrow, "->", loc}; }
       return Token{TokenKind::Minus, "-", loc};
     }
-    case '*': get(); return Token{TokenKind::Star, "*", loc};
-    case '/': get(); return Token{TokenKind::Slash, "/", loc};
+    case '*': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::StarAssign, "*=", loc}; }
+      return Token{TokenKind::Star, "*", loc};
+    }
+    case '/': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::SlashAssign, "/=", loc}; }
+      return Token{TokenKind::Slash, "/", loc};
+    }
+    case '%': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::PercentAssign, "%=", loc}; }
+      return Token{TokenKind::Percent, "%", loc};
+    }
 
     case '&': {
       get();
       if (!eof() && peek() == '&') { get(); return Token{TokenKind::AmpAmp, "&&", loc}; }
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::AmpAssign, "&=", loc}; }
       return Token{TokenKind::Amp, "&", loc};
     }
 
     case '|': {
       get();
       if (!eof() && peek() == '|') { get(); return Token{TokenKind::PipePipe, "||", loc}; }
-      diags_.error(loc, "unexpected character: '|'");
-      return next();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::PipeAssign, "|=", loc}; }
+      return Token{TokenKind::Pipe, "|", loc};
+    }
+    case '^': {
+      get();
+      if (!eof() && peek() == '=') { get(); return Token{TokenKind::CaretAssign, "^=", loc}; }
+      return Token{TokenKind::Caret, "^", loc};
     }
 
     case '=': {
@@ -174,12 +271,22 @@ Token Lexer::next() {
 
     case '<': {
       get();
+      if (!eof() && peek() == '<') {
+        get();
+        if (!eof() && peek() == '=') { get(); return Token{TokenKind::LessLessAssign, "<<=", loc}; }
+        return Token{TokenKind::LessLess, "<<", loc};
+      }
       if (!eof() && peek() == '=') { get(); return Token{TokenKind::LessEqual, "<=", loc}; }
       return Token{TokenKind::Less, "<", loc};
     }
 
     case '>': {
       get();
+      if (!eof() && peek() == '>') {
+        get();
+        if (!eof() && peek() == '=') { get(); return Token{TokenKind::GreaterGreaterAssign, ">>=", loc}; }
+        return Token{TokenKind::GreaterGreater, ">>", loc};
+      }
       if (!eof() && peek() == '=') { get(); return Token{TokenKind::GreaterEqual, ">=", loc}; }
       return Token{TokenKind::Greater, ">", loc};
     }

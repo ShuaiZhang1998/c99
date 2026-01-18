@@ -113,9 +113,22 @@ struct FloatLiteralExpr final : Expr {
   FloatLiteralExpr(SourceLocation l, double v, bool isF) : Expr(l), value(v), isFloat(isF) {}
 };
 
+struct StringLiteralExpr final : Expr {
+  std::string value;
+  StringLiteralExpr(SourceLocation l, std::string v) : Expr(l), value(std::move(v)) {}
+};
+
 struct VarRefExpr final : Expr {
   std::string name;
   VarRefExpr(SourceLocation l, std::string n) : Expr(l), name(std::move(n)) {}
+};
+
+struct IncDecExpr final : Expr {
+  bool isInc = true;
+  bool isPost = false;
+  std::unique_ptr<Expr> operand;
+  IncDecExpr(SourceLocation l, bool inc, bool post, std::unique_ptr<Expr> e)
+      : Expr(l), isInc(inc), isPost(post), operand(std::move(e)) {}
 };
 
 struct CastExpr final : Expr {
@@ -190,10 +203,11 @@ struct TernaryExpr final : Expr {
 };
 
 struct AssignExpr final : Expr {
+  TokenKind op;
   std::unique_ptr<Expr> lhs;
   std::unique_ptr<Expr> rhs;
-  AssignExpr(SourceLocation l, std::unique_ptr<Expr> left, std::unique_ptr<Expr> r)
-      : Expr(l), lhs(std::move(left)), rhs(std::move(r)) {}
+  AssignExpr(SourceLocation l, TokenKind o, std::unique_ptr<Expr> left, std::unique_ptr<Expr> r)
+      : Expr(l), op(o), lhs(std::move(left)), rhs(std::move(r)) {}
 };
 
 // statements

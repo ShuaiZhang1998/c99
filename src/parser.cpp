@@ -514,11 +514,11 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
   first.type.ptrDepth += firstDepth;
   first.name = std::move(name);
   first.nameLoc = nameLoc;
-  if (cur_.kind == TokenKind::LBracket) {
-    auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
-    if (!dims) return std::nullopt;
-    first.type.arrayDims = std::move(*dims);
-  }
+    if (cur_.kind == TokenKind::LBracket) {
+      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
+      if (!dims) return std::nullopt;
+      first.type.arrayDims = std::move(*dims);
+    }
 
   if (cur_.kind == TokenKind::Assign) {
     advance();
@@ -540,7 +540,7 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     item.nameLoc = cur_.loc;
     advance();
     if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
+      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
       if (!dims) return std::nullopt;
       item.type.arrayDims = std::move(*dims);
     }
@@ -642,7 +642,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
     item.nameLoc = cur_.loc;
     advance();
     if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
+      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
       if (!dims) return std::nullopt;
       item.type.arrayDims = std::move(*dims);
     }
@@ -1019,6 +1019,12 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     advance();
     return std::make_unique<IntLiteralExpr>(l, v);
   }
+  if (cur_.kind == TokenKind::CharLiteral) {
+    SourceLocation l = cur_.loc;
+    int64_t v = std::stoll(cur_.text);
+    advance();
+    return std::make_unique<IntLiteralExpr>(l, v);
+  }
   if (cur_.kind == TokenKind::FloatLiteral) {
     SourceLocation l = cur_.loc;
     std::string text = cur_.text;
@@ -1033,6 +1039,12 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     double v = std::stod(text);
     advance();
     return std::make_unique<FloatLiteralExpr>(l, v, isFloat);
+  }
+  if (cur_.kind == TokenKind::StringLiteral) {
+    SourceLocation l = cur_.loc;
+    std::string text = cur_.text;
+    advance();
+    return std::make_unique<StringLiteralExpr>(l, std::move(text));
   }
 
   if (cur_.kind == TokenKind::Identifier) {
@@ -1114,6 +1126,15 @@ std::optional<std::unique_ptr<Expr>> Parser::parseUnary() {
     return std::make_unique<SizeofExpr>(l, std::move(*rhs));
   }
 
+  if (cur_.kind == TokenKind::PlusPlus || cur_.kind == TokenKind::MinusMinus) {
+    SourceLocation l = cur_.loc;
+    bool isInc = cur_.kind == TokenKind::PlusPlus;
+    advance();
+    auto rhs = parseUnary();
+    if (!rhs) return std::nullopt;
+    return std::make_unique<IncDecExpr>(l, isInc, /*post=*/false, std::move(*rhs));
+  }
+
   if (cur_.kind == TokenKind::LParen && isTypeStartToken(peekToken())) {
     SourceLocation l = cur_.loc;
     advance();
@@ -1163,6 +1184,13 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePostfix() {
       advance();
       base = std::make_unique<MemberExpr>(l, std::move(*base), std::move(member), memberLoc, isArrow);
       continue;
+    }
+    if (cur_.kind == TokenKind::PlusPlus || cur_.kind == TokenKind::MinusMinus) {
+      SourceLocation l = cur_.loc;
+      bool isInc = cur_.kind == TokenKind::PlusPlus;
+      advance();
+      base = std::make_unique<IncDecExpr>(l, isInc, /*post=*/true, std::move(*base));
+      break;
     }
     break;
   }
@@ -1219,7 +1247,26 @@ std::optional<std::unique_ptr<Expr>> Parser::parseAssignmentExpr() {
   auto lhs = parseConditionalExpr();
   if (!lhs) return std::nullopt;
 
-  if (cur_.kind == TokenKind::Assign) {
+  auto isAssignOp = [&](TokenKind k) {
+    switch (k) {
+      case TokenKind::Assign:
+      case TokenKind::PlusAssign:
+      case TokenKind::MinusAssign:
+      case TokenKind::StarAssign:
+      case TokenKind::SlashAssign:
+      case TokenKind::PercentAssign:
+      case TokenKind::AmpAssign:
+      case TokenKind::PipeAssign:
+      case TokenKind::CaretAssign:
+      case TokenKind::LessLessAssign:
+      case TokenKind::GreaterGreaterAssign:
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  if (isAssignOp(cur_.kind)) {
     bool ok = dynamic_cast<VarRefExpr*>(lhs->get()) != nullptr;
     if (!ok) {
       if (auto* un = dynamic_cast<UnaryExpr*>(lhs->get())) ok = (un->op == TokenKind::Star);
@@ -1235,13 +1282,13 @@ std::optional<std::unique_ptr<Expr>> Parser::parseAssignmentExpr() {
       return std::nullopt;
     }
 
+    TokenKind op = cur_.kind;
     SourceLocation assignLoc = cur_.loc;
-
     advance();
     auto rhs = parseAssignmentExpr(); // right associative
     if (!rhs) return std::nullopt;
 
-    return std::make_unique<AssignExpr>(assignLoc, std::move(*lhs), std::move(*rhs));
+    return std::make_unique<AssignExpr>(assignLoc, op, std::move(*lhs), std::move(*rhs));
   }
 
   return lhs;
@@ -1251,7 +1298,8 @@ std::optional<std::unique_ptr<Expr>> Parser::parseConditionalExpr() {
   auto parseMultiplicative = [&]() -> std::optional<std::unique_ptr<Expr>> {
     auto lhs = parseUnary();
     if (!lhs) return std::nullopt;
-    while (cur_.kind == TokenKind::Star || cur_.kind == TokenKind::Slash) {
+    while (cur_.kind == TokenKind::Star || cur_.kind == TokenKind::Slash ||
+           cur_.kind == TokenKind::Percent) {
       TokenKind op = cur_.kind;
       SourceLocation l = (*lhs)->loc;
       advance();
@@ -1277,14 +1325,28 @@ std::optional<std::unique_ptr<Expr>> Parser::parseConditionalExpr() {
   };
 
   auto parseRelational = [&]() -> std::optional<std::unique_ptr<Expr>> {
-    auto lhs = parseAdditive();
+    auto parseShift = [&]() -> std::optional<std::unique_ptr<Expr>> {
+      auto lhs = parseAdditive();
+      if (!lhs) return std::nullopt;
+      while (cur_.kind == TokenKind::LessLess || cur_.kind == TokenKind::GreaterGreater) {
+        TokenKind op = cur_.kind;
+        SourceLocation l = (*lhs)->loc;
+        advance();
+        auto rhs = parseAdditive();
+        if (!rhs) return std::nullopt;
+        lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+      }
+      return lhs;
+    };
+
+    auto lhs = parseShift();
     if (!lhs) return std::nullopt;
     while (cur_.kind == TokenKind::Less || cur_.kind == TokenKind::LessEqual ||
            cur_.kind == TokenKind::Greater || cur_.kind == TokenKind::GreaterEqual) {
       TokenKind op = cur_.kind;
       SourceLocation l = (*lhs)->loc;
       advance();
-      auto rhs = parseAdditive();
+      auto rhs = parseShift();
       if (!rhs) return std::nullopt;
       lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
     }
@@ -1305,14 +1367,56 @@ std::optional<std::unique_ptr<Expr>> Parser::parseConditionalExpr() {
     return lhs;
   };
 
-  auto parseLogicalAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
+  auto parseBitAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
     auto lhs = parseEquality();
+    if (!lhs) return std::nullopt;
+    while (cur_.kind == TokenKind::Amp) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseEquality();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseBitXor = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseBitAnd();
+    if (!lhs) return std::nullopt;
+    while (cur_.kind == TokenKind::Caret) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseBitAnd();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseBitOr = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseBitXor();
+    if (!lhs) return std::nullopt;
+    while (cur_.kind == TokenKind::Pipe) {
+      TokenKind op = cur_.kind;
+      SourceLocation l = (*lhs)->loc;
+      advance();
+      auto rhs = parseBitXor();
+      if (!rhs) return std::nullopt;
+      lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
+    }
+    return lhs;
+  };
+
+  auto parseLogicalAnd = [&]() -> std::optional<std::unique_ptr<Expr>> {
+    auto lhs = parseBitOr();
     if (!lhs) return std::nullopt;
     while (cur_.kind == TokenKind::AmpAmp) {
       TokenKind op = cur_.kind;
       SourceLocation l = (*lhs)->loc;
       advance();
-      auto rhs = parseEquality();
+      auto rhs = parseBitOr();
       if (!rhs) return std::nullopt;
       lhs = std::make_unique<BinaryExpr>(l, op, std::move(*lhs), std::move(*rhs));
     }

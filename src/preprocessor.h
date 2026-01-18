@@ -33,6 +33,8 @@ private:
   std::unordered_map<std::string, Macro> macros_;
   std::vector<std::string> includePaths_;
   std::vector<std::string> systemIncludePaths_;
+  std::string builtinDate_;
+  std::string builtinTime_;
   std::vector<std::string> errors_;
 
   bool processFile(const std::string& path, const std::string& source, std::string& out);
@@ -42,9 +44,10 @@ private:
       std::vector<IfState>& ifs, std::string& out);
 
   bool evalIfExpr(const std::string& expr, bool& out, std::string& err);
-  std::string expandLine(const std::string& line);
+  std::string expandLine(const std::string& line, const std::string& path, int lineNo);
   std::string expandText(
-      const std::string& text, std::unordered_map<std::string, bool>& expanding, int depth);
+      const std::string& text, const std::string& path, int lineNo,
+      std::unordered_map<std::string, bool>& expanding, int depth);
 
   bool report(const std::string& path, int line, int col, const std::string& msg);
   bool readFile(const std::string& path, std::string& out);

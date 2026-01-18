@@ -87,21 +87,83 @@ static bool tuHasMain(const c99cc::AstTranslationUnit& tu) {
   return false;
 }
 
+static std::string replaceExtensionWithObj(const std::string& path) {
+  size_t slash = path.find_last_of("/\\");
+  size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+    return path + ".o";
+  }
+  return path.substr(0, dot) + ".o";
+}
+
+static std::string createTempObjPath() {
+  llvm::SmallString<128> tmp;
+  std::error_code ec = llvm::sys::fs::createTemporaryFile("c99cc", "o", tmp);
+  if (ec) {
+    llvm::errs() << "Could not create temporary file: " << ec.message() << "\n";
+    std::exit(1);
+  }
+  return tmp.str().str();
+}
+
+static bool compileToObject(
+    const std::string& inputPath,
+    const std::vector<std::string>& includePaths,
+    const std::vector<std::string>& systemIncludePaths,
+    const std::string& objPath,
+    bool& hasMainOut) {
+  std::string source = readFileOrDie(inputPath);
+
+  c99cc::Preprocessor pp(includePaths, systemIncludePaths);
+  auto preprocessed = pp.run(inputPath, source);
+  if (!preprocessed) {
+    return false;
+  }
+  source = *preprocessed;
+
+  c99cc::Diagnostics diags;
+  c99cc::Lexer lex(source, diags);
+  c99cc::Parser parser(lex, diags);
+
+  auto tuOpt = parser.parse();
+  if (!tuOpt || diags.hasError()) {
+    diags.printAll(inputPath, source);
+    return false;
+  }
+
+  if (tuHasMain(*tuOpt)) hasMainOut = true;
+
+  c99cc::Sema sema(diags);
+  if (!sema.run(*tuOpt) || diags.hasError()) {
+    diags.printAll(inputPath, source);
+    return false;
+  }
+
+  llvm::LLVMContext ctx;
+  auto mod = c99cc::CodeGen::emitLLVM(ctx, *tuOpt, inputPath);
+  writeObjOrDie(*mod, objPath);
+  return true;
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::cerr << "usage: c99cc <input.c> [-o <output>] [-I <path>] [-isystem <path>]\n";
+    std::cerr
+        << "usage: c99cc <input.c>... [-o <output>] [-c] [-I <path>] [-isystem <path>]\n";
     return 1;
   }
 
-  std::string inputPath = argv[1];
   std::string outPath = "a.out";
+  bool compileOnly = false;
+  std::vector<std::string> inputPaths;
   std::vector<std::string> includePaths;
   std::vector<std::string> systemIncludePaths;
 
-  for (int i = 2; i < argc; i++) {
+  for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "-o" && i + 1 < argc) {
       outPath = argv[++i];
+    } else if (a == "-c") {
+      compileOnly = true;
     } else if (a == "-I" && i + 1 < argc) {
       includePaths.push_back(argv[++i]);
     } else if (a == "-I") {
@@ -114,54 +176,63 @@ int main(int argc, char** argv) {
     } else if (a == "-isystem") {
       std::cerr << "missing path after -isystem\n";
       return 1;
-    } else {
+    } else if (!a.empty() && a[0] == '-') {
       std::cerr << "unknown arg: " << a << "\n";
       return 1;
+    } else {
+      inputPaths.push_back(a);
     }
   }
 
-  std::string source = readFileOrDie(inputPath);
-
-  c99cc::Preprocessor pp(std::move(includePaths), std::move(systemIncludePaths));
-  auto preprocessed = pp.run(inputPath, source);
-  if (!preprocessed) {
-    return 1;
-  }
-  source = *preprocessed;
-
-  c99cc::Diagnostics diags;
-  c99cc::Lexer lex(source, diags);
-  c99cc::Parser parser(lex, diags);
-
-  auto tuOpt = parser.parse();
-  if (!tuOpt || diags.hasError()) {
-    diags.printAll(inputPath, source);
+  if (inputPaths.empty()) {
+    std::cerr << "error: no input files\n";
     return 1;
   }
 
-  // Optional but helpful: fail early if no main declared/defined
-  if (!tuHasMain(*tuOpt)) {
-    std::cerr << "error: no 'main' function defined\n";
+  if (compileOnly && inputPaths.size() > 1 && outPath != "a.out") {
+    std::cerr << "error: -o with -c requires a single input file\n";
     return 1;
   }
 
-  c99cc::Sema sema(diags);
-  if (!sema.run(*tuOpt) || diags.hasError()) {
-    diags.printAll(inputPath, source);
-    return 1;
+  bool hasMain = false;
+  std::vector<std::string> objPaths;
+  objPaths.reserve(inputPaths.size());
+
+  for (size_t i = 0; i < inputPaths.size(); i++) {
+    const std::string& inputPath = inputPaths[i];
+    std::string objPath;
+    if (compileOnly) {
+      if (inputPaths.size() == 1 && outPath != "a.out") {
+        objPath = outPath;
+      } else {
+        objPath = replaceExtensionWithObj(inputPath);
+      }
+    } else {
+      objPath = createTempObjPath();
+    }
+    if (!compileToObject(
+            inputPath, includePaths, systemIncludePaths, objPath, hasMain)) {
+      return 1;
+    }
+    objPaths.push_back(objPath);
   }
 
-  llvm::LLVMContext ctx;
-  auto mod = c99cc::CodeGen::emitLLVM(ctx, *tuOpt, inputPath);
+  if (!compileOnly) {
+    if (!hasMain) {
+      std::cerr << "error: no 'main' function defined\n";
+      return 1;
+    }
 
-  std::string objPath = outPath + ".o";
-  writeObjOrDie(*mod, objPath);
-
-  std::string cmd = "clang \"" + objPath + "\" -o \"" + outPath + "\"";
-  int rc = std::system(cmd.c_str());
-  if (rc != 0) {
-    std::cerr << "link failed (cmd=" << cmd << ")\n";
-    return 1;
+    std::string cmd = "clang";
+    for (const auto& obj : objPaths) {
+      cmd += " \"" + obj + "\"";
+    }
+    cmd += " -o \"" + outPath + "\"";
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      std::cerr << "link failed (cmd=" << cmd << ")\n";
+      return 1;
+    }
   }
 
   return 0;

@@ -1,4 +1,5 @@
 #pragma once
+#include <optional>
 #include <string>
 #include "diag.h"
 
@@ -9,6 +10,8 @@ enum class TokenKind {
   Identifier,
   IntegerLiteral,
   FloatLiteral,
+  CharLiteral,
+  StringLiteral,
 
   KwChar,
   KwShort,
@@ -41,8 +44,11 @@ enum class TokenKind {
   Colon,
 
   Plus, Minus, Star, Slash,
+  Percent,
   Assign,
   Amp,    // &
+  Pipe,   // |
+  Caret,  // ^
 
   Comma,
 
@@ -62,6 +68,22 @@ enum class TokenKind {
 
   Dot,      // .
   Arrow,    // ->
+
+  PlusPlus,  // ++
+  MinusMinus, // --
+
+  PlusAssign,     // +=
+  MinusAssign,    // -=
+  StarAssign,     // *=
+  SlashAssign,    // /=
+  PercentAssign,  // %=
+  AmpAssign,      // &=
+  PipeAssign,     // |=
+  CaretAssign,    // ^=
+  LessLess,       // <<
+  GreaterGreater, // >>
+  LessLessAssign, // <<=
+  GreaterGreaterAssign // >>=
 };
 
 struct Token {
@@ -83,6 +105,9 @@ private:
   void skipWhitespace();
   Token lexIdentifierOrKeyword();
   Token lexNumber();
+  Token lexStringLiteral();
+  Token lexCharLiteral();
+  std::optional<char> parseEscapeChar(SourceLocation loc);
 
   const std::string& input_;
   Diagnostics& diags_;

@@ -74,6 +74,10 @@ static bool isScalarType(const Type& t) {
   return t.isNumeric() || t.isPointer();
 }
 
+static const StringLiteralExpr* asStringLiteral(const Expr& e) {
+  return dynamic_cast<const StringLiteralExpr*>(&e);
+}
+
 static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr);
 
 static Type promoteInteger(const Type& t) {
@@ -170,6 +174,27 @@ static bool hasInvalidArraySize(const Type& t, bool allowFirstEmpty) {
   return false;
 }
 
+static bool fillArraySizeFromString(DeclItem& item, Diagnostics& diags) {
+  if (!item.type.isArray() || item.type.arrayDims.empty()) return true;
+  if (item.type.arrayDims[0].has_value()) return true;
+  if (!item.initExpr) {
+    diags.error(item.nameLoc, "invalid array size");
+    return false;
+  }
+  auto* str = dynamic_cast<StringLiteralExpr*>(item.initExpr.get());
+  if (!str) {
+    diags.error(item.nameLoc, "invalid array size");
+    return false;
+  }
+  Type elem = item.type.elementType();
+  if (elem.base != Type::Base::Char || elem.ptrDepth != 0 || !elem.arrayDims.empty()) {
+    diags.error(item.nameLoc, "invalid array size");
+    return false;
+  }
+  item.type.arrayDims[0] = str->value.size() + 1;
+  return true;
+}
+
 static bool requiresStructDef(const Type& t) {
   return t.base == Type::Base::Struct && t.ptrDepth == 0;
 }
@@ -261,6 +286,21 @@ static bool checkInitializer(
   }
 
   if (target.isArray() && !target.ptrOutsideArrays) {
+    if (auto* str = asStringLiteral(init)) {
+      Type elem = target.elementType();
+      if (elem.base != Type::Base::Char || elem.ptrDepth != 0 || !elem.arrayDims.empty()) {
+        diags.error(init.loc, "invalid string initializer");
+        return false;
+      }
+      if (!target.arrayDims.empty() && target.arrayDims[0].has_value()) {
+        size_t need = str->value.size() + 1;
+        if (*target.arrayDims[0] < need) {
+          diags.error(init.loc, "string initializer too long");
+          return false;
+        }
+      }
+      return true;
+    }
     if (allowArrayInit) {
       diags.error(init.loc, "invalid initializer for array");
     } else {
@@ -418,7 +458,7 @@ static void checkStmtImpl(
 
   if (auto* decl = dynamic_cast<DeclStmt*>(&s)) {
     auto& cur = scopes.back();
-    for (const auto& item : decl->items) {
+    for (auto& item : decl->items) {
       if (cur.count(item.name)) {
         diags.error(item.nameLoc, "redefinition of '" + item.name + "'");
         return;
@@ -433,6 +473,9 @@ static void checkStmtImpl(
       }
       if (item.type.isVoidObject()) {
         diags.error(item.nameLoc, "invalid use of void type");
+        return;
+      }
+      if (!fillArraySizeFromString(item, diags)) {
         return;
       }
       if (hasInvalidArraySize(item.type, /*allowFirstEmpty=*/false)) {
@@ -455,9 +498,11 @@ static void checkStmtImpl(
       // initializer cannot reference the variable being declared:
       // keep behavior by checking before insertion.
       if (item.initExpr) {
-        if (item.type.isArray()) {
-          diags.error(item.nameLoc, "array initializer not supported");
-          return;
+        if (item.type.isArray() && !item.type.ptrOutsideArrays) {
+          if (!asStringLiteral(*item.initExpr)) {
+            diags.error(item.nameLoc, "array initializer not supported");
+            return;
+          }
         }
         if (!checkInitializer(diags, scopes, fns, structs, enums,
                               item.type, *item.initExpr, false)) {
@@ -614,10 +659,34 @@ static std::optional<Type> checkExprImpl(
     e.semaType = t;
     return t;
   }
+  if (dynamic_cast<StringLiteralExpr*>(&e)) {
+    Type t;
+    t.base = Type::Base::Char;
+    t.ptrDepth = 1;
+    e.semaType = t;
+    return t;
+  }
 
   if (dynamic_cast<InitListExpr*>(&e)) {
     diags.error(e.loc, "initializer list not allowed here");
     return std::nullopt;
+  }
+
+  if (auto* inc = dynamic_cast<IncDecExpr*>(&e)) {
+    auto lvTy = checkLValue(diags, scopes, fns, structs, enums, *inc->operand,
+                            "expected lvalue for increment/decrement",
+                            /*isAssign=*/true);
+    if (!lvTy) return std::nullopt;
+    if (lvTy->isPointer() && lvTy->isVoidPointer()) {
+      diags.error(inc->loc, "invalid operand to ++/--");
+      return std::nullopt;
+    }
+    if (!lvTy->isInteger() && !lvTy->isPointer()) {
+      diags.error(inc->loc, "invalid operand to ++/--");
+      return std::nullopt;
+    }
+    e.semaType = *lvTy;
+    return *lvTy;
   }
 
   if (auto* sz = dynamic_cast<SizeofExpr*>(&e)) {
@@ -727,11 +796,68 @@ static std::optional<Type> checkExprImpl(
                              "expected lvalue on left-hand side of assignment",
                              /*isAssign=*/true);
     auto rhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *asn->rhs);
-    if (lhsTy && rhsTy && !isAssignable(*lhsTy, *rhsTy, *asn->rhs)) {
-      diags.error(asn->loc, "incompatible assignment");
+    if (!lhsTy || !rhsTy) return std::nullopt;
+    if (asn->op == TokenKind::Assign) {
+      if (!isAssignable(*lhsTy, *rhsTy, *asn->rhs)) {
+        diags.error(asn->loc, "incompatible assignment");
+      }
+      e.semaType = *lhsTy;
+      return *lhsTy;
     }
-    if (lhsTy) e.semaType = *lhsTy;
-    return lhsTy;
+
+    auto report = [&](const std::string& msg) -> std::optional<Type> {
+      diags.error(asn->loc, msg);
+      return std::nullopt;
+    };
+
+    switch (asn->op) {
+      case TokenKind::PlusAssign:
+      case TokenKind::MinusAssign: {
+        if (lhsTy->isNumeric() && rhsTy->isNumeric()) {
+          e.semaType = *lhsTy;
+          return *lhsTy;
+        }
+        if (lhsTy->isPointer() && rhsTy->isInteger() && !lhsTy->isVoidPointer()) {
+          e.semaType = *lhsTy;
+          return *lhsTy;
+        }
+        return report("invalid operands to pointer arithmetic");
+      }
+      case TokenKind::StarAssign:
+      case TokenKind::SlashAssign: {
+        if (!lhsTy->isNumeric() || !rhsTy->isNumeric()) {
+          return report("invalid operands to compound assignment");
+        }
+        e.semaType = *lhsTy;
+        return *lhsTy;
+      }
+      case TokenKind::PercentAssign: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          return report("invalid operands to compound assignment");
+        }
+        e.semaType = *lhsTy;
+        return *lhsTy;
+      }
+      case TokenKind::LessLessAssign:
+      case TokenKind::GreaterGreaterAssign: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          return report("invalid operands to shift operator");
+        }
+        e.semaType = *lhsTy;
+        return *lhsTy;
+      }
+      case TokenKind::AmpAssign:
+      case TokenKind::PipeAssign:
+      case TokenKind::CaretAssign: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          return report("invalid operands to bitwise operator");
+        }
+        e.semaType = *lhsTy;
+        return *lhsTy;
+      }
+      default:
+        return report("invalid operands to compound assignment");
+    }
   }
 
   if (auto* ter = dynamic_cast<TernaryExpr*>(&e)) {
@@ -917,6 +1043,36 @@ static std::optional<Type> checkExprImpl(
           return std::nullopt;
         }
         Type t = commonNumericType(*lhsTy, *rhsTy);
+        e.semaType = t;
+        return t;
+      }
+      case TokenKind::Percent: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          diags.error(bin->loc, "invalid operands to arithmetic operator");
+          return std::nullopt;
+        }
+        Type t = commonIntegerType(*lhsTy, *rhsTy);
+        e.semaType = t;
+        return t;
+      }
+      case TokenKind::LessLess:
+      case TokenKind::GreaterGreater: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          diags.error(bin->loc, "invalid operands to shift operator");
+          return std::nullopt;
+        }
+        Type t = promoteInteger(*lhsTy);
+        e.semaType = t;
+        return t;
+      }
+      case TokenKind::Amp:
+      case TokenKind::Pipe:
+      case TokenKind::Caret: {
+        if (!lhsTy->isInteger() || !rhsTy->isInteger()) {
+          diags.error(bin->loc, "invalid operands to bitwise operator");
+          return std::nullopt;
+        }
+        Type t = commonIntegerType(*lhsTy, *rhsTy);
         e.semaType = t;
         return t;
       }
@@ -1148,11 +1304,11 @@ bool Sema::run(AstTranslationUnit& tu) {
     ScopeStack scopes;
     scopes.push_back({});
 
-    for (const auto& item : tu.items) {
+    for (auto& item : tu.items) {
       auto* g = std::get_if<GlobalVarDecl>(&item);
       if (!g) continue;
 
-      for (const auto& decl : g->items) {
+      for (auto& decl : g->items) {
         if (scopes.back().count(decl.name)) {
           diags_.error(decl.nameLoc, "redefinition of '" + decl.name + "'");
           return false;
@@ -1167,6 +1323,9 @@ bool Sema::run(AstTranslationUnit& tu) {
         }
         if (!isValidUnsignedUse(decl.type)) {
           diags_.error(decl.nameLoc, "invalid use of unsigned type");
+          return false;
+        }
+        if (!fillArraySizeFromString(decl, diags_)) {
           return false;
         }
         if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/false)) {
@@ -1187,9 +1346,11 @@ bool Sema::run(AstTranslationUnit& tu) {
         }
 
         if (decl.initExpr) {
-          if (decl.type.isArray()) {
-            diags_.error(decl.nameLoc, "array initializer not supported");
-            return false;
+          if (decl.type.isArray() && !decl.type.ptrOutsideArrays) {
+            if (!asStringLiteral(*decl.initExpr)) {
+              diags_.error(decl.nameLoc, "array initializer not supported");
+              return false;
+            }
           }
           if (!checkInitializer(diags_, scopes, fns, structs, enumConsts,
                                 decl.type, *decl.initExpr, false)) {

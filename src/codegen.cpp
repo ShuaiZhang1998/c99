@@ -153,6 +153,10 @@ static llvm::Value* i32Const(CGEnv& env, int64_t v) {
   return llvm::ConstantInt::get(env.i32Ty(), (uint64_t)v, true);
 }
 
+static llvm::Value* emitStringLiteral(CGEnv& env, const std::string& value) {
+  return env.b.CreateGlobalStringPtr(value, ".str");
+}
+
 static llvm::Value* castIntegerToType(CGEnv& env, llvm::Value* v, const Type& src, const Type& dst) {
   llvm::Type* dstTy = llvmType(env, dst);
   if (v->getType() == dstTy) return v;
@@ -262,6 +266,20 @@ static Type typeFromRank(int rank) {
     default: t.base = Type::Base::Int; break;
   }
   return t;
+}
+
+static Type promoteInteger(const Type& t) {
+  Type res = t;
+  if (!t.isInteger()) return res;
+  if (t.base == Type::Base::Enum) {
+    res.base = Type::Base::Int;
+    res.enumName.clear();
+    return res;
+  }
+  if (t.base == Type::Base::Char || t.base == Type::Base::Short) {
+    res.base = Type::Base::Int;
+  }
+  return res;
 }
 
 static Type commonIntegerType(const Type& lhs, const Type& rhs) {
@@ -425,6 +443,25 @@ static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm
 }
 
 static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const Expr& init) {
+  if (auto* str = dynamic_cast<const StringLiteralExpr*>(&init)) {
+    if (ty.isArray() && !ty.ptrOutsideArrays) {
+      Type elemTy = ty.elementType();
+      if (elemTy.base == Type::Base::Char && elemTy.ptrDepth == 0 && elemTy.arrayDims.empty()) {
+        if (ty.arrayDims.empty() || !ty.arrayDims[0].has_value()) return;
+        size_t size = *ty.arrayDims[0];
+        llvm::Type* arrTy = llvmType(env, ty);
+        for (size_t i = 0; i < size; ++i) {
+          llvm::Value* idxs[] = {i32Const(env, 0), i32Const(env, static_cast<int64_t>(i))};
+          llvm::Value* elemAddr = env.b.CreateGEP(arrTy, addr, idxs, "init.str");
+          uint8_t ch = 0;
+          if (i < str->value.size()) ch = static_cast<uint8_t>(str->value[i]);
+          llvm::Value* v = llvm::ConstantInt::get(llvmType(env, elemTy), ch, false);
+          env.b.CreateStore(v, elemAddr);
+        }
+        return;
+      }
+    }
+  }
   if (auto* list = dynamic_cast<const InitListExpr*>(&init)) {
     if (ty.base == Type::Base::Struct && ty.ptrDepth == 0) {
       auto it = env.structFields.find(ty.structName);
@@ -675,6 +712,34 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       }
       return env.b.CreateSDiv(L, R, "div");
     }
+    case TokenKind::Percent: {
+      if (lhsTy.isInteger() && rhsTy.isInteger()) {
+        const Type& resTy = exprType(bin);
+        L = castNumericToType(env, L, lhsTy, resTy);
+        R = castNumericToType(env, R, rhsTy, resTy);
+        if (resTy.isUnsigned) return env.b.CreateURem(L, R, "urem");
+      }
+      return env.b.CreateSRem(L, R, "srem");
+    }
+    case TokenKind::LessLess:
+    case TokenKind::GreaterGreater: {
+      const Type& resTy = exprType(bin);
+      L = castNumericToType(env, L, lhsTy, resTy);
+      R = castNumericToType(env, R, rhsTy, resTy);
+      if (bin.op == TokenKind::LessLess) return env.b.CreateShl(L, R, "shl");
+      if (resTy.isUnsigned) return env.b.CreateLShr(L, R, "lshr");
+      return env.b.CreateAShr(L, R, "ashr");
+    }
+    case TokenKind::Amp:
+    case TokenKind::Pipe:
+    case TokenKind::Caret: {
+      const Type& resTy = exprType(bin);
+      L = castNumericToType(env, L, lhsTy, resTy);
+      R = castNumericToType(env, R, rhsTy, resTy);
+      if (bin.op == TokenKind::Amp) return env.b.CreateAnd(L, R, "and");
+      if (bin.op == TokenKind::Pipe) return env.b.CreateOr(L, R, "or");
+      return env.b.CreateXor(L, R, "xor");
+    }
 
     case TokenKind::Comma:
       return R;
@@ -895,6 +960,29 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     return llvm::ConstantFP::get(ty, flt->value);
   }
 
+  if (auto* str = dynamic_cast<const StringLiteralExpr*>(&e)) {
+    return emitStringLiteral(env, str->value);
+  }
+
+  if (auto* inc = dynamic_cast<const IncDecExpr*>(&e)) {
+    llvm::Value* addr = emitLValue(env, *inc->operand);
+    if (!addr) return i32Const(env, 0);
+    Type opTy = exprType(*inc->operand);
+    llvm::Value* oldV = env.b.CreateLoad(llvmType(env, opTy), addr, "incdec.old");
+    llvm::Value* newV = nullptr;
+    if (opTy.isPointer()) {
+      llvm::Type* elemTy = oldV->getType()->getPointerElementType();
+      llvm::Value* idx = llvm::ConstantInt::get(env.b.getInt64Ty(), inc->isInc ? 1 : -1, true);
+      newV = env.b.CreateGEP(elemTy, oldV, idx, "incdec.ptr");
+    } else {
+      llvm::Value* one = llvm::ConstantInt::get(oldV->getType(), 1, true);
+      newV = inc->isInc ? env.b.CreateAdd(oldV, one, "incdec.add")
+                        : env.b.CreateSub(oldV, one, "incdec.sub");
+    }
+    env.b.CreateStore(newV, addr);
+    return inc->isPost ? oldV : newV;
+  }
+
   if (auto* sz = dynamic_cast<const SizeofExpr*>(&e)) {
     Type t = sz->isType ? sz->type : exprType(*sz->expr);
     uint64_t size = sizeOfType(t, env);
@@ -1068,15 +1156,99 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
     llvm::Value* addr = emitLValue(env, *asn->lhs);
     const Type& lhsTy = exprType(*asn->lhs);
+    const Type& rhsTy = exprType(*asn->rhs);
     llvm::Value* rhsV = emitExpr(env, *asn->rhs);
+
+    if (asn->op != TokenKind::Assign) {
+      llvm::Value* lhsV = env.b.CreateLoad(llvmType(env, lhsTy), addr, "assign.lhs");
+      llvm::Value* newV = nullptr;
+      Type resultTy = lhsTy;
+      if (asn->op == TokenKind::PlusAssign || asn->op == TokenKind::MinusAssign) {
+        if (lhsTy.isPointer() && rhsTy.isInteger()) {
+          llvm::Value* idx = castIndex(env, rhsV, rhsTy);
+          if (asn->op == TokenKind::MinusAssign) {
+            llvm::Value* zero = llvm::ConstantInt::get(idx->getType(), 0, true);
+            idx = env.b.CreateSub(zero, idx, "neg");
+          }
+          llvm::Type* elemTy = lhsV->getType()->getPointerElementType();
+          newV = env.b.CreateGEP(elemTy, lhsV, idx, "ptr.add");
+        } else {
+          Type resTy = commonNumericType(lhsTy, rhsTy);
+          resultTy = resTy;
+          llvm::Value* L = castNumericToType(env, lhsV, lhsTy, resTy);
+          llvm::Value* R = castNumericToType(env, rhsV, rhsTy, resTy);
+          if (resTy.isFloating()) {
+            newV = (asn->op == TokenKind::PlusAssign)
+                      ? env.b.CreateFAdd(L, R, "fadd")
+                      : env.b.CreateFSub(L, R, "fsub");
+          } else {
+            newV = (asn->op == TokenKind::PlusAssign)
+                      ? env.b.CreateAdd(L, R, "add")
+                      : env.b.CreateSub(L, R, "sub");
+          }
+        }
+      } else if (asn->op == TokenKind::StarAssign || asn->op == TokenKind::SlashAssign) {
+        Type resTy = commonNumericType(lhsTy, rhsTy);
+        resultTy = resTy;
+        llvm::Value* L = castNumericToType(env, lhsV, lhsTy, resTy);
+        llvm::Value* R = castNumericToType(env, rhsV, rhsTy, resTy);
+        if (resTy.isFloating()) {
+          newV = (asn->op == TokenKind::StarAssign)
+                    ? env.b.CreateFMul(L, R, "fmul")
+                    : env.b.CreateFDiv(L, R, "fdiv");
+        } else {
+          newV = (asn->op == TokenKind::StarAssign)
+                    ? env.b.CreateMul(L, R, "mul")
+                    : (resTy.isUnsigned ? env.b.CreateUDiv(L, R, "udiv")
+                                        : env.b.CreateSDiv(L, R, "sdiv"));
+        }
+      } else if (asn->op == TokenKind::PercentAssign) {
+        Type resTy = commonIntegerType(lhsTy, rhsTy);
+        resultTy = resTy;
+        llvm::Value* L = castNumericToType(env, lhsV, lhsTy, resTy);
+        llvm::Value* R = castNumericToType(env, rhsV, rhsTy, resTy);
+        newV = resTy.isUnsigned ? env.b.CreateURem(L, R, "urem")
+                                : env.b.CreateSRem(L, R, "srem");
+      } else if (asn->op == TokenKind::LessLessAssign || asn->op == TokenKind::GreaterGreaterAssign) {
+        Type resTy = promoteInteger(lhsTy);
+        resultTy = resTy;
+        llvm::Value* L = castNumericToType(env, lhsV, lhsTy, resTy);
+        llvm::Value* R = castNumericToType(env, rhsV, rhsTy, resTy);
+        if (asn->op == TokenKind::LessLessAssign) {
+          newV = env.b.CreateShl(L, R, "shl");
+        } else if (resTy.isUnsigned) {
+          newV = env.b.CreateLShr(L, R, "lshr");
+        } else {
+          newV = env.b.CreateAShr(L, R, "ashr");
+        }
+      } else if (asn->op == TokenKind::AmpAssign || asn->op == TokenKind::PipeAssign ||
+                 asn->op == TokenKind::CaretAssign) {
+        Type resTy = commonIntegerType(lhsTy, rhsTy);
+        resultTy = resTy;
+        llvm::Value* L = castNumericToType(env, lhsV, lhsTy, resTy);
+        llvm::Value* R = castNumericToType(env, rhsV, rhsTy, resTy);
+        if (asn->op == TokenKind::AmpAssign) newV = env.b.CreateAnd(L, R, "and");
+        else if (asn->op == TokenKind::PipeAssign) newV = env.b.CreateOr(L, R, "or");
+        else newV = env.b.CreateXor(L, R, "xor");
+      }
+
+      if (!newV) return i32Const(env, 0);
+      llvm::Value* storeV = newV;
+      if (lhsTy.isNumeric() && storeV->getType() != llvmType(env, lhsTy)) {
+        storeV = castNumericToType(env, storeV, resultTy, lhsTy);
+      }
+      env.b.CreateStore(storeV, addr);
+      return storeV;
+    }
+
     if (lhsTy.isPointer() && isNullPointerLiteral(*asn->rhs)) {
       llvm::Type* ptrTy = llvmType(env, lhsTy);
       rhsV = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy));
-    } else if (lhsTy.isPointer() && exprType(*asn->rhs).isPointer()) {
+    } else if (lhsTy.isPointer() && rhsTy.isPointer()) {
       llvm::Type* ptrTy = llvmType(env, lhsTy);
       rhsV = castPointerIfNeeded(env, rhsV, ptrTy);
-    } else if (lhsTy.isNumeric() && exprType(*asn->rhs).isNumeric()) {
-      rhsV = castNumericToType(env, rhsV, exprType(*asn->rhs), lhsTy);
+    } else if (lhsTy.isNumeric() && rhsTy.isNumeric()) {
+      rhsV = castNumericToType(env, rhsV, rhsTy, lhsTy);
     }
     env.b.CreateStore(rhsV, addr);
     return rhsV;

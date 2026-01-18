@@ -1,7 +1,9 @@
 #include "preprocessor.h"
 
 #include <cctype>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -12,7 +14,20 @@ Preprocessor::Preprocessor(
     std::vector<std::string> includePaths,
     std::vector<std::string> systemIncludePaths)
     : includePaths_(std::move(includePaths)),
-      systemIncludePaths_(std::move(systemIncludePaths)) {}
+      systemIncludePaths_(std::move(systemIncludePaths)) {
+  std::time_t now = std::time(nullptr);
+  std::tm tm = *std::localtime(&now);
+  {
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%b %e %Y");
+    builtinDate_ = oss.str();
+  }
+  {
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%H:%M:%S");
+    builtinTime_ = oss.str();
+  }
+}
 
 void Preprocessor::addIncludePath(const std::string& path) {
   includePaths_.push_back(path);
@@ -52,6 +67,16 @@ static std::string rtrim(const std::string& s) {
 }
 
 static std::string stringize(const std::string& raw) {
+  std::string out = "\"";
+  for (char c : raw) {
+    if (c == '\\' || c == '"') out.push_back('\\');
+    out.push_back(c);
+  }
+  out.push_back('"');
+  return out;
+}
+
+static std::string toStringLiteral(const std::string& raw) {
   std::string out = "\"";
   for (char c : raw) {
     if (c == '\\' || c == '"') out.push_back('\\');
@@ -207,7 +232,7 @@ bool Preprocessor::processLines(const std::string& path, const std::string& sour
     }
 
     if (curActive) {
-      out.append(expandLine(line));
+      out.append(expandLine(line, path, lineNo));
       out.push_back('\n');
     }
     lineNo++;
@@ -699,7 +724,7 @@ bool Preprocessor::evalIfExpr(const std::string& expr, bool& out, std::string& e
   return true;
 }
 
-std::string Preprocessor::expandLine(const std::string& line) {
+std::string Preprocessor::expandLine(const std::string& line, const std::string& path, int lineNo) {
   size_t commentPos = line.find("//");
   std::string code = line;
   std::string comment;
@@ -709,13 +734,14 @@ std::string Preprocessor::expandLine(const std::string& line) {
   }
 
   std::unordered_map<std::string, bool> expanding;
-  std::string expanded = expandText(code, expanding, 0);
+  std::string expanded = expandText(code, path, lineNo, expanding, 0);
   if (!comment.empty()) expanded += comment;
   return expanded;
 }
 
 std::string Preprocessor::expandText(
-    const std::string& text, std::unordered_map<std::string, bool>& expanding, int depth) {
+    const std::string& text, const std::string& path, int lineNo,
+    std::unordered_map<std::string, bool>& expanding, int depth) {
   if (depth > 32) return text;
   std::string out;
   size_t i = 0;
@@ -743,6 +769,22 @@ std::string Preprocessor::expandText(
       i++;
       while (i < text.size() && isIdentChar(text[i])) i++;
       std::string name = text.substr(start, i - start);
+      if (name == "__LINE__") {
+        out += std::to_string(lineNo);
+        continue;
+      }
+      if (name == "__FILE__") {
+        out += toStringLiteral(path);
+        continue;
+      }
+      if (name == "__DATE__") {
+        out += toStringLiteral(builtinDate_);
+        continue;
+      }
+      if (name == "__TIME__") {
+        out += toStringLiteral(builtinTime_);
+        continue;
+      }
       auto it = macros_.find(name);
       if (it != macros_.end() && !expanding[name]) {
         const Macro& macro = it->second;
@@ -809,7 +851,7 @@ std::string Preprocessor::expandText(
                 std::vector<std::string> expArgs;
                 expArgs.reserve(args.size());
                 for (const auto& a : args) {
-                  expArgs.push_back(expandText(a, expanding, depth + 1));
+                  expArgs.push_back(expandText(a, path, lineNo, expanding, depth + 1));
                 }
                 std::string varRaw;
                 std::string varExpanded;
@@ -835,7 +877,7 @@ std::string Preprocessor::expandText(
                     macro.body, macro.params, fixedRaw, fixedExpanded,
                     macro.variadic, varRaw, varExpanded);
                 expanding[name] = true;
-                out += expandText(replaced, expanding, depth + 1);
+                out += expandText(replaced, path, lineNo, expanding, depth + 1);
                 expanding[name] = false;
                 i = pos;
                 continue;
@@ -845,7 +887,7 @@ std::string Preprocessor::expandText(
           out += name;
         } else {
           expanding[name] = true;
-          out += expandText(macro.body, expanding, depth + 1);
+          out += expandText(macro.body, path, lineNo, expanding, depth + 1);
           expanding[name] = false;
         }
       } else {
