@@ -116,7 +116,8 @@ static std::vector<std::string> buildRuntimeObjs() {
   std::vector<std::string> objs;
   for (const char* file : files) {
     std::string objPath = createTempObjPath();
-    std::string cmd = "clang -c \"" + std::string(file) + "\" -o \"" + objPath + "\"";
+    std::string cmd =
+        "clang -c -I \"include\" \"" + std::string(file) + "\" -o \"" + objPath + "\"";
     int rc = std::system(cmd.c_str());
     if (rc != 0) {
       std::cerr << "runtime compile failed (cmd=" << cmd << ")\n";
