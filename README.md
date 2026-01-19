@@ -63,7 +63,7 @@
 
 ### 标准库与运行时（最小）
 
-- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h`
+- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h`
 - `printf`（最小实现）：
   - 支持 `%d/%i/%c/%s/%f/%%`
   - 支持最小宽度
@@ -74,6 +74,7 @@
 - `stdlib.h`（最小实现：`atoi/atol/atoll`、`abs/labs/llabs`、`div/ldiv`、`exit/abort`）
 - `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
 - `ctype.h`（最小实现：`isdigit`、`isspace`）
+- 运行时编译使用 `-I include`，避免系统头文件宏与本项目最小实现冲突
 
 ## 构建
 
@@ -190,3 +191,11 @@ EOS
 - 标准库：仅提供最小头文件与极简 `printf`，无完整 libc 实现
 - 内存分配：`malloc/calloc/realloc/free` 为最小实现，不支持碎片整理与复用策略
 - 诊断与错误恢复：仍较有限
+
+## 接下来优先完善的 C 运行时（面向简单 C99 项目）
+
+- `stdio.h`：文件 I/O 与格式化 I/O（`fopen/fclose/fread/fwrite/fprintf/snprintf/scanf` 等）
+- `stdlib.h`：`rand/srand`、`strtol/strtoul/strtod`、`qsort/bsearch`、`getenv`
+- `string.h`：`strchr/strrchr/strstr/strtok`、`memchr`
+- `math.h`：`sqrt/pow/sin/cos` 等基础函数
+- `time.h` / `errno.h` / `assert.h` / `signal.h`
