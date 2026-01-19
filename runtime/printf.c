@@ -194,3 +194,13 @@ int printf(const char* fmt, ...) {
   va_end(ap);
   return count;
 }
+
+int putchar(int c) {
+  return write_char((char)c);
+}
+
+int puts(const char* s) {
+  int count = write_str(s);
+  write_char('\n');
+  return count + 1;
+}

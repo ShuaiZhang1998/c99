@@ -69,6 +69,11 @@
   - 支持最小宽度
   - 支持精度：`%f`（小数位）、`%s`（截断）
   - 不支持对齐标志、填充、符号、进制等扩展
+- `putchar/puts`
+- `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
+- `stdlib.h`（最小实现：`atoi/atol/atoll`、`abs/labs/llabs`、`div/ldiv`、`exit/abort`）
+- `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
+- `ctype.h`（最小实现：`isdigit`、`isspace`）
 
 ## 构建
 
@@ -183,4 +188,5 @@ EOS
 - 类型系统：无 `union`、位域、`_Bool`、`long double`
 - 作用域与存储期：`extern`/`static` 等存储类尚未覆盖
 - 标准库：仅提供最小头文件与极简 `printf`，无完整 libc 实现
+- 内存分配：`malloc/calloc/realloc/free` 为最小实现，不支持碎片整理与复用策略
 - 诊断与错误恢复：仍较有限
