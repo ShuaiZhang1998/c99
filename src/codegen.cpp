@@ -144,6 +144,41 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
   return ty;
 }
 
+static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name, const Type& type);
+
+static llvm::Type* abiReturnType(CGEnv& env, const Type& t) {
+  if (t.base == Type::Base::Struct && t.ptrDepth == 0) {
+    llvm::Type* stTy = llvmType(env, t);
+    uint64_t size = env.mod.getDataLayout().getTypeAllocSize(stTy);
+    if (size == 1) return llvm::Type::getInt8Ty(env.ctx);
+    if (size == 2) return llvm::Type::getInt16Ty(env.ctx);
+    if (size == 4) return llvm::Type::getInt32Ty(env.ctx);
+    if (size == 8) return llvm::Type::getInt64Ty(env.ctx);
+    if (size == 16) return llvm::Type::getInt128Ty(env.ctx);
+  }
+  return llvmType(env, t);
+}
+
+static llvm::Value* packReturnValue(CGEnv& env, const Type& t, llvm::Value* v) {
+  llvm::Type* abiTy = abiReturnType(env, t);
+  llvm::Type* irTy = llvmType(env, t);
+  if (abiTy == irTy) return v;
+  llvm::AllocaInst* tmp = createEntryAlloca(env, "ret.pack", t);
+  env.b.CreateStore(v, tmp);
+  llvm::Value* ip = env.b.CreateBitCast(tmp, llvm::PointerType::getUnqual(abiTy));
+  return env.b.CreateLoad(abiTy, ip, "ret.pack");
+}
+
+static llvm::Value* unpackReturnValue(CGEnv& env, const Type& t, llvm::Value* v) {
+  llvm::Type* abiTy = abiReturnType(env, t);
+  llvm::Type* irTy = llvmType(env, t);
+  if (abiTy == irTy) return v;
+  llvm::AllocaInst* tmp = createEntryAlloca(env, "ret.unpack", t);
+  llvm::Value* ip = env.b.CreateBitCast(tmp, llvm::PointerType::getUnqual(abiTy));
+  env.b.CreateStore(v, ip);
+  return env.b.CreateLoad(irTy, tmp, "ret.unpack");
+}
+
 static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name, const Type& type) {
   llvm::IRBuilder<> tmp(&env.fn->getEntryBlock(), env.fn->getEntryBlock().begin());
   return tmp.CreateAlloca(llvmType(env, type), nullptr, name);
@@ -1150,7 +1185,12 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
       argsV.push_back(emitExpr(env, *a));
     }
 
-    return env.b.CreateCall(callee, argsV, "calltmp");
+    llvm::Value* callV = env.b.CreateCall(callee, argsV, "calltmp");
+    const Type& resTy = exprType(*call);
+    if (resTy.base == Type::Base::Struct && resTy.ptrDepth == 0) {
+      callV = unpackReturnValue(env, resTy, callV);
+    }
+    return callV;
   }
 
   if (auto* ter = dynamic_cast<const TernaryExpr*>(&e)) {
@@ -1573,6 +1613,9 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     } else if (env.currentReturnType.isNumeric() && exprType(*r->valueExpr).isNumeric()) {
       retV = castNumericToType(env, retV, exprType(*r->valueExpr), env.currentReturnType);
     }
+    if (env.currentReturnType.base == Type::Base::Struct && env.currentReturnType.ptrDepth == 0) {
+      retV = packReturnValue(env, env.currentReturnType, retV);
+    }
     env.b.CreateRet(retV);
     return true;
   }
@@ -1699,7 +1742,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       paramTypes.push_back(adj);
       paramTys.push_back(llvmType(env, adj));
     }
-    auto* fnTy = llvm::FunctionType::get(llvmType(env, p->returnType), paramTys, p->isVariadic);
+    auto* fnTy = llvm::FunctionType::get(abiReturnType(env, p->returnType), paramTys, p->isVariadic);
     llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
     env.functions[name] = F;
     env.functionParamTypes.emplace(name, std::move(paramTypes));
@@ -1782,7 +1825,11 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
         llvm::Type* ptrTy = llvmType(env, p.returnType);
         builder.CreateRet(llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ptrTy)));
       } else {
-        builder.CreateRet(zeroValue(env, p.returnType));
+        llvm::Value* retV = zeroValue(env, p.returnType);
+        if (p.returnType.base == Type::Base::Struct && p.returnType.ptrDepth == 0) {
+          retV = packReturnValue(env, p.returnType, retV);
+        }
+        builder.CreateRet(retV);
       }
     }
 

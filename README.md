@@ -70,6 +70,8 @@
   - 支持精度：`%f`（小数位）、`%s`（截断）
   - 不支持对齐标志、填充、符号、进制等扩展
 - `putchar/puts`
+- `fopen/fclose/fread/fwrite/fprintf/sprintf/snprintf`（基础文件 I/O 与格式化 I/O）
+- `stdin/stdout/stderr`
 - `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
 - `stdlib.h`（最小实现：`atoi/atol/atoll`、`abs/labs/llabs`、`div/ldiv`、`exit/abort`）
 - `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
@@ -194,7 +196,7 @@ EOS
 
 ## 接下来优先完善的 C 运行时（面向简单 C99 项目）
 
-- `stdio.h`：文件 I/O 与格式化 I/O（`fopen/fclose/fread/fwrite/fprintf/snprintf/scanf` 等）
+- `stdio.h`：补齐 `scanf/sscanf` 与更完整的文件/缓冲 I/O
 - `stdlib.h`：`rand/srand`、`strtol/strtoul/strtod`、`qsort/bsearch`、`getenv`
 - `string.h`：`strchr/strrchr/strstr/strtok`、`memchr`
 - `math.h`：`sqrt/pow/sin/cos` 等基础函数

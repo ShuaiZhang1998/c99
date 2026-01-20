@@ -880,11 +880,24 @@ static std::optional<Type> checkExprImpl(
         return std::nullopt;
       }
     } else {
-      auto ty = checkExprImpl(diags, scopes, fns, structs, enums, *sz->expr);
-      if (!ty) return std::nullopt;
-      if (ty->isVoidObject()) {
-        diags.error(sz->loc, "sizeof of void");
-        return std::nullopt;
+      if (auto* vr = dynamic_cast<VarRefExpr*>(sz->expr.get())) {
+        auto ty = lookupVarType(scopes, vr->name);
+        if (!ty) {
+          diags.error(vr->loc, "use of undeclared identifier '" + vr->name + "'");
+          return std::nullopt;
+        }
+        if (ty->isVoidObject()) {
+          diags.error(sz->loc, "sizeof of void");
+          return std::nullopt;
+        }
+        vr->semaType = *ty;
+      } else {
+        auto ty = checkExprImpl(diags, scopes, fns, structs, enums, *sz->expr);
+        if (!ty) return std::nullopt;
+        if (ty->isVoidObject()) {
+          diags.error(sz->loc, "sizeof of void");
+          return std::nullopt;
+        }
       }
     }
     Type t;
