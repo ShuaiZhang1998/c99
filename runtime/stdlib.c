@@ -1,4 +1,4 @@
-#include <stddef.h>
+#include <stdlib.h>
 #include <stdint.h>
 
 #ifdef _WIN32
@@ -12,16 +12,6 @@ typedef struct {
   size_t size;
   size_t total;
 } BlockHeader;
-
-typedef struct {
-  int quot;
-  int rem;
-} div_t;
-
-typedef struct {
-  long quot;
-  long rem;
-} ldiv_t;
 
 static size_t round_up(size_t n, size_t align) {
   return (n + align - 1) / align * align;
