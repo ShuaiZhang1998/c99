@@ -1116,30 +1116,6 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   }
 
   if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
-    if (call->callee == "div" || call->callee == "ldiv") {
-      Type retTy = exprType(e);
-      if (retTy.base == Type::Base::Struct && retTy.ptrDepth == 0) {
-        auto fieldsIt = env.structFields.find(retTy.structName);
-        auto stIt = env.structs.find(retTy.structName);
-        if (fieldsIt != env.structFields.end() && stIt != env.structs.end() &&
-            fieldsIt->second.size() >= 2 && call->args.size() >= 2) {
-          llvm::Value* lhs = emitExpr(env, *call->args[0]);
-          llvm::Value* rhs = emitExpr(env, *call->args[1]);
-          const Type& lhsTy = exprType(*call->args[0]);
-          const Type& rhsTy = exprType(*call->args[1]);
-          Type numTy = fieldsIt->second[0].type;
-          if (lhsTy.isNumeric()) lhs = castNumericToType(env, lhs, lhsTy, numTy);
-          if (rhsTy.isNumeric()) rhs = castNumericToType(env, rhs, rhsTy, numTy);
-          llvm::Value* quot = env.b.CreateSDiv(lhs, rhs, "div.quot");
-          llvm::Value* rem = env.b.CreateSRem(lhs, rhs, "div.rem");
-          llvm::Value* agg = llvm::UndefValue::get(stIt->second);
-          agg = env.b.CreateInsertValue(agg, quot, {0}, "div.ins0");
-          agg = env.b.CreateInsertValue(agg, rem, {1}, "div.ins1");
-          return agg;
-        }
-      }
-    }
-
     llvm::Function* callee = nullptr;
     auto it = env.functions.find(call->callee);
     if (it != env.functions.end()) callee = it->second;
