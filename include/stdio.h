@@ -29,6 +29,8 @@ size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* f);
 int fprintf(FILE* f, const char* fmt, ...);
 int sprintf(char* s, const char* fmt, ...);
 int snprintf(char* s, size_t n, const char* fmt, ...);
+int scanf(const char* fmt, ...);
+int sscanf(const char* s, const char* fmt, ...);
 
 int printf(const char* fmt, ...);
 int putchar(int c);
