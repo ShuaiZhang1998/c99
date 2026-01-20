@@ -106,15 +106,26 @@ static std::string createTempObjPath() {
   return tmp.str().str();
 }
 
-static std::string buildRuntimeObj() {
-  std::string objPath = createTempObjPath();
-  std::string cmd = "clang -c \"runtime/printf.c\" -o \"" + objPath + "\"";
-  int rc = std::system(cmd.c_str());
-  if (rc != 0) {
-    std::cerr << "runtime compile failed (cmd=" << cmd << ")\n";
-    std::exit(1);
+static std::vector<std::string> buildRuntimeObjs() {
+  const char* files[] = {
+      "runtime/printf.c",
+      "runtime/stdlib.c",
+      "runtime/string.c",
+      "runtime/ctype.c",
+  };
+  std::vector<std::string> objs;
+  for (const char* file : files) {
+    std::string objPath = createTempObjPath();
+    std::string cmd =
+        "clang -c -I \"include\" \"" + std::string(file) + "\" -o \"" + objPath + "\"";
+    int rc = std::system(cmd.c_str());
+    if (rc != 0) {
+      std::cerr << "runtime compile failed (cmd=" << cmd << ")\n";
+      std::exit(1);
+    }
+    objs.push_back(objPath);
   }
-  return objPath;
+  return objs;
 }
 
 static bool compileToObject(
@@ -234,8 +245,8 @@ int main(int argc, char** argv) {
       return 1;
     }
 
-    std::string rtObj = buildRuntimeObj();
-    objPaths.push_back(rtObj);
+    auto rtObjs = buildRuntimeObjs();
+    objPaths.insert(objPaths.end(), rtObjs.begin(), rtObjs.end());
 
     std::string cmd = "clang";
     for (const auto& obj : objPaths) {
