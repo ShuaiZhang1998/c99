@@ -220,6 +220,101 @@ static void unread_limited(Reader* r, int* width, int ch) {
   r->unread(r->ctx, ch);
 }
 
+static const char* build_scanset(const char* p, int* negate, unsigned char set[256]) {
+  for (int i = 0; i < 256; ++i) set[i] = 0;
+  *negate = 0;
+  if (*p == '^') {
+    *negate = 1;
+    ++p;
+  }
+  int first = 1;
+  unsigned char prev = 0;
+  int has_prev = 0;
+  for (; *p; ++p) {
+    unsigned char ch = (unsigned char)*p;
+    if (ch == ']' && !first) {
+      return p;
+    }
+    if (ch == '-' && has_prev && p[1] && p[1] != ']') {
+      unsigned char end = (unsigned char)p[1];
+      if (end < prev) {
+        unsigned char tmp = prev;
+        prev = end;
+        end = tmp;
+      }
+      for (unsigned char c = prev; c <= end; ++c) set[c] = 1;
+      ++p;
+      prev = end;
+      has_prev = 1;
+    } else {
+      set[ch] = 1;
+      prev = ch;
+      has_prev = 1;
+    }
+    first = 0;
+  }
+  return NULL;
+}
+
+static int scan_scanset(Reader* r, char* out, int width, int negate,
+                        const unsigned char set[256], int* eof) {
+  int w = width;
+  int ch = read_limited(r, &w, eof);
+  if (ch < 0) return 0;
+  unsigned char c = (unsigned char)ch;
+  int in = set[c] ? 1 : 0;
+  if (negate) in = !in;
+  if (!in) {
+    unread_limited(r, &w, ch);
+    return 0;
+  }
+  int count = 0;
+  while (1) {
+    if (width == 0) break;
+    out[count++] = (char)c;
+    if (w == 0) break;
+    ch = read_limited(r, &w, eof);
+    if (ch < 0 || ch == -2) break;
+    c = (unsigned char)ch;
+    in = set[c] ? 1 : 0;
+    if (negate) in = !in;
+    if (!in) {
+      unread_limited(r, &w, ch);
+      break;
+    }
+  }
+  out[count] = '\0';
+  return 1;
+}
+
+static int scan_scanset_discard(Reader* r, int width, int negate,
+                                const unsigned char set[256], int* eof) {
+  int w = width;
+  int ch = read_limited(r, &w, eof);
+  if (ch < 0) return 0;
+  unsigned char c = (unsigned char)ch;
+  int in = set[c] ? 1 : 0;
+  if (negate) in = !in;
+  if (!in) {
+    unread_limited(r, &w, ch);
+    return 0;
+  }
+  while (1) {
+    if (width == 0) break;
+    if (w == 0) break;
+    ch = read_limited(r, &w, eof);
+    if (ch < 0 || ch == -2) break;
+    c = (unsigned char)ch;
+    in = set[c] ? 1 : 0;
+    if (negate) in = !in;
+    if (!in) {
+      unread_limited(r, &w, ch);
+      break;
+    }
+  }
+  return 1;
+}
+
 static int scan_uint_base(Reader* r, unsigned int* out, int base, int width, int* eof) {
   if (!skip_ws(r, eof)) return 0;
   int w = width;
@@ -909,6 +1004,23 @@ static int scan_impl(Reader* base, const char* fmt, va_list ap) {
         }
         assigned++;
       }
+      continue;
+    }
+    if (*p == '[') {
+      unsigned char set[256];
+      int negate = 0;
+      const char* end = build_scanset(p + 1, &negate, set);
+      if (!end) break;
+      int w = width >= 0 ? width : 0x7fffffff;
+      if (suppress) {
+        if (!scan_scanset_discard(r, w, negate, set, &eof)) break;
+      } else {
+        char* out = va_arg(ap, char*);
+        if (!out) return assigned;
+        if (!scan_scanset(r, out, w, negate, set, &eof)) break;
+        assigned++;
+      }
+      p = end;
       continue;
     }
     if (*p == 'n') {

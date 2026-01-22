@@ -44,7 +44,7 @@ struct CGEnv {
   };
 
   struct LocalBinding {
-    llvm::AllocaInst* slot = nullptr;
+    llvm::Value* slot = nullptr;
     Type type;
   };
 
@@ -57,6 +57,9 @@ struct CGEnv {
   // loop stack: {breakTarget, continueTarget}
   std::vector<std::pair<llvm::BasicBlock*, llvm::BasicBlock*>> loops;
 
+  std::vector<std::pair<llvm::GlobalVariable*, const Expr*>>* globalInits = nullptr;
+  int staticLocalCounter = 0;
+
   llvm::Type* i32Ty() { return llvm::Type::getInt32Ty(ctx); }
   llvm::Type* i1Ty() { return llvm::Type::getInt1Ty(ctx); }
 
@@ -68,6 +71,7 @@ struct CGEnv {
     currentReturnType = Type{};
     scopes.clear();
     loops.clear();
+    staticLocalCounter = 0;
   }
 
   LocalBinding* lookupLocal(const std::string& name) {
@@ -84,7 +88,7 @@ struct CGEnv {
     return &it->second;
   }
 
-  bool insertLocal(const std::string& name, llvm::AllocaInst* slot, const Type& type) {
+  bool insertLocal(const std::string& name, llvm::Value* slot, const Type& type) {
     auto& cur = scopes.back();
     if (cur.count(name)) return false;
     cur.emplace(name, LocalBinding{slot, type});
@@ -98,7 +102,40 @@ struct CGEnv {
   }
 };
 
+static llvm::Type* abiReturnType(CGEnv& env, const Type& t);
+
 static llvm::Type* llvmType(CGEnv& env, const Type& t) {
+  if (t.func) {
+    std::vector<llvm::Type*> paramTys;
+    paramTys.reserve(t.func->params.size());
+    for (const auto& param : t.func->params) {
+      Type adj = param;
+      if (adj.isArray()) adj = adj.decayType();
+      paramTys.push_back(llvmType(env, adj));
+    }
+    auto* fnTy = llvm::FunctionType::get(abiReturnType(env, t.func->returnType),
+                                         paramTys, t.func->isVariadic);
+    llvm::Type* ty = fnTy;
+    int ptrs = t.ptrDepth > 0 ? t.ptrDepth : 1;
+    if (t.ptrOutsideArrays) {
+      for (auto it = t.arrayDims.rbegin(); it != t.arrayDims.rend(); ++it) {
+        size_t dim = it->value_or(0);
+        ty = llvm::ArrayType::get(ty, dim);
+      }
+      for (int i = 0; i < ptrs; ++i) {
+        ty = llvm::PointerType::getUnqual(ty);
+      }
+    } else {
+      for (int i = 0; i < ptrs; ++i) {
+        ty = llvm::PointerType::getUnqual(ty);
+      }
+      for (auto it = t.arrayDims.rbegin(); it != t.arrayDims.rend(); ++it) {
+        size_t dim = it->value_or(0);
+        ty = llvm::ArrayType::get(ty, dim);
+      }
+    }
+    return ty;
+  }
   llvm::Type* baseTy = nullptr;
   if (t.base == Type::Base::Void) {
     baseTy = llvm::Type::getInt8Ty(env.ctx);
@@ -645,6 +682,10 @@ static llvm::Value* emitUnary(CGEnv& env, const UnaryExpr& u) {
       return emitLValue(env, *u.operand);
     case TokenKind::Star: {
       llvm::Value* opnd = emitExpr(env, *u.operand);
+      const Type& opTy = exprType(*u.operand);
+      if (opTy.func && opTy.ptrDepth == 1) {
+        return opnd;
+      }
       llvm::Type* elemTy = opnd->getType()->getPointerElementType();
       return env.b.CreateLoad(elemTy, opnd, "deref");
     }
@@ -1147,18 +1188,77 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     if (it != env.enumConstants.end()) {
       return i32Const(env, it->second);
     }
+    auto fit = env.functions.find(vr->name);
+    if (fit != env.functions.end()) {
+      return fit->second;
+    }
     return i32Const(env, 0);
   }
 
   if (auto* call = dynamic_cast<const CallExpr*>(&e)) {
-    llvm::Function* callee = nullptr;
-    auto it = env.functions.find(call->callee);
-    if (it != env.functions.end()) callee = it->second;
-    if (!callee) return i32Const(env, 0);
-
+    llvm::Value* calleeV = nullptr;
+    llvm::FunctionType* fnTy = nullptr;
     const std::vector<Type>* paramTypes = nullptr;
-    auto pit = env.functionParamTypes.find(call->callee);
-    if (pit != env.functionParamTypes.end()) paramTypes = &pit->second;
+    if (call->calleeExpr) {
+      const Type& calleeTy = exprType(*call->calleeExpr);
+      if (!calleeTy.func) return i32Const(env, 0);
+      calleeV = emitExpr(env, *call->calleeExpr);
+      std::vector<llvm::Type*> paramTys;
+      paramTys.reserve(calleeTy.func->params.size());
+      for (const auto& param : calleeTy.func->params) {
+        Type adj = param;
+        if (adj.isArray()) adj = adj.decayType();
+        paramTys.push_back(llvmType(env, adj));
+      }
+      fnTy = llvm::FunctionType::get(abiReturnType(env, calleeTy.func->returnType),
+                                     paramTys, calleeTy.func->isVariadic);
+      paramTypes = &calleeTy.func->params;
+    } else {
+      if (auto* local = env.lookupLocal(call->callee)) {
+        if (local->type.isFunctionPointer()) {
+          calleeV = env.b.CreateLoad(llvmType(env, local->type), local->slot, call->callee + ".fn");
+          const auto& fnInfo = *local->type.func;
+          std::vector<llvm::Type*> paramTys;
+          paramTys.reserve(fnInfo.params.size());
+          for (const auto& param : fnInfo.params) {
+            Type adj = param;
+            if (adj.isArray()) adj = adj.decayType();
+            paramTys.push_back(llvmType(env, adj));
+          }
+          fnTy = llvm::FunctionType::get(abiReturnType(env, fnInfo.returnType),
+                                         paramTys, fnInfo.isVariadic);
+          paramTypes = &fnInfo.params;
+        }
+      }
+      if (!calleeV) {
+        if (auto* global = env.lookupGlobal(call->callee)) {
+          if (global->type.isFunctionPointer()) {
+            calleeV = env.b.CreateLoad(llvmType(env, global->type), global->gv, call->callee + ".fn");
+            const auto& fnInfo = *global->type.func;
+            std::vector<llvm::Type*> paramTys;
+            paramTys.reserve(fnInfo.params.size());
+            for (const auto& param : fnInfo.params) {
+              Type adj = param;
+              if (adj.isArray()) adj = adj.decayType();
+              paramTys.push_back(llvmType(env, adj));
+            }
+            fnTy = llvm::FunctionType::get(abiReturnType(env, fnInfo.returnType),
+                                           paramTys, fnInfo.isVariadic);
+            paramTypes = &fnInfo.params;
+          }
+        }
+      }
+      if (!calleeV) {
+        auto it = env.functions.find(call->callee);
+        if (it != env.functions.end()) {
+          calleeV = it->second;
+          auto pit = env.functionParamTypes.find(call->callee);
+          if (pit != env.functionParamTypes.end()) paramTypes = &pit->second;
+          fnTy = it->second->getFunctionType();
+        }
+      }
+      if (!calleeV || !fnTy) return i32Const(env, 0);
+    }
 
     std::vector<llvm::Value*> argsV;
     argsV.reserve(call->args.size());
@@ -1185,7 +1285,7 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
       argsV.push_back(emitExpr(env, *a));
     }
 
-    llvm::Value* callV = env.b.CreateCall(callee, argsV, "calltmp");
+    llvm::Value* callV = env.b.CreateCall(fnTy, calleeV, argsV, "calltmp");
     const Type& resTy = exprType(*call);
     if (resTy.base == Type::Base::Struct && resTy.ptrDepth == 0) {
       callV = unpackReturnValue(env, resTy, callV);
@@ -1576,6 +1676,34 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
 
   if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
     for (const auto& item : d->items) {
+      if (item.storage == StorageClass::Static) {
+        std::string unique = "__c99cc_static_";
+        if (env.fn) {
+          unique += env.fn->getName().str();
+        } else {
+          unique += "global";
+        }
+        unique += "_" + item.name + "_" + std::to_string(env.staticLocalCounter++);
+
+        llvm::Type* gvTy = llvmType(env, item.type);
+        llvm::Constant* init = nullptr;
+        if (item.type.isArray()) {
+          init = llvm::ConstantAggregateZero::get(gvTy);
+        } else if (item.type.base == Type::Base::Struct && item.type.ptrDepth == 0) {
+          init = llvm::ConstantAggregateZero::get(gvTy);
+        } else if (item.type.isPointer()) {
+          init = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(gvTy));
+        } else {
+          init = zeroValue(env, item.type);
+        }
+        auto* gv = new llvm::GlobalVariable(
+            env.mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::InternalLinkage, init, unique);
+        env.insertGlobal(unique, gv, item.type);
+        env.insertLocal(item.name, gv, item.type);
+        if (item.initExpr && env.globalInits) env.globalInits->emplace_back(gv, item.initExpr.get());
+        continue;
+      }
+
       llvm::AllocaInst* slot = createEntryAlloca(env, item.name, item.type);
       env.insertLocal(item.name, slot, item.type);
       if (item.initExpr) {
@@ -1669,6 +1797,7 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
   CGEnv env{ctx, *mod, builder};
 
   std::vector<std::pair<llvm::GlobalVariable*, const Expr*>> globalInits;
+  env.globalInits = &globalInits;
 
   for (const auto& item : tu.items) {
     auto* ed = std::get_if<EnumDef>(&item);
@@ -1716,8 +1845,11 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       } else {
         init = zeroValue(env, decl.type);
       }
+      auto linkage = decl.storage == StorageClass::Static
+          ? llvm::GlobalValue::InternalLinkage
+          : llvm::GlobalValue::ExternalLinkage;
       auto* gv = new llvm::GlobalVariable(
-          *mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::ExternalLinkage, init, decl.name);
+          *mod, gvTy, /*isConstant=*/false, linkage, init, decl.name);
       env.insertGlobal(decl.name, gv, decl.type);
       if (decl.initExpr) globalInits.emplace_back(gv, decl.initExpr.get());
     }
@@ -1743,7 +1875,10 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       paramTys.push_back(llvmType(env, adj));
     }
     auto* fnTy = llvm::FunctionType::get(abiReturnType(env, p->returnType), paramTys, p->isVariadic);
-    llvm::Function* F = llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, name, mod.get());
+    auto linkage = p->storage == StorageClass::Static
+        ? llvm::GlobalValue::InternalLinkage
+        : llvm::GlobalValue::ExternalLinkage;
+    llvm::Function* F = llvm::Function::Create(fnTy, linkage, name, mod.get());
     env.functions[name] = F;
     env.functionParamTypes.emplace(name, std::move(paramTypes));
 
@@ -1753,27 +1888,6 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       if (i < p->params.size() && p->params[i].name.has_value()) arg.setName(*p->params[i].name);
       ++i;
     }
-  }
-
-  llvm::Function* initFn = nullptr;
-  if (!globalInits.empty()) {
-    auto* initTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), false);
-    initFn = llvm::Function::Create(
-        initTy, llvm::GlobalValue::InternalLinkage, "__c99cc_init_globals", mod.get());
-
-    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", initFn);
-    builder.SetInsertPoint(entry);
-    env.resetFunctionState(initFn);
-
-    for (const auto& gi : globalInits) {
-      auto* binding = env.lookupGlobal(gi.first->getName().str());
-      if (binding) {
-        emitInitToAddr(env, binding->type, gi.first, *gi.second);
-      }
-    }
-
-    builder.CreateRetVoid();
-    llvm::verifyFunction(*initFn);
   }
 
   // 3) Emit bodies only for FunctionDef
@@ -1810,10 +1924,6 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       ++idx;
     }
 
-    if (initFn && p.name == "main") {
-      builder.CreateCall(initFn);
-    }
-
     bool terminated = false;
     for (const auto& st : def->body) {
       terminated = emitStmt(env, *st);
@@ -1835,6 +1945,45 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
 
     env.popScope();
     llvm::verifyFunction(*F);
+  }
+
+  if (!globalInits.empty()) {
+    auto* initTy = llvm::FunctionType::get(llvm::Type::getVoidTy(ctx), false);
+    auto* initFn = llvm::Function::Create(
+        initTy, llvm::GlobalValue::InternalLinkage, "__c99cc_init_globals", mod.get());
+
+    llvm::BasicBlock* entry = llvm::BasicBlock::Create(ctx, "entry", initFn);
+    builder.SetInsertPoint(entry);
+    env.resetFunctionState(initFn);
+
+    for (const auto& gi : globalInits) {
+      auto* binding = env.lookupGlobal(gi.first->getName().str());
+      if (binding) {
+        emitInitToAddr(env, binding->type, gi.first, *gi.second);
+      }
+    }
+
+    builder.CreateRetVoid();
+    llvm::verifyFunction(*initFn);
+
+    auto it = env.functions.find("main");
+    if (it != env.functions.end() && !it->second->empty()) {
+      llvm::Function* mainFn = it->second;
+      llvm::BasicBlock& mainEntry = mainFn->getEntryBlock();
+      llvm::Instruction* insertPt = nullptr;
+      for (auto& inst : mainEntry) {
+        if (!llvm::isa<llvm::AllocaInst>(inst)) {
+          insertPt = &inst;
+          break;
+        }
+      }
+      if (!insertPt) {
+        insertPt = mainEntry.getTerminator();
+      }
+      llvm::IRBuilder<> ib(ctx);
+      ib.SetInsertPoint(insertPt);
+      ib.CreateCall(initFn);
+    }
   }
 
   return mod;
