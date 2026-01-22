@@ -63,20 +63,22 @@
 
 ### 标准库与运行时（最小）
 
-- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h`
+- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h` / `errno.h`
 - `printf`（最小实现）：
   - 支持 `%d/%i/%c/%s/%f/%%`
   - 支持最小宽度
   - 支持精度：`%f`（小数位）、`%s`（截断）
   - 不支持对齐标志、填充、符号、进制等扩展
 - `putchar/puts`
-- `fopen/fclose/fread/fwrite/fprintf/sprintf/snprintf`（基础文件 I/O 与格式化 I/O）
-- `scanf/sscanf`（最小实现：`%d/%u/%x/%f/%s/%c`、`%%`、宽度与空白匹配）
+- `fopen/fclose/fread/fwrite/fgetc/fputc/getc/putc/ungetc/fgets/fputs/fseek/ftell/fseeko/ftello/rewind/fflush/feof/ferror/clearerr/fprintf/sprintf/snprintf/fscanf/remove/rename/tmpnam/tmpfile/perror`（基础文件 I/O 与格式化 I/O）
+  - `fopen` 模式：`r/w/a`，支持 `+` 与 `b`
+- `scanf/sscanf`（最小实现：`%d/%u/%x/%o/%i/%f/%e/%g/%s/%c/%p/%n`，支持 `l/ll` 修饰与宽度、`*` 抑制赋值，含 `%%`、空白匹配）
 - `stdin/stdout/stderr`（在 `stdio.h` 中通过访问器宏提供）
 - `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
 - `stdlib.h`（最小实现：`atoi/atol/atoll`、`abs/labs/llabs`、`div/ldiv`、`exit/abort`）
 - `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
 - `ctype.h`（最小实现：`isdigit`、`isspace`）
+- `errno.h`（最小实现：`errno` 与常见错误码）
 - 运行时编译使用 `-I include`，避免系统头文件宏与本项目最小实现冲突
 
 ## 构建

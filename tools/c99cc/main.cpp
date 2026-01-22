@@ -114,6 +114,7 @@ static std::vector<std::string> buildRuntimeObjs() {
       "runtime/stdlib.c",
       "runtime/string.c",
       "runtime/ctype.c",
+      "runtime/errno.c",
   };
   std::vector<std::string> objs;
   for (const char* file : files) {
