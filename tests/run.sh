@@ -8,6 +8,11 @@ CC="${BUILD_DIR}/c99cc"
 echo "==> runner: ROOT=${ROOT_DIR}"
 echo "==> runner: CC=${CC}"
 
+cleanup() {
+  rm -f "${ROOT_DIR}"/c99cc_stdio_tmp*.txt
+}
+trap cleanup EXIT
+
 if [[ ! -x "${CC}" ]]; then
   echo "error: ${CC} not found or not executable"
   echo "hint: build first: cmake -S . -B build -DLLVM_DIR=\$(llvm-config --cmakedir) && cmake --build build -j"
