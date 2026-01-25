@@ -15,7 +15,7 @@ typedef struct {
 typedef struct {
   Reader* base;
   int* count;
-  int buf[2];
+  int buf[3];
   int buf_len;
 } CountReader;
 
@@ -35,7 +35,7 @@ static void counted_unread(void* ctx, int ch) {
   CountReader* cr = (CountReader*)ctx;
   if (ch >= 0) (*cr->count)--;
   if (ch < 0) return;
-  if (cr->buf_len < 2) {
+  if (cr->buf_len < 3) {
     cr->buf[cr->buf_len++] = ch;
     return;
   }
@@ -666,10 +666,14 @@ static int scan_float(Reader* r, double* out, int width, int* eof) {
   }
   int exp_val = 0;
   int exp_sign = 1;
+  int exp_failed = 0;
   if (ch == 'e' || ch == 'E') {
+    int exp_chars[2];
+    int exp_count = 0;
     int ch2 = read_limited(r, &w, eof);
     if (ch2 == '+' || ch2 == '-') {
       if (ch2 == '-') exp_sign = -1;
+      exp_chars[exp_count++] = ch2;
       ch2 = read_limited(r, &w, eof);
     }
     if (ch2 >= '0' && ch2 <= '9') {
@@ -679,16 +683,18 @@ static int scan_float(Reader* r, double* out, int width, int* eof) {
       }
       if (ch2 >= 0 && ch2 != -2) unread_limited(r, &w, ch2);
     } else {
-      unread_limited(r, &w, ch2);
+      if (ch2 >= 0 && ch2 != -2) unread_limited(r, &w, ch2);
+      for (int i = exp_count - 1; i >= 0; --i) {
+        unread_limited(r, &w, exp_chars[i]);
+      }
       unread_limited(r, &w, ch);
       exp_val = 0;
       exp_sign = 1;
-      ch = read_limited(r, &w, eof);
-      if (ch >= 0 && ch != -2) unread_limited(r, &w, ch);
+      exp_failed = 1;
     }
     ch = -2;
   }
-  if (ch >= 0 && ch != -2) unread_limited(r, &w, ch);
+  if (!exp_failed && ch >= 0 && ch != -2) unread_limited(r, &w, ch);
   double v = int_part;
   if (frac_len > 0) v += frac_part / pow10_int(frac_len);
   if (exp_val != 0) v *= pow10_int(exp_sign * exp_val);

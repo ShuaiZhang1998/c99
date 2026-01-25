@@ -157,6 +157,11 @@ FILE* fopen(const char* path, const char* mode) {
     c99cc_set_errno(ENOENT);
     return NULL;
   }
+  if (m == 'a') {
+    if (lseek(fd, 0, SEEK_END) < 0) {
+      c99cc_set_errno(EIO);
+    }
+  }
   FILE* f = (FILE*)malloc(sizeof(FILE));
   if (!f) {
     close(fd);
