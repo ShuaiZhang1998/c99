@@ -175,13 +175,20 @@ int fclose(FILE* f) {
   if (!f) return -1;
   c99cc_init_stdio();
   if (f == stdin || f == stdout || f == stderr) return 0;
+  int ok = 1;
 #ifdef _WIN32
-  if (!CloseHandle(f->handle)) c99cc_set_errno(EIO);
+  if (!CloseHandle(f->handle)) {
+    c99cc_set_errno(EIO);
+    ok = 0;
+  }
 #else
-  if (close(f->fd) != 0) c99cc_set_errno(EIO);
+  if (close(f->fd) != 0) {
+    c99cc_set_errno(EIO);
+    ok = 0;
+  }
 #endif
   free(f);
-  return 0;
+  return ok ? 0 : EOF;
 }
 
 int remove(const char* path) {
