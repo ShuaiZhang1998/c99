@@ -138,6 +138,7 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "default")  return Token{TokenKind::KwDefault, s, loc};
   if (s == "const")    return Token{TokenKind::KwConst, s, loc};
   if (s == "static")   return Token{TokenKind::KwStatic, s, loc};
+  if (s == "extern")   return Token{TokenKind::KwExtern, s, loc};
   if (s == "NULL")     return Token{TokenKind::IntegerLiteral, "0", loc};
 
   return Token{TokenKind::Identifier, s, loc};
@@ -189,6 +190,14 @@ Token Lexer::lexNumber() {
   }
 
   if (isFloat) return Token{TokenKind::FloatLiteral, s, loc};
+  while (!eof()) {
+    char c = peek();
+    if (c == 'u' || c == 'U' || c == 'l' || c == 'L') {
+      s.push_back(get());
+      continue;
+    }
+    break;
+  }
   return Token{TokenKind::IntegerLiteral, s, loc};
 }
 

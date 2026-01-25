@@ -4,6 +4,63 @@
 
 namespace c99cc {
 
+namespace {
+
+struct ParsedIntLiteral {
+  int64_t value = 0;
+  bool isUnsigned = false;
+  int longKind = 0; // 0=int, 1=long, 2=long long
+};
+
+static std::optional<ParsedIntLiteral> parseIntLiteralToken(
+    Diagnostics& diags, SourceLocation loc, const std::string& text) {
+  size_t pos = text.size();
+  while (pos > 0) {
+    char c = text[pos - 1];
+    if (c == 'u' || c == 'U' || c == 'l' || c == 'L') {
+      --pos;
+      continue;
+    }
+    break;
+  }
+  if (pos == 0) {
+    diags.error(loc, "invalid integer literal");
+    return std::nullopt;
+  }
+  std::string digits = text.substr(0, pos);
+  std::string suffix = text.substr(pos);
+  int64_t value = 0;
+  try {
+    value = std::stoll(digits);
+  } catch (...) {
+    diags.error(loc, "invalid integer literal");
+    return std::nullopt;
+  }
+  bool isUnsigned = false;
+  int lcount = 0;
+  for (char c : suffix) {
+    if (c == 'u' || c == 'U') {
+      isUnsigned = true;
+    } else if (c == 'l' || c == 'L') {
+      lcount++;
+    } else {
+      diags.error(loc, "invalid integer literal suffix");
+      return std::nullopt;
+    }
+  }
+  if (lcount > 2) {
+    diags.error(loc, "invalid integer literal suffix");
+    return std::nullopt;
+  }
+  ParsedIntLiteral out;
+  out.value = value;
+  out.isUnsigned = isUnsigned;
+  out.longKind = (lcount >= 2) ? 2 : (lcount == 1 ? 1 : 0);
+  return out;
+}
+
+} // namespace
+
 void Parser::advance() {
   if (hasPeek_) {
     cur_ = peek_;
@@ -47,6 +104,7 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
   SourceLocation typeLoc = cur_.loc;
   bool isConst = false;
   bool isStatic = false;
+  bool isExtern = false;
   bool saw = true;
   while (saw) {
     saw = false;
@@ -60,6 +118,15 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
       saw = true;
     }
+    if (allowStorage && cur_.kind == TokenKind::KwExtern) {
+      isExtern = true;
+      advance();
+      saw = true;
+    }
+  }
+  if (isStatic && isExtern) {
+    diags_.error(cur_.loc, "conflicting storage class specifiers");
+    return std::nullopt;
   }
   if (cur_.kind == TokenKind::KwUnsigned) {
     advance();
@@ -77,21 +144,24 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
       spec.type.base = Type::Base::Char;
       spec.type.isConst = isConst;
-      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwShort) {
       advance();
       spec.type.base = Type::Base::Short;
       spec.type.isConst = isConst;
-      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwInt) {
       advance();
       spec.type.base = Type::Base::Int;
       spec.type.isConst = isConst;
-      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwLong) {
@@ -100,17 +170,20 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
         advance();
         spec.type.base = Type::Base::LongLong;
         spec.type.isConst = isConst;
-        spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+        spec.storage = isStatic ? StorageClass::Static
+                                : (isExtern ? StorageClass::Extern : StorageClass::None);
         return spec;
       }
       spec.type.base = Type::Base::Long;
       spec.type.isConst = isConst;
-      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     spec.type.base = Type::Base::Int;
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwChar) {
@@ -121,7 +194,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwShort) {
@@ -132,7 +206,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwInt) {
@@ -143,7 +218,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwLong) {
@@ -165,7 +241,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwFloat) {
@@ -176,7 +253,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwDouble) {
@@ -213,7 +291,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     if (cur_.kind == TokenKind::LBrace) {
       if (!allowStructDef) {
         diags_.error(cur_.loc, "enum definition not allowed here");
@@ -250,7 +329,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     if (cur_.kind == TokenKind::LBrace) {
       if (!allowStructDef) {
         diags_.error(cur_.loc, "struct definition not allowed here");
@@ -278,7 +358,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
         spec.type.isConst = true;
         advance();
       }
-      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
   }
@@ -330,7 +411,9 @@ std::optional<std::vector<EnumItem>> Parser::parseEnumItems() {
         advance();
       }
       if (cur_.kind == TokenKind::IntegerLiteral) {
-        value = std::stoll(cur_.text);
+        auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+        if (!parsed) return std::nullopt;
+        value = parsed->value;
         if (neg) value = -value;
         advance();
       } else if (cur_.kind == TokenKind::Identifier) {
@@ -382,7 +465,9 @@ std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool al
       diags_.error(cur_.loc, "expected integer literal in array size");
       return std::nullopt;
     }
-    size_t size = static_cast<size_t>(std::stoll(cur_.text));
+    auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+    if (!parsed) return std::nullopt;
+    size_t size = static_cast<size_t>(parsed->value);
     dims.push_back(size);
     advance();
     if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
@@ -793,7 +878,8 @@ std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwTypedef) return parseTypedefStmt();
-  if (cur_.kind == TokenKind::KwStatic || cur_.kind == TokenKind::KwConst ||
+  if (cur_.kind == TokenKind::KwStatic || cur_.kind == TokenKind::KwExtern ||
+      cur_.kind == TokenKind::KwConst ||
       cur_.kind == TokenKind::KwChar ||
       cur_.kind == TokenKind::KwShort ||
       cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
@@ -1165,7 +1251,9 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseSwitchStmt() {
         diags_.error(cur_.loc, "expected integer literal after 'case'");
         return std::nullopt;
       }
-      int64_t value = std::stoll(cur_.text);
+      auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+      if (!parsed) return std::nullopt;
+      int64_t value = parsed->value;
       advance();
       if (!expect(TokenKind::Colon, "':'")) return std::nullopt;
       advance();
@@ -1221,15 +1309,16 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseSwitchStmt() {
 std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
   if (cur_.kind == TokenKind::IntegerLiteral) {
     SourceLocation l = cur_.loc;
-    int64_t v = std::stoll(cur_.text);
+    auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+    if (!parsed) return std::nullopt;
     advance();
-    return std::make_unique<IntLiteralExpr>(l, v);
+    return std::make_unique<IntLiteralExpr>(l, parsed->value, parsed->isUnsigned, parsed->longKind);
   }
   if (cur_.kind == TokenKind::CharLiteral) {
     SourceLocation l = cur_.loc;
     int64_t v = std::stoll(cur_.text);
     advance();
-    return std::make_unique<IntLiteralExpr>(l, v);
+    return std::make_unique<IntLiteralExpr>(l, v, false, 0);
   }
   if (cur_.kind == TokenKind::FloatLiteral) {
     SourceLocation l = cur_.loc;
@@ -1462,7 +1551,9 @@ std::optional<std::unique_ptr<Expr>> Parser::parseInitializer() {
             diags_.error(cur_.loc, "expected integer literal in array designator");
             return std::nullopt;
           }
-          size_t idx = static_cast<size_t>(std::stoll(cur_.text));
+          auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+          if (!parsed) return std::nullopt;
+          size_t idx = static_cast<size_t>(parsed->value);
           advance();
           if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
           advance();

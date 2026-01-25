@@ -677,7 +677,18 @@ static void checkStmtImpl(
     auto& cur = scopes.back();
     for (auto& item : decl->items) {
       if (cur.count(item.name)) {
-        diags.error(item.nameLoc, "redefinition of '" + item.name + "'");
+        if (item.storage == StorageClass::Extern) {
+          if (cur[item.name] != item.type) {
+            diags.error(item.nameLoc, "conflicting types for '" + item.name + "'");
+            return;
+          }
+        } else {
+          diags.error(item.nameLoc, "redefinition of '" + item.name + "'");
+          return;
+        }
+      }
+      if (item.storage == StorageClass::Extern && item.initExpr) {
+        diags.error(item.nameLoc, "extern declaration cannot have initializer");
         return;
       }
       if (!isValidUnsignedUse(item.type)) {
@@ -698,7 +709,8 @@ static void checkStmtImpl(
       if (!fillArraySizeFromInitList(item, diags)) {
         return;
       }
-      if (hasInvalidArraySize(item.type, /*allowFirstEmpty=*/false)) {
+      bool allowFirstEmpty = item.storage == StorageClass::Extern && !item.initExpr;
+      if (hasInvalidArraySize(item.type, /*allowFirstEmpty=*/allowFirstEmpty)) {
         diags.error(item.nameLoc, "invalid array size");
         return;
       }
@@ -891,6 +903,12 @@ static std::optional<Type> checkExprImpl(
     const EnumConstTable& enums, Expr& e) {
   if (auto* lit = dynamic_cast<IntLiteralExpr*>(&e)) {
     Type t;
+    if (lit->longKind == 1) {
+      t.base = Type::Base::Long;
+    } else if (lit->longKind == 2) {
+      t.base = Type::Base::LongLong;
+    }
+    t.isUnsigned = lit->isUnsigned;
     e.semaType = t;
     return t;
   }
@@ -1601,16 +1619,13 @@ bool Sema::run(AstTranslationUnit& tu) {
   {
     ScopeStack scopes;
     scopes.push_back({});
+    std::unordered_set<std::string> globalDefs;
 
     for (auto& item : tu.items) {
       auto* g = std::get_if<GlobalVarDecl>(&item);
       if (!g) continue;
 
       for (auto& decl : g->items) {
-        if (scopes.back().count(decl.name)) {
-          diags_.error(decl.nameLoc, "redefinition of '" + decl.name + "'");
-          return false;
-        }
         if (isArrayElementVoid(decl.type)) {
           diags_.error(decl.nameLoc, "invalid array element type");
           return false;
@@ -1629,7 +1644,8 @@ bool Sema::run(AstTranslationUnit& tu) {
         if (!fillArraySizeFromInitList(decl, diags_)) {
           return false;
         }
-        if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/false)) {
+        bool allowFirstEmpty = decl.storage == StorageClass::Extern && !decl.initExpr;
+        if (hasInvalidArraySize(decl.type, /*allowFirstEmpty=*/allowFirstEmpty)) {
           diags_.error(decl.nameLoc, "invalid array size");
           return false;
         }
@@ -1654,8 +1670,31 @@ bool Sema::run(AstTranslationUnit& tu) {
           }
         }
 
-        scopes.back().emplace(decl.name, decl.type);
-        globalScope.emplace(decl.name, decl.type);
+        bool isExternDecl = decl.storage == StorageClass::Extern && !decl.initExpr;
+        auto it = scopes.back().find(decl.name);
+        if (isExternDecl) {
+          if (it != scopes.back().end() && it->second != decl.type) {
+            diags_.error(decl.nameLoc, "conflicting types for '" + decl.name + "'");
+            return false;
+          }
+          if (it == scopes.back().end()) {
+            scopes.back().emplace(decl.name, decl.type);
+            globalScope.emplace(decl.name, decl.type);
+          }
+          continue;
+        }
+
+        if (globalDefs.count(decl.name)) {
+          diags_.error(decl.nameLoc, "redefinition of '" + decl.name + "'");
+          return false;
+        }
+        if (it != scopes.back().end() && it->second != decl.type) {
+          diags_.error(decl.nameLoc, "conflicting types for '" + decl.name + "'");
+          return false;
+        }
+        scopes.back()[decl.name] = decl.type;
+        globalScope[decl.name] = decl.type;
+        globalDefs.insert(decl.name);
       }
     }
   }

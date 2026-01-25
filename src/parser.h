@@ -26,6 +26,7 @@ struct FunctionType;
 enum class StorageClass {
   None,
   Static,
+  Extern,
 };
 
 struct Type {
@@ -167,7 +168,10 @@ struct Stmt : Node {
 
 struct IntLiteralExpr final : Expr {
   int64_t value;
-  IntLiteralExpr(SourceLocation l, int64_t v) : Expr(l), value(v) {}
+  bool isUnsigned = false;
+  int longKind = 0; // 0=int, 1=long, 2=long long
+  IntLiteralExpr(SourceLocation l, int64_t v, bool isU, int lk)
+      : Expr(l), value(v), isUnsigned(isU), longKind(lk) {}
 };
 
 struct FloatLiteralExpr final : Expr {

@@ -1109,7 +1109,10 @@ static llvm::Value* emitLValue(CGEnv& env, const Expr& e) {
 
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
-    return i32Const(env, lit->value);
+    Type ty = exprType(e);
+    if (!ty.isInteger()) return i32Const(env, lit->value);
+    llvm::Type* llvmTy = llvmType(env, ty);
+    return llvm::ConstantInt::get(llvmTy, lit->value, !ty.isUnsigned);
   }
   if (auto* flt = dynamic_cast<const FloatLiteralExpr*>(&e)) {
     llvm::Type* ty = flt->isFloat ? llvm::Type::getFloatTy(env.ctx)
@@ -1676,6 +1679,16 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
 
   if (auto* d = dynamic_cast<const DeclStmt*>(&s)) {
     for (const auto& item : d->items) {
+      if (item.storage == StorageClass::Extern) {
+        if (!env.lookupGlobal(item.name)) {
+          llvm::Type* gvTy = llvmType(env, item.type);
+          auto* gv = new llvm::GlobalVariable(
+              env.mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::ExternalLinkage,
+              /*Initializer=*/nullptr, item.name);
+          env.insertGlobal(item.name, gv, item.type);
+        }
+        continue;
+      }
       if (item.storage == StorageClass::Static) {
         std::string unique = "__c99cc_static_";
         if (env.fn) {
@@ -1834,6 +1847,18 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     auto* g = std::get_if<GlobalVarDecl>(&item);
     if (!g) continue;
     for (const auto& decl : g->items) {
+      bool isExternDecl = decl.storage == StorageClass::Extern && !decl.initExpr;
+      auto* existing = env.lookupGlobal(decl.name);
+      if (isExternDecl) {
+        if (existing) continue;
+        llvm::Type* gvTy = llvmType(env, decl.type);
+        auto* gv = new llvm::GlobalVariable(
+            *mod, gvTy, /*isConstant=*/false, llvm::GlobalValue::ExternalLinkage,
+            /*Initializer=*/nullptr, decl.name);
+        env.insertGlobal(decl.name, gv, decl.type);
+        continue;
+      }
+
       llvm::Type* gvTy = llvmType(env, decl.type);
       llvm::Constant* init = nullptr;
       if (decl.type.isArray()) {
@@ -1848,10 +1873,16 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       auto linkage = decl.storage == StorageClass::Static
           ? llvm::GlobalValue::InternalLinkage
           : llvm::GlobalValue::ExternalLinkage;
-      auto* gv = new llvm::GlobalVariable(
-          *mod, gvTy, /*isConstant=*/false, linkage, init, decl.name);
-      env.insertGlobal(decl.name, gv, decl.type);
-      if (decl.initExpr) globalInits.emplace_back(gv, decl.initExpr.get());
+      if (existing && existing->gv->isDeclaration()) {
+        existing->gv->setLinkage(linkage);
+        existing->gv->setInitializer(init);
+      } else if (!existing) {
+        auto* gv = new llvm::GlobalVariable(
+            *mod, gvTy, /*isConstant=*/false, linkage, init, decl.name);
+        env.insertGlobal(decl.name, gv, decl.type);
+        existing = env.lookupGlobal(decl.name);
+      }
+      if (decl.initExpr && existing) globalInits.emplace_back(existing->gv, decl.initExpr.get());
     }
   }
 
