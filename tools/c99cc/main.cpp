@@ -109,9 +109,12 @@ static std::string createTempObjPath() {
 static std::vector<std::string> buildRuntimeObjs() {
   const char* files[] = {
       "runtime/printf.c",
+      "runtime/scanf.c",
+      "runtime/stdio_file.c",
       "runtime/stdlib.c",
       "runtime/string.c",
       "runtime/ctype.c",
+      "runtime/errno.c",
   };
   std::vector<std::string> objs;
   for (const char* file : files) {

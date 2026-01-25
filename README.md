@@ -63,17 +63,22 @@
 
 ### 标准库与运行时（最小）
 
-- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h`
+- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h` / `errno.h`
 - `printf`（最小实现）：
   - 支持 `%d/%i/%c/%s/%f/%%`
   - 支持最小宽度
   - 支持精度：`%f`（小数位）、`%s`（截断）
   - 不支持对齐标志、填充、符号、进制等扩展
 - `putchar/puts`
+- `fopen/fclose/fread/fwrite/fgetc/fputc/getc/putc/ungetc/fgets/fputs/fseek/ftell/fseeko/ftello/rewind/fflush/feof/ferror/clearerr/fprintf/sprintf/snprintf/fscanf/remove/rename/tmpnam/tmpfile/perror`（基础文件 I/O 与格式化 I/O）
+  - `fopen` 模式：`r/w/a`，支持 `+` 与 `b`
+- `scanf/sscanf`（最小实现：`%d/%u/%x/%o/%i/%f/%e/%g/%s/%c/%p/%n/%[]`，支持 `l/ll` 修饰与宽度、`*` 抑制赋值，含 `%%`、空白匹配）
+- `stdin/stdout/stderr`（在 `stdio.h` 中通过访问器宏提供）
 - `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
-- `stdlib.h`（最小实现：`atoi/atol/atoll`、`abs/labs/llabs`、`div/ldiv`、`exit/abort`）
+- `stdlib.h`（最小实现：`atoi/atol/atoll`、`strtol/strtoul/strtod`、`abs/labs/llabs`、`div/ldiv`、`rand/srand`、`qsort/bsearch`、`exit/abort`）
 - `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
 - `ctype.h`（最小实现：`isdigit`、`isspace`）
+- `errno.h`（最小实现：`errno` 与常见错误码）
 - 运行时编译使用 `-I include`，避免系统头文件宏与本项目最小实现冲突
 
 ## 构建
@@ -187,14 +192,19 @@ EOS
 - 类型与转换：整数提升与常规算术转换为简化版
 - 预处理器：不支持 `#pragma once`，宏展开与 token 规则不完全一致于标准
 - 类型系统：无 `union`、位域、`_Bool`、`long double`
-- 作用域与存储期：`extern`/`static` 等存储类尚未覆盖
-- 标准库：仅提供最小头文件与极简 `printf`，无完整 libc 实现
+- 作用域与存储期：`extern` 尚未覆盖
+- 标准库：仅提供最小头文件与子集实现，无完整 libc
 - 内存分配：`malloc/calloc/realloc/free` 为最小实现，不支持碎片整理与复用策略
 - 诊断与错误恢复：仍较有限
 
+### 测试中遇到的缺口（已调整用例）
+
+下面这些是近期在实现标准库/运行时时，为了让测试通过而不得不规避的语言特性：
+- **带后缀的无符号整数字面量**：如 `255u` 无法解析。
+
 ## 接下来优先完善的 C 运行时（面向简单 C99 项目）
 
-- `stdio.h`：文件 I/O 与格式化 I/O（`fopen/fclose/fread/fwrite/fprintf/snprintf/scanf` 等）
+- `stdio.h`：继续扩展 `scanf/sscanf` 规格与更完整的文件/缓冲 I/O
 - `stdlib.h`：`rand/srand`、`strtol/strtoul/strtod`、`qsort/bsearch`、`getenv`
 - `string.h`：`strchr/strrchr/strstr/strtok`、`memchr`
 - `math.h`：`sqrt/pow/sin/cos` 等基础函数

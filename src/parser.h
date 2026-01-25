@@ -21,15 +21,26 @@ struct Node {
   virtual ~Node() = default;
 };
 
+struct FunctionType;
+
+enum class StorageClass {
+  None,
+  Static,
+  Extern,
+};
+
 struct Type {
   enum class Base { Char, Short, Int, Long, LongLong, Float, Double, Void, Struct, Enum };
   Base base = Base::Int;
   bool isUnsigned = false;
+  bool isConst = false;
   std::string structName;
   std::string enumName;
   int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
+  std::vector<bool> ptrConst;
   std::vector<std::optional<size_t>> arrayDims;
   bool ptrOutsideArrays = false;
+  std::shared_ptr<FunctionType> func;
   Type() = default;
   Type(Base b, int d) : base(b), ptrDepth(d) {}
   Type(Base b, int d, std::vector<std::optional<size_t>> dims)
@@ -51,44 +62,97 @@ struct Type {
   bool isEnum() const { return base == Base::Enum; }
   bool isPointer() const { return ptrDepth > 0; }
   bool isArray() const { return !arrayDims.empty(); }
+  bool isFunctionPointer() const { return func != nullptr; }
+  bool isTopLevelConst() const {
+    if (ptrDepth > 0) return !ptrConst.empty() && ptrConst[0];
+    return isConst;
+  }
+  void addPointerLevel(bool isConstPtr) {
+    ptrDepth++;
+    ptrConst.push_back(isConstPtr);
+  }
+  void addPointerQuals(const std::vector<bool>& quals) {
+    for (bool q : quals) addPointerLevel(q);
+  }
+  void clearTopLevelConst() {
+    if (ptrDepth > 0) {
+      if (!ptrConst.empty()) ptrConst[0] = false;
+    } else {
+      isConst = false;
+    }
+  }
   Type pointee() const {
     Type t{base, ptrDepth - 1, arrayDims};
     t.isUnsigned = isUnsigned;
+    t.isConst = isConst;
     t.structName = structName;
     t.enumName = enumName;
     t.ptrOutsideArrays = false;
+    t.func = func;
+    if (!ptrConst.empty()) {
+      t.ptrConst.assign(ptrConst.begin() + 1, ptrConst.end());
+    }
     return t;
   }
   Type elementType() const {
     if (arrayDims.empty()) {
     Type t{base, ptrDepth};
     t.isUnsigned = isUnsigned;
+    t.isConst = isConst;
     t.structName = structName;
     t.enumName = enumName;
+    t.func = func;
+    t.ptrConst = ptrConst;
     return t;
   }
     std::vector<std::optional<size_t>> rest(arrayDims.begin() + 1, arrayDims.end());
     Type t{base, ptrDepth, std::move(rest)};
     t.isUnsigned = isUnsigned;
+    t.isConst = isConst;
     t.structName = structName;
     t.enumName = enumName;
+    t.func = func;
+    t.ptrConst = ptrConst;
     return t;
   }
   Type decayType() const {
     Type elem = elementType();
-    elem.ptrDepth++;
+    elem.addPointerLevel(false);
     elem.ptrOutsideArrays = !elem.arrayDims.empty();
     return elem;
   }
-  bool isVoidPointer() const { return base == Base::Void && ptrDepth == 1; }
+  bool isVoidPointer() const { return base == Base::Void && ptrDepth == 1 && !func; }
   bool isVoidObject() const { return base == Base::Void && ptrDepth == 0; }
-  bool operator==(const Type& other) const {
-    return base == other.base && isUnsigned == other.isUnsigned &&
-           structName == other.structName && enumName == other.enumName &&
-           ptrDepth == other.ptrDepth && arrayDims == other.arrayDims &&
-           ptrOutsideArrays == other.ptrOutsideArrays;
-  }
+  bool operator==(const Type& other) const;
   bool operator!=(const Type& other) const { return !(*this == other); }
+};
+
+struct FunctionType {
+  Type returnType;
+  std::vector<Type> params;
+  bool isVariadic = false;
+  bool operator==(const FunctionType& other) const {
+    return returnType == other.returnType && params == other.params &&
+           isVariadic == other.isVariadic;
+  }
+  bool operator!=(const FunctionType& other) const { return !(*this == other); }
+};
+
+inline bool Type::operator==(const Type& other) const {
+  if ((func && !other.func) || (!func && other.func)) return false;
+  if (func && other.func) {
+    if (!(*func == *other.func)) return false;
+  }
+  return base == other.base && isUnsigned == other.isUnsigned &&
+         isConst == other.isConst && structName == other.structName && enumName == other.enumName &&
+         ptrDepth == other.ptrDepth && arrayDims == other.arrayDims &&
+         ptrOutsideArrays == other.ptrOutsideArrays && ptrConst == other.ptrConst;
+}
+
+struct Declarator {
+  Type type;
+  std::string name;
+  SourceLocation nameLoc;
 };
 
 struct Expr : Node {
@@ -104,7 +168,10 @@ struct Stmt : Node {
 
 struct IntLiteralExpr final : Expr {
   int64_t value;
-  IntLiteralExpr(SourceLocation l, int64_t v) : Expr(l), value(v) {}
+  bool isUnsigned = false;
+  int longKind = 0; // 0=int, 1=long, 2=long long
+  IntLiteralExpr(SourceLocation l, int64_t v, bool isU, int lk)
+      : Expr(l), value(v), isUnsigned(isU), longKind(lk) {}
 };
 
 struct FloatLiteralExpr final : Expr {
@@ -180,9 +247,12 @@ struct SizeofExpr final : Expr {
 struct CallExpr final : Expr {
   std::string callee;
   SourceLocation calleeLoc;
+  std::unique_ptr<Expr> calleeExpr;
   std::vector<std::unique_ptr<Expr>> args;
   CallExpr(SourceLocation l, std::string c, SourceLocation cLoc, std::vector<std::unique_ptr<Expr>> a)
       : Expr(l), callee(std::move(c)), calleeLoc(cLoc), args(std::move(a)) {}
+  CallExpr(SourceLocation l, std::unique_ptr<Expr> cExpr, std::vector<std::unique_ptr<Expr>> a)
+      : Expr(l), calleeExpr(std::move(cExpr)), args(std::move(a)) {}
 };
 
 struct UnaryExpr final : Expr {
@@ -246,6 +316,7 @@ struct DeclItem {
   std::string name;
   SourceLocation nameLoc;
   std::unique_ptr<Expr> initExpr; // nullable
+  StorageClass storage = StorageClass::None;
 };
 
 struct StructField {
@@ -364,6 +435,7 @@ struct FunctionProto {
   SourceLocation nameLoc;
   std::vector<Param> params;
   bool isVariadic = false;
+  StorageClass storage = StorageClass::None;
 };
 
 struct FunctionDecl {
@@ -429,13 +501,18 @@ private:
   void advance();
   bool expect(TokenKind k, const char* what);
   const Token& peekToken();
-  int parsePointerDepth();
+  struct PtrQuals {
+    int depth = 0;
+    std::vector<bool> consts;
+  };
+  PtrQuals parsePointerQuals();
   struct ParsedTypeSpec {
     Type type;
     std::optional<StructDef> structDef;
     std::optional<EnumDef> enumDef;
+    StorageClass storage = StorageClass::None;
   };
-  std::optional<ParsedTypeSpec> parseTypeSpec(bool allowStructDef);
+  std::optional<ParsedTypeSpec> parseTypeSpec(bool allowStructDef, bool allowStorage);
   std::optional<Type> parseTypeName(bool allowStructDef);
   std::optional<std::vector<StructField>> parseStructFields();
   std::optional<std::vector<EnumItem>> parseEnumItems();
@@ -472,6 +549,8 @@ private:
   std::optional<std::unique_ptr<Expr>> parseUnary();
   std::optional<std::unique_ptr<Expr>> parsePostfix();
   std::optional<std::unique_ptr<Expr>> parsePrimary();
+  std::optional<Declarator> parseDeclarator(const Type& baseType, bool allowArray,
+                                            bool allowFirstEmpty, bool allowFunctionPointer);
 
   // Compatibility (not used)
   std::optional<std::unique_ptr<Expr>> parseBinary(int /*minPrec*/);

@@ -4,6 +4,63 @@
 
 namespace c99cc {
 
+namespace {
+
+struct ParsedIntLiteral {
+  int64_t value = 0;
+  bool isUnsigned = false;
+  int longKind = 0; // 0=int, 1=long, 2=long long
+};
+
+static std::optional<ParsedIntLiteral> parseIntLiteralToken(
+    Diagnostics& diags, SourceLocation loc, const std::string& text) {
+  size_t pos = text.size();
+  while (pos > 0) {
+    char c = text[pos - 1];
+    if (c == 'u' || c == 'U' || c == 'l' || c == 'L') {
+      --pos;
+      continue;
+    }
+    break;
+  }
+  if (pos == 0) {
+    diags.error(loc, "invalid integer literal");
+    return std::nullopt;
+  }
+  std::string digits = text.substr(0, pos);
+  std::string suffix = text.substr(pos);
+  int64_t value = 0;
+  try {
+    value = std::stoll(digits);
+  } catch (...) {
+    diags.error(loc, "invalid integer literal");
+    return std::nullopt;
+  }
+  bool isUnsigned = false;
+  int lcount = 0;
+  for (char c : suffix) {
+    if (c == 'u' || c == 'U') {
+      isUnsigned = true;
+    } else if (c == 'l' || c == 'L') {
+      lcount++;
+    } else {
+      diags.error(loc, "invalid integer literal suffix");
+      return std::nullopt;
+    }
+  }
+  if (lcount > 2) {
+    diags.error(loc, "invalid integer literal suffix");
+    return std::nullopt;
+  }
+  ParsedIntLiteral out;
+  out.value = value;
+  out.isUnsigned = isUnsigned;
+  out.longKind = (lcount >= 2) ? 2 : (lcount == 1 ? 1 : 0);
+  return out;
+}
+
+} // namespace
+
 void Parser::advance() {
   if (hasPeek_) {
     cur_ = peek_;
@@ -27,25 +84,55 @@ bool Parser::expect(TokenKind k, const char* what) {
   return false;
 }
 
-int Parser::parsePointerDepth() {
-  int depth = 0;
+Parser::PtrQuals Parser::parsePointerQuals() {
+  PtrQuals out;
   while (cur_.kind == TokenKind::Star) {
-    depth++;
+    out.depth++;
     advance();
+    bool isConst = false;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    out.consts.push_back(isConst);
   }
-  return depth;
+  return out;
 }
 
-std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef) {
+std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef, bool allowStorage) {
   ParsedTypeSpec spec;
   SourceLocation typeLoc = cur_.loc;
-  while (cur_.kind == TokenKind::KwConst) {
-    advance();
+  bool isConst = false;
+  bool isStatic = false;
+  bool isExtern = false;
+  bool saw = true;
+  while (saw) {
+    saw = false;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+      saw = true;
+    }
+    if (allowStorage && cur_.kind == TokenKind::KwStatic) {
+      isStatic = true;
+      advance();
+      saw = true;
+    }
+    if (allowStorage && cur_.kind == TokenKind::KwExtern) {
+      isExtern = true;
+      advance();
+      saw = true;
+    }
+  }
+  if (isStatic && isExtern) {
+    diags_.error(cur_.loc, "conflicting storage class specifiers");
+    return std::nullopt;
   }
   if (cur_.kind == TokenKind::KwUnsigned) {
     advance();
     spec.type.isUnsigned = true;
     while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
       advance();
     }
     if (cur_.kind == TokenKind::KwFloat || cur_.kind == TokenKind::KwDouble ||
@@ -56,16 +143,25 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     if (cur_.kind == TokenKind::KwChar) {
       advance();
       spec.type.base = Type::Base::Char;
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwShort) {
       advance();
       spec.type.base = Type::Base::Short;
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwInt) {
       advance();
       spec.type.base = Type::Base::Int;
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     if (cur_.kind == TokenKind::KwLong) {
@@ -73,27 +169,57 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
       if (cur_.kind == TokenKind::KwLong) {
         advance();
         spec.type.base = Type::Base::LongLong;
+        spec.type.isConst = isConst;
+        spec.storage = isStatic ? StorageClass::Static
+                                : (isExtern ? StorageClass::Extern : StorageClass::None);
         return spec;
       }
       spec.type.base = Type::Base::Long;
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
     spec.type.base = Type::Base::Int;
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwChar) {
     advance();
     spec.type.base = Type::Base::Char;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwShort) {
     advance();
     spec.type.base = Type::Base::Short;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwInt) {
     advance();
     spec.type.base = Type::Base::Int;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwLong) {
@@ -101,24 +227,56 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     if (cur_.kind == TokenKind::KwLong) {
       advance();
       spec.type.base = Type::Base::LongLong;
+      while (cur_.kind == TokenKind::KwConst) {
+        isConst = true;
+        advance();
+      }
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
       return spec;
     }
     spec.type.base = Type::Base::Long;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwFloat) {
     advance();
     spec.type.base = Type::Base::Float;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwDouble) {
     advance();
     spec.type.base = Type::Base::Double;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
     return spec;
   }
   if (cur_.kind == TokenKind::KwVoid) {
     advance();
     spec.type.base = Type::Base::Void;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
     return spec;
   }
   if (cur_.kind == TokenKind::KwEnum) {
@@ -128,6 +286,13 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
       spec.type.enumName = cur_.text;
       advance();
     }
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     if (cur_.kind == TokenKind::LBrace) {
       if (!allowStructDef) {
         diags_.error(cur_.loc, "enum definition not allowed here");
@@ -159,6 +324,13 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     advance();
     spec.type.base = Type::Base::Struct;
     spec.type.structName = name;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     if (cur_.kind == TokenKind::LBrace) {
       if (!allowStructDef) {
         diags_.error(cur_.loc, "struct definition not allowed here");
@@ -182,6 +354,12 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
     if (it != typedefs_.end()) {
       spec.type = it->second;
       advance();
+      while (cur_.kind == TokenKind::KwConst) {
+        spec.type.isConst = true;
+        advance();
+      }
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
       return spec;
     }
   }
@@ -191,24 +369,18 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef)
 std::optional<std::vector<StructField>> Parser::parseStructFields() {
   std::vector<StructField> fields;
   while (cur_.kind != TokenKind::RBrace && cur_.kind != TokenKind::Eof) {
-    auto baseSpec = parseTypeSpec(/*allowStructDef=*/false);
+    auto baseSpec = parseTypeSpec(/*allowStructDef=*/false, /*allowStorage=*/false);
     if (!baseSpec) return std::nullopt;
     Type baseType = baseSpec->type;
 
     while (true) {
-      int depth = parsePointerDepth();
-      if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+      auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/false,
+                                  /*allowFunctionPointer=*/true);
+      if (!decl) return std::nullopt;
       StructField f;
-      f.type = baseType;
-      f.type.ptrDepth += depth;
-      f.name = cur_.text;
-      f.nameLoc = cur_.loc;
-      advance();
-      if (cur_.kind == TokenKind::LBracket) {
-        auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
-        if (!dims) return std::nullopt;
-        f.type.arrayDims = std::move(*dims);
-      }
+      f.type = decl->type;
+      f.name = std::move(decl->name);
+      f.nameLoc = decl->nameLoc;
       fields.push_back(std::move(f));
 
       if (cur_.kind != TokenKind::Comma) break;
@@ -239,7 +411,9 @@ std::optional<std::vector<EnumItem>> Parser::parseEnumItems() {
         advance();
       }
       if (cur_.kind == TokenKind::IntegerLiteral) {
-        value = std::stoll(cur_.text);
+        auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+        if (!parsed) return std::nullopt;
+        value = parsed->value;
         if (neg) value = -value;
         advance();
       } else if (cur_.kind == TokenKind::Identifier) {
@@ -291,7 +465,9 @@ std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool al
       diags_.error(cur_.loc, "expected integer literal in array size");
       return std::nullopt;
     }
-    size_t size = static_cast<size_t>(std::stoll(cur_.text));
+    auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+    if (!parsed) return std::nullopt;
+    size_t size = static_cast<size_t>(parsed->value);
     dims.push_back(size);
     advance();
     if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
@@ -302,20 +478,83 @@ std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool al
 }
 
 std::optional<Type> Parser::parseTypeName(bool allowStructDef) {
-  auto specOpt = parseTypeSpec(allowStructDef);
+  auto specOpt = parseTypeSpec(allowStructDef, /*allowStorage=*/false);
   if (!specOpt) return std::nullopt;
   if (specOpt->structDef || specOpt->enumDef) {
     diags_.error(cur_.loc, "type definition not allowed here");
     return std::nullopt;
   }
   Type t = specOpt->type;
-  t.ptrDepth += parsePointerDepth();
+  auto quals = parsePointerQuals();
+  t.addPointerQuals(quals.consts);
   if (cur_.kind == TokenKind::LBracket) {
     auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
     if (!dims) return std::nullopt;
     t.arrayDims = std::move(*dims);
   }
   return t;
+}
+
+std::optional<Declarator> Parser::parseDeclarator(const Type& baseType, bool allowArray,
+                                                  bool allowFirstEmpty,
+                                                  bool allowFunctionPointer) {
+  Declarator d;
+  auto retQuals = parsePointerQuals();
+  if (allowFunctionPointer && cur_.kind == TokenKind::LParen && peekToken().kind == TokenKind::Star) {
+    advance(); // '('
+    advance(); // '*'
+    bool ptrIsConst = false;
+    while (cur_.kind == TokenKind::KwConst) {
+      ptrIsConst = true;
+      advance();
+    }
+    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    d.name = cur_.text;
+    d.nameLoc = cur_.loc;
+    advance();
+    std::optional<std::vector<std::optional<size_t>>> dims;
+    if (allowArray && cur_.kind == TokenKind::LBracket) {
+      dims = parseArrayDims(/*allowFirstEmpty=*/allowFirstEmpty);
+      if (!dims) return std::nullopt;
+    }
+    if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+    advance();
+    if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+    advance();
+    auto fnParams = parseParamList();
+    if (!fnParams) return std::nullopt;
+    if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+    advance();
+
+    auto fnTy = std::make_shared<FunctionType>();
+    fnTy->returnType = baseType;
+    fnTy->returnType.addPointerQuals(retQuals.consts);
+    fnTy->isVariadic = fnParams->isVariadic;
+    for (const auto& param : fnParams->params) {
+      fnTy->params.push_back(param.type);
+    }
+
+    d.type = baseType;
+    d.type.ptrDepth = 0;
+    d.type.ptrConst.clear();
+    d.type.addPointerLevel(ptrIsConst);
+    d.type.func = std::move(fnTy);
+    if (dims) d.type.arrayDims = std::move(*dims);
+    return d;
+  }
+
+  if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+  d.name = cur_.text;
+  d.nameLoc = cur_.loc;
+  advance();
+  d.type = baseType;
+  d.type.addPointerQuals(retQuals.consts);
+  if (allowArray && cur_.kind == TokenKind::LBracket) {
+    auto dims = parseArrayDims(/*allowFirstEmpty=*/allowFirstEmpty);
+    if (!dims) return std::nullopt;
+    d.type.arrayDims = std::move(*dims);
+  }
+  return d;
 }
 
 // -------------------- TU / top-level --------------------
@@ -334,39 +573,83 @@ std::optional<Parser::ParamList> Parser::parseParamList() {
     }
     SourceLocation typeLoc = cur_.loc;
     Param p;
+    Type baseType;
+    PtrQuals retQuals;
     if (cur_.kind == TokenKind::KwVoid) {
       advance();
       if (cur_.kind == TokenKind::RParen) {
         // "void)" means no parameters
         return list;
       }
-      p.loc = typeLoc;
-      p.type.base = Type::Base::Void;
-      p.type.ptrDepth += parsePointerDepth();
+      baseType.base = Type::Base::Void;
+      retQuals = parsePointerQuals();
     } else {
-      auto specOpt = parseTypeSpec(/*allowStructDef=*/false);
+      auto specOpt = parseTypeSpec(/*allowStructDef=*/false, /*allowStorage=*/false);
       if (!specOpt) {
         diags_.error(cur_.loc, "expected type");
         return std::nullopt;
       }
-      p.loc = typeLoc;
-      p.type = specOpt->type;
-      p.type.ptrDepth += parsePointerDepth();
+      baseType = specOpt->type;
+      retQuals = parsePointerQuals();
     }
+    p.loc = typeLoc;
 
-  if (cur_.kind == TokenKind::Identifier) {
-    p.name = cur_.text;
-    p.nameLoc = cur_.loc;
-    advance();
-    if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
-      if (!dims) return std::nullopt;
-      p.type.arrayDims = std::move(*dims);
+    if (cur_.kind == TokenKind::LParen && peekToken().kind == TokenKind::Star) {
+      // function pointer parameter: ret_type (*name?)(params)
+      advance(); // '('
+      advance(); // '*'
+      bool ptrIsConst = false;
+      while (cur_.kind == TokenKind::KwConst) {
+        ptrIsConst = true;
+        advance();
+      }
+      if (cur_.kind == TokenKind::Identifier) {
+        p.name = cur_.text;
+        p.nameLoc = cur_.loc;
+        advance();
+      } else {
+        p.name = std::nullopt;
+        p.nameLoc = SourceLocation{};
+      }
+      if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+      advance();
+      if (!expect(TokenKind::LParen, "'('")) return std::nullopt;
+      advance();
+      auto fnParams = parseParamList();
+      if (!fnParams) return std::nullopt;
+      if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+      advance();
+
+      auto fnTy = std::make_shared<FunctionType>();
+      fnTy->returnType = baseType;
+      fnTy->returnType.addPointerQuals(retQuals.consts);
+      fnTy->isVariadic = fnParams->isVariadic;
+      for (const auto& param : fnParams->params) {
+        fnTy->params.push_back(param.type);
+      }
+
+      p.type = baseType;
+      p.type.ptrDepth = 0;
+      p.type.ptrConst.clear();
+      p.type.addPointerLevel(ptrIsConst);
+      p.type.func = std::move(fnTy);
+    } else {
+      p.type = baseType;
+      p.type.addPointerQuals(retQuals.consts);
+      if (cur_.kind == TokenKind::Identifier) {
+        p.name = cur_.text;
+        p.nameLoc = cur_.loc;
+        advance();
+        if (cur_.kind == TokenKind::LBracket) {
+          auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
+          if (!dims) return std::nullopt;
+          p.type.arrayDims = std::move(*dims);
+        }
+      } else {
+        p.name = std::nullopt;
+        p.nameLoc = SourceLocation{}; // unused
+      }
     }
-  } else {
-    p.name = std::nullopt;
-    p.nameLoc = SourceLocation{}; // unused
-  }
 
     list.params.push_back(std::move(p));
 
@@ -386,17 +669,17 @@ std::optional<Parser::ParamList> Parser::parseParamList() {
 
 std::optional<FunctionProto> Parser::parseFunctionProto() {
   // type_spec <name> '(' params ')'
-  auto specOpt = parseTypeSpec(/*allowStructDef=*/false);
+  auto specOpt = parseTypeSpec(/*allowStructDef=*/false, /*allowStorage=*/false);
   if (!specOpt) {
     diags_.error(cur_.loc, "expected return type");
     return std::nullopt;
   }
-  int retDepth = parsePointerDepth();
+  auto retQuals = parsePointerQuals();
 
   if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
   FunctionProto proto;
   proto.returnType = specOpt->type;
-  proto.returnType.ptrDepth += retDepth;
+  proto.returnType.addPointerQuals(retQuals.consts);
   proto.name = cur_.text;
   proto.nameLoc = cur_.loc;
   advance();
@@ -445,44 +728,49 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     return parseTypedefTopLevel();
   }
 
-  auto specOpt = parseTypeSpec(/*allowStructDef=*/true);
+  auto specOpt = parseTypeSpec(/*allowStructDef=*/true, /*allowStorage=*/true);
   if (!specOpt) {
     diags_.error(cur_.loc, "expected type");
     return std::nullopt;
   }
 
   if (specOpt->structDef && cur_.kind == TokenKind::Semicolon) {
+    if (specOpt->storage != StorageClass::None) {
+      diags_.error(cur_.loc, "storage class not allowed here");
+      return std::nullopt;
+    }
     StructDef def = std::move(*specOpt->structDef);
     advance();
     return TopLevelItem{std::move(def)};
   }
   if (specOpt->enumDef && cur_.kind == TokenKind::Semicolon) {
+    if (specOpt->storage != StorageClass::None) {
+      diags_.error(cur_.loc, "storage class not allowed here");
+      return std::nullopt;
+    }
     EnumDef def = std::move(*specOpt->enumDef);
     advance();
     return TopLevelItem{std::move(def)};
   }
 
   Type baseType = specOpt->type;
-  int firstDepth = parsePointerDepth();
+  auto firstDecl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/true,
+                                   /*allowFunctionPointer=*/true);
+  if (!firstDecl) return std::nullopt;
 
-  if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
-  std::string name = cur_.text;
-  SourceLocation nameLoc = cur_.loc;
-  advance();
-
-  if (cur_.kind == TokenKind::LParen) {
+  if (!firstDecl->type.func && cur_.kind == TokenKind::LParen) {
     advance(); // '('
 
     auto params = parseParamList();
     if (!params) return std::nullopt;
 
     FunctionProto proto;
-    proto.returnType = baseType;
-    proto.returnType.ptrDepth += firstDepth;
-    proto.name = std::move(name);
-    proto.nameLoc = nameLoc;
+    proto.returnType = firstDecl->type;
+    proto.name = std::move(firstDecl->name);
+    proto.nameLoc = firstDecl->nameLoc;
     proto.params = std::move(params->params);
     proto.isVariadic = params->isVariadic;
+    proto.storage = specOpt->storage;
 
     if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
     advance();
@@ -523,15 +811,10 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
 
   std::vector<DeclItem> items;
   DeclItem first;
-  first.type = baseType;
-  first.type.ptrDepth += firstDepth;
-  first.name = std::move(name);
-  first.nameLoc = nameLoc;
-    if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
-      if (!dims) return std::nullopt;
-      first.type.arrayDims = std::move(*dims);
-    }
+  first.type = firstDecl->type;
+  first.name = std::move(firstDecl->name);
+  first.nameLoc = firstDecl->nameLoc;
+  first.storage = specOpt->storage;
 
   if (cur_.kind == TokenKind::Assign) {
     advance();
@@ -544,19 +827,14 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
 
   while (cur_.kind == TokenKind::Comma) {
     advance();
-    int depth = parsePointerDepth();
-    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/true,
+                                /*allowFunctionPointer=*/true);
+    if (!decl) return std::nullopt;
     DeclItem item;
-    item.type = baseType;
-    item.type.ptrDepth += depth;
-    item.name = cur_.text;
-    item.nameLoc = cur_.loc;
-    advance();
-    if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
-      if (!dims) return std::nullopt;
-      item.type.arrayDims = std::move(*dims);
-    }
+    item.type = decl->type;
+    item.name = std::move(decl->name);
+    item.nameLoc = decl->nameLoc;
+    item.storage = specOpt->storage;
 
     if (cur_.kind == TokenKind::Assign) {
       advance();
@@ -600,7 +878,10 @@ std::optional<AstTranslationUnit> Parser::parseTranslationUnit() {
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
   if (cur_.kind == TokenKind::KwTypedef) return parseTypedefStmt();
-  if (cur_.kind == TokenKind::KwChar || cur_.kind == TokenKind::KwShort ||
+  if (cur_.kind == TokenKind::KwStatic || cur_.kind == TokenKind::KwExtern ||
+      cur_.kind == TokenKind::KwConst ||
+      cur_.kind == TokenKind::KwChar ||
+      cur_.kind == TokenKind::KwShort ||
       cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
       cur_.kind == TokenKind::KwUnsigned || cur_.kind == TokenKind::KwFloat ||
       cur_.kind == TokenKind::KwDouble ||
@@ -636,7 +917,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
 
 std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
   SourceLocation l = cur_.loc;
-  auto specOpt = parseTypeSpec(/*allowStructDef=*/false);
+  auto specOpt = parseTypeSpec(/*allowStructDef=*/false, /*allowStorage=*/true);
   if (!specOpt) {
     diags_.error(cur_.loc, "expected type");
     return std::nullopt;
@@ -646,19 +927,14 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
   Type baseType = specOpt->type;
 
   while (true) {
-    int depth = parsePointerDepth();
-    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/true,
+                                /*allowFunctionPointer=*/true);
+    if (!decl) return std::nullopt;
     DeclItem item;
-    item.type = baseType;
-    item.type.ptrDepth += depth;
-    item.name = cur_.text;
-    item.nameLoc = cur_.loc;
-    advance();
-    if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/true);
-      if (!dims) return std::nullopt;
-      item.type.arrayDims = std::move(*dims);
-    }
+    item.type = decl->type;
+    item.name = std::move(decl->name);
+    item.nameLoc = decl->nameLoc;
+    item.storage = specOpt->storage;
 
     if (cur_.kind == TokenKind::Assign) {
       advance();
@@ -682,9 +958,13 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseDeclStmt() {
 std::optional<std::vector<DeclItem>> Parser::parseTypedefItems(bool allowStructDef) {
   if (!expect(TokenKind::KwTypedef, "'typedef'")) return std::nullopt;
   advance();
-  auto specOpt = parseTypeSpec(allowStructDef);
+  auto specOpt = parseTypeSpec(allowStructDef, /*allowStorage=*/false);
   if (!specOpt) {
     diags_.error(cur_.loc, "expected type");
+    return std::nullopt;
+  }
+  if (specOpt->storage != StorageClass::None) {
+    diags_.error(cur_.loc, "storage class not allowed in typedef");
     return std::nullopt;
   }
   if (specOpt->structDef) {
@@ -698,19 +978,13 @@ std::optional<std::vector<DeclItem>> Parser::parseTypedefItems(bool allowStructD
   Type baseType = specOpt->type;
 
   while (true) {
-    int depth = parsePointerDepth();
-    if (!expect(TokenKind::Identifier, "identifier")) return std::nullopt;
+    auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/false,
+                                /*allowFunctionPointer=*/true);
+    if (!decl) return std::nullopt;
     DeclItem item;
-    item.type = baseType;
-    item.type.ptrDepth += depth;
-    item.name = cur_.text;
-    item.nameLoc = cur_.loc;
-    advance();
-    if (cur_.kind == TokenKind::LBracket) {
-      auto dims = parseArrayDims(/*allowFirstEmpty=*/false);
-      if (!dims) return std::nullopt;
-      item.type.arrayDims = std::move(*dims);
-    }
+    item.type = decl->type;
+    item.name = std::move(decl->name);
+    item.nameLoc = decl->nameLoc;
     if (typedefs_.count(item.name)) {
       diags_.error(item.nameLoc, "redefinition of typedef '" + item.name + "'");
       return std::nullopt;
@@ -977,7 +1251,9 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseSwitchStmt() {
         diags_.error(cur_.loc, "expected integer literal after 'case'");
         return std::nullopt;
       }
-      int64_t value = std::stoll(cur_.text);
+      auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+      if (!parsed) return std::nullopt;
+      int64_t value = parsed->value;
       advance();
       if (!expect(TokenKind::Colon, "':'")) return std::nullopt;
       advance();
@@ -1033,15 +1309,16 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseSwitchStmt() {
 std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
   if (cur_.kind == TokenKind::IntegerLiteral) {
     SourceLocation l = cur_.loc;
-    int64_t v = std::stoll(cur_.text);
+    auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+    if (!parsed) return std::nullopt;
     advance();
-    return std::make_unique<IntLiteralExpr>(l, v);
+    return std::make_unique<IntLiteralExpr>(l, parsed->value, parsed->isUnsigned, parsed->longKind);
   }
   if (cur_.kind == TokenKind::CharLiteral) {
     SourceLocation l = cur_.loc;
     int64_t v = std::stoll(cur_.text);
     advance();
-    return std::make_unique<IntLiteralExpr>(l, v);
+    return std::make_unique<IntLiteralExpr>(l, v, false, 0);
   }
   if (cur_.kind == TokenKind::FloatLiteral) {
     SourceLocation l = cur_.loc;
@@ -1073,34 +1350,6 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePrimary() {
     SourceLocation idLoc = cur_.loc;
     std::string name = cur_.text;
     advance();
-
-    if (cur_.kind == TokenKind::LParen) {
-      advance(); // '('
-      std::vector<std::unique_ptr<Expr>> args;
-
-      if (cur_.kind != TokenKind::RParen) {
-        while (true) {
-          auto a = parseAssignmentExpr(); // IMPORTANT: no comma-expr
-          if (!a) return std::nullopt;
-          args.push_back(std::move(*a));
-
-          if (cur_.kind == TokenKind::Comma) {
-            advance();
-            if (cur_.kind == TokenKind::RParen) {
-              diags_.error(cur_.loc, "expected expression");
-              return std::nullopt;
-            }
-            continue;
-          }
-          break;
-        }
-      }
-
-      if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
-      advance();
-      return std::make_unique<CallExpr>(idLoc, std::move(name), idLoc, std::move(args));
-    }
-
     return std::make_unique<VarRefExpr>(idLoc, std::move(name));
   }
 
@@ -1207,6 +1456,41 @@ std::optional<std::unique_ptr<Expr>> Parser::parsePostfix() {
       base = std::make_unique<MemberExpr>(l, std::move(*base), std::move(member), memberLoc, isArrow);
       continue;
     }
+    if (cur_.kind == TokenKind::LParen) {
+      SourceLocation l = cur_.loc;
+      advance(); // '('
+      std::vector<std::unique_ptr<Expr>> args;
+
+      if (cur_.kind != TokenKind::RParen) {
+        while (true) {
+          auto a = parseAssignmentExpr(); // IMPORTANT: no comma-expr
+          if (!a) return std::nullopt;
+          args.push_back(std::move(*a));
+
+          if (cur_.kind == TokenKind::Comma) {
+            advance();
+            if (cur_.kind == TokenKind::RParen) {
+              diags_.error(cur_.loc, "expected expression");
+              return std::nullopt;
+            }
+            continue;
+          }
+          break;
+        }
+      }
+
+      if (!expect(TokenKind::RParen, "')'")) return std::nullopt;
+      advance();
+
+      if (auto* vr = dynamic_cast<VarRefExpr*>(base->get())) {
+        SourceLocation calleeLoc = vr->loc;
+        std::string name = vr->name;
+        base = std::make_unique<CallExpr>(calleeLoc, std::move(name), calleeLoc, std::move(args));
+      } else {
+        base = std::make_unique<CallExpr>(l, std::move(*base), std::move(args));
+      }
+      continue;
+    }
     if (cur_.kind == TokenKind::PlusPlus || cur_.kind == TokenKind::MinusMinus) {
       SourceLocation l = cur_.loc;
       bool isInc = cur_.kind == TokenKind::PlusPlus;
@@ -1267,7 +1551,9 @@ std::optional<std::unique_ptr<Expr>> Parser::parseInitializer() {
             diags_.error(cur_.loc, "expected integer literal in array designator");
             return std::nullopt;
           }
-          size_t idx = static_cast<size_t>(std::stoll(cur_.text));
+          auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
+          if (!parsed) return std::nullopt;
+          size_t idx = static_cast<size_t>(parsed->value);
           advance();
           if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
           advance();

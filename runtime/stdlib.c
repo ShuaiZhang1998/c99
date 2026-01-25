@@ -209,3 +209,231 @@ ldiv_t ldiv(long num, long den) {
   r.rem = num % den;
   return r;
 }
+
+static int is_space_char(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static int digit_value(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'Z') return c - 'A' + 10;
+  return -1;
+}
+
+long strtol(const char* nptr, char** endptr, int base) {
+  const char* s = nptr;
+  if (!s) {
+    if (endptr) *endptr = (char*)nptr;
+    return 0;
+  }
+  while (is_space_char(*s)) ++s;
+  int sign = 1;
+  if (*s == '+' || *s == '-') {
+    if (*s == '-') sign = -1;
+    ++s;
+  }
+  if (base == 0) {
+    if (*s == '0') {
+      if (s[1] == 'x' || s[1] == 'X') base = 16;
+      else base = 8;
+    } else {
+      base = 10;
+    }
+  }
+  if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+  unsigned long value = 0;
+  int any = 0;
+  while (*s) {
+    int d = digit_value(*s);
+    if (d < 0 || d >= base) break;
+    value = value * (unsigned long)base + (unsigned long)d;
+    any = 1;
+    ++s;
+  }
+  if (endptr) *endptr = (char*)(any ? s : nptr);
+  return (long)(sign * (long)value);
+}
+
+unsigned long strtoul(const char* nptr, char** endptr, int base) {
+  const char* s = nptr;
+  if (!s) {
+    if (endptr) *endptr = (char*)nptr;
+    return 0;
+  }
+  while (is_space_char(*s)) ++s;
+  int sign = 1;
+  if (*s == '+' || *s == '-') {
+    if (*s == '-') sign = -1;
+    ++s;
+  }
+  if (base == 0) {
+    if (*s == '0') {
+      if (s[1] == 'x' || s[1] == 'X') base = 16;
+      else base = 8;
+    } else {
+      base = 10;
+    }
+  }
+  if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+  unsigned long value = 0;
+  int any = 0;
+  while (*s) {
+    int d = digit_value(*s);
+    if (d < 0 || d >= base) break;
+    value = value * (unsigned long)base + (unsigned long)d;
+    any = 1;
+    ++s;
+  }
+  if (endptr) *endptr = (char*)(any ? s : nptr);
+  if (sign < 0) return (unsigned long)(-(long)value);
+  return value;
+}
+
+double strtod(const char* nptr, char** endptr) {
+  const char* s = nptr;
+  if (!s) {
+    if (endptr) *endptr = (char*)nptr;
+    return 0.0;
+  }
+  while (is_space_char(*s)) ++s;
+  int sign = 1;
+  if (*s == '+' || *s == '-') {
+    if (*s == '-') sign = -1;
+    ++s;
+  }
+  double value = 0.0;
+  int any = 0;
+  while (*s >= '0' && *s <= '9') {
+    value = value * 10.0 + (double)(*s - '0');
+    any = 1;
+    ++s;
+  }
+  if (*s == '.') {
+    ++s;
+    double scale = 0.1;
+    while (*s >= '0' && *s <= '9') {
+      value += (double)(*s - '0') * scale;
+      scale *= 0.1;
+      any = 1;
+      ++s;
+    }
+  }
+  int exp = 0;
+  int exp_sign = 1;
+  const char* exp_start = s;
+  if (*s == 'e' || *s == 'E') {
+    ++s;
+    if (*s == '+' || *s == '-') {
+      if (*s == '-') exp_sign = -1;
+      ++s;
+    }
+    if (*s < '0' || *s > '9') {
+      s = exp_start;
+    } else {
+      while (*s >= '0' && *s <= '9') {
+        exp = exp * 10 + (*s - '0');
+        ++s;
+      }
+    }
+  }
+  if (endptr) *endptr = (char*)(any ? s : nptr);
+  if (!any) return 0.0;
+  if (exp != 0) {
+    int e = exp_sign * exp;
+    if (e > 0) {
+      while (e-- > 0) value *= 10.0;
+    } else {
+      while (e++ < 0) value *= 0.1;
+    }
+  }
+  return (double)sign * value;
+}
+
+static unsigned long rand_state = 1;
+
+void srand(unsigned int seed) {
+  rand_state = seed ? seed : 1u;
+}
+
+int rand(void) {
+  rand_state = rand_state * 1103515245u + 12345u;
+  return (int)((rand_state >> 16) & 0x7fff);
+}
+
+static void swap_bytes(unsigned char* a, unsigned char* b, size_t size) {
+  for (size_t i = 0; i < size; ++i) {
+    unsigned char tmp = a[i];
+    a[i] = b[i];
+    b[i] = tmp;
+  }
+}
+
+static void insertion_sort(unsigned char* base, size_t nmemb, size_t size,
+                           int (*compar)(const void*, const void*)) {
+  for (size_t i = 1; i < nmemb; ++i) {
+    size_t j = i;
+    while (j > 0 && compar(base + (j - 1) * size, base + j * size) > 0) {
+      swap_bytes(base + (j - 1) * size, base + j * size, size);
+      --j;
+    }
+  }
+}
+
+static void qsort_impl(unsigned char* base, size_t nmemb, size_t size,
+                       int (*compar)(const void*, const void*)) {
+  if (nmemb < 2) return;
+  if (nmemb < 16) {
+    insertion_sort(base, nmemb, size, compar);
+    return;
+  }
+  unsigned char* pivot = (unsigned char*)malloc(size);
+  if (!pivot) {
+    insertion_sort(base, nmemb, size, compar);
+    return;
+  }
+  mem_copy(pivot, base + (nmemb / 2) * size, size);
+
+  size_t i = 0;
+  size_t j = nmemb - 1;
+  while (1) {
+    while (compar(base + i * size, pivot) < 0) i++;
+    while (compar(base + j * size, pivot) > 0) {
+      if (j == 0) break;
+      j--;
+    }
+    if (i >= j) break;
+    swap_bytes(base + i * size, base + j * size, size);
+    i++;
+    if (j == 0) break;
+    j--;
+  }
+  free(pivot);
+
+  size_t left = j + 1;
+  if (left > 0) qsort_impl(base, left, size, compar);
+  if (left < nmemb) qsort_impl(base + left * size, nmemb - left, size, compar);
+}
+
+void qsort(void* base, size_t nmemb, size_t size,
+           int (*compar)(const void*, const void*)) {
+  if (!base || nmemb == 0 || size == 0 || !compar) return;
+  qsort_impl((unsigned char*)base, nmemb, size, compar);
+}
+
+void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+              int (*compar)(const void*, const void*)) {
+  if (!key || !base || nmemb == 0 || size == 0 || !compar) return NULL;
+  size_t lo = 0;
+  size_t hi = nmemb;
+  const unsigned char* b = (const unsigned char*)base;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    const void* elem = b + mid * size;
+    int c = compar(key, elem);
+    if (c == 0) return (void*)elem;
+    if (c < 0) hi = mid;
+    else lo = mid + 1;
+  }
+  return NULL;
+}

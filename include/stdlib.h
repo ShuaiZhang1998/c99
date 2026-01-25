@@ -34,4 +34,20 @@ long long llabs(long long v);
 div_t div(int num, int den);
 ldiv_t ldiv(long num, long den);
 
+#ifndef RAND_MAX
+#define RAND_MAX 32767
+#endif
+
+long strtol(const char* nptr, char** endptr, int base);
+unsigned long strtoul(const char* nptr, char** endptr, int base);
+double strtod(const char* nptr, char** endptr);
+
+int rand(void);
+void srand(unsigned int seed);
+
+void qsort(void* base, size_t nmemb, size_t size,
+           int (*compar)(const void*, const void*));
+void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
+              int (*compar)(const void*, const void*));
+
 #endif
