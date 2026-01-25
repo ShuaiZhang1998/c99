@@ -15,11 +15,18 @@ typedef struct {
 typedef struct {
   Reader* base;
   int* count;
+  int buf[2];
+  int buf_len;
 } CountReader;
 
 static int counted_read(void* ctx) {
   CountReader* cr = (CountReader*)ctx;
-  int ch = cr->base->read(cr->base->ctx);
+  int ch = -1;
+  if (cr->buf_len > 0) {
+    ch = cr->buf[--cr->buf_len];
+  } else {
+    ch = cr->base->read(cr->base->ctx);
+  }
   if (ch >= 0) (*cr->count)++;
   return ch;
 }
@@ -27,6 +34,11 @@ static int counted_read(void* ctx) {
 static void counted_unread(void* ctx, int ch) {
   CountReader* cr = (CountReader*)ctx;
   if (ch >= 0) (*cr->count)--;
+  if (ch < 0) return;
+  if (cr->buf_len < 2) {
+    cr->buf[cr->buf_len++] = ch;
+    return;
+  }
   cr->base->unread(cr->base->ctx, ch);
 }
 
@@ -686,7 +698,7 @@ static int scan_float(Reader* r, double* out, int width, int* eof) {
 
 static int scan_impl(Reader* base, const char* fmt, va_list ap) {
   int count = 0;
-  CountReader cr = {base, &count};
+  CountReader cr = {base, &count, {0, 0}, 0};
   Reader wrapped;
   wrapped.read = counted_read;
   wrapped.unread = counted_unread;
