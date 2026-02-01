@@ -122,7 +122,9 @@ Token Lexer::lexIdentifierOrKeyword() {
   if (s == "double")   return Token{TokenKind::KwDouble, s, loc};
   if (s == "void")     return Token{TokenKind::KwVoid, s, loc};
   if (s == "struct")   return Token{TokenKind::KwStruct, s, loc};
+  if (s == "union")    return Token{TokenKind::KwUnion, s, loc};
   if (s == "enum")     return Token{TokenKind::KwEnum, s, loc};
+  if (s == "_Bool")    return Token{TokenKind::KwBool, s, loc};
   if (s == "typedef")  return Token{TokenKind::KwTypedef, s, loc};
   if (s == "sizeof")   return Token{TokenKind::KwSizeof, s, loc};
   if (s == "return")   return Token{TokenKind::KwReturn, s, loc};
@@ -148,6 +150,10 @@ Token Lexer::lexNumber() {
   SourceLocation loc{ i_, line_, col_ };
   std::string s;
   bool isFloat = false;
+  auto isHexDigit = [](char c) {
+    return std::isdigit((unsigned char)c) ||
+           (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  };
   if (peek() == '.') {
     isFloat = true;
     s.push_back(get());
@@ -157,10 +163,53 @@ Token Lexer::lexNumber() {
       else break;
     }
   } else {
-    while (!eof()) {
-      char c = peek();
-      if (std::isdigit((unsigned char)c)) s.push_back(get());
-      else break;
+    if (peek() == '0' && i_ + 1 < input_.size() &&
+        (input_[i_ + 1] == 'x' || input_[i_ + 1] == 'X')) {
+      s.push_back(get()); // 0
+      s.push_back(get()); // x/X
+      while (!eof()) {
+        char c = peek();
+        if (isHexDigit(c)) {
+          s.push_back(get());
+        } else {
+          break;
+        }
+      }
+      bool hasHexFloat = false;
+      size_t j = i_;
+      if (j < input_.size() && input_[j] == '.') {
+        ++j;
+        while (j < input_.size() && isHexDigit(input_[j])) ++j;
+      }
+      if (j < input_.size() && (input_[j] == 'p' || input_[j] == 'P')) {
+        hasHexFloat = true;
+      }
+      if (hasHexFloat) {
+        if (!eof() && peek() == '.') {
+          s.push_back(get());
+          while (!eof()) {
+            char c = peek();
+            if (isHexDigit(c)) s.push_back(get());
+            else break;
+          }
+        }
+        if (!eof() && (peek() == 'p' || peek() == 'P')) {
+          isFloat = true;
+          s.push_back(get());
+          if (!eof() && (peek() == '+' || peek() == '-')) s.push_back(get());
+          while (!eof()) {
+            char c = peek();
+            if (std::isdigit((unsigned char)c)) s.push_back(get());
+            else break;
+          }
+        }
+      }
+    } else {
+      while (!eof()) {
+        char c = peek();
+        if (std::isdigit((unsigned char)c)) s.push_back(get());
+        else break;
+      }
     }
     if (!eof() && peek() == '.') {
       isFloat = true;

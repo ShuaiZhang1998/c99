@@ -36,6 +36,24 @@ struct CGEnv {
   // struct table: name -> llvm::StructType*
   std::unordered_map<std::string, llvm::StructType*> structs;
   std::unordered_map<std::string, std::vector<StructField>> structFields;
+  // union table: name -> llvm::StructType*
+  std::unordered_map<std::string, llvm::StructType*> unions;
+  std::unordered_map<std::string, std::vector<StructField>> unionFields;
+
+  struct RecordFieldAccess {
+    Type type;
+    Type storageType;
+    bool isBitfield = false;
+    unsigned storageIndex = 0;
+    int bitOffset = 0;
+    int bitWidth = 0;
+  };
+
+  std::unordered_map<std::string, std::unordered_map<std::string, RecordFieldAccess>>
+      structFieldAccess;
+  std::unordered_map<std::string, std::unordered_map<std::string, RecordFieldAccess>>
+      unionFieldAccess;
+  std::unordered_map<std::string, bool> structHasBitfields;
   std::unordered_map<std::string, int64_t> enumConstants;
 
   struct GlobalBinding {
@@ -143,6 +161,14 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
     auto it = env.structs.find(t.structName);
     assert(it != env.structs.end());
     baseTy = it->second;
+  } else if (t.base == Type::Base::Union) {
+    auto it = env.unions.find(t.unionName);
+    assert(it != env.unions.end());
+    baseTy = it->second;
+  } else if (t.base == Type::Base::Bool) {
+    baseTy = llvm::Type::getInt1Ty(env.ctx);
+  } else if (t.base == Type::Base::LongDouble) {
+    baseTy = llvm::Type::getDoubleTy(env.ctx);
   } else if (t.base == Type::Base::Enum) {
     baseTy = env.i32Ty();
   } else if (t.base == Type::Base::Char) {
@@ -184,7 +210,7 @@ static llvm::Type* llvmType(CGEnv& env, const Type& t) {
 static llvm::AllocaInst* createEntryAlloca(CGEnv& env, const std::string& name, const Type& type);
 
 static llvm::Type* abiReturnType(CGEnv& env, const Type& t) {
-  if (t.base == Type::Base::Struct && t.ptrDepth == 0) {
+  if ((t.base == Type::Base::Struct || t.base == Type::Base::Union) && t.ptrDepth == 0) {
     llvm::Type* stTy = llvmType(env, t);
     uint64_t size = env.mod.getDataLayout().getTypeAllocSize(stTy);
     if (size == 1) return llvm::Type::getInt8Ty(env.ctx);
@@ -242,6 +268,16 @@ static llvm::Value* castIntegerToType(CGEnv& env, llvm::Value* v, const Type& sr
 static llvm::Value* castNumericToType(
     CGEnv& env, llvm::Value* v, const Type& src, const Type& dst) {
   if (src == dst) return v;
+  if (dst.isBool()) {
+    if (src.isFloating()) {
+      llvm::Value* zero = llvm::ConstantFP::get(v->getType(), 0.0);
+      return env.b.CreateFCmpONE(v, zero, "bool.cast");
+    }
+    if (src.isInteger()) {
+      llvm::Value* zero = llvm::ConstantInt::get(v->getType(), 0, true);
+      return env.b.CreateICmpNE(v, zero, "bool.cast");
+    }
+  }
   llvm::Type* dstTy = llvmType(env, dst);
   if (dst.isInteger()) {
     if (src.isInteger()) return castIntegerToType(env, v, src, dst);
@@ -284,10 +320,29 @@ static uint64_t integerSizeBytes(const Type& t) {
     case Type::Base::Long:  return 8;
     case Type::Base::LongLong: return 8;
     case Type::Base::Int:   return 4;
+    case Type::Base::Bool:  return 1;
     case Type::Base::Enum:  return 4;
     case Type::Base::Float: return 4;
     case Type::Base::Double:return 8;
+    case Type::Base::LongDouble: return 8;
     default: return sizeof(void*);
+  }
+}
+
+static int64_t integerBitWidth(const Type& t) {
+  return static_cast<int64_t>(integerSizeBytes(t)) * 8;
+}
+
+static llvm::Type* bitfieldStorageType(CGEnv& env, const Type& t) {
+  switch (t.base) {
+    case Type::Base::Char: return llvm::Type::getInt8Ty(env.ctx);
+    case Type::Base::Short: return llvm::Type::getInt16Ty(env.ctx);
+    case Type::Base::Long: return llvm::Type::getInt64Ty(env.ctx);
+    case Type::Base::LongLong: return llvm::Type::getInt64Ty(env.ctx);
+    case Type::Base::Enum: return env.i32Ty();
+    case Type::Base::Int:
+    default:
+      return env.i32Ty();
   }
 }
 
@@ -302,14 +357,9 @@ static uint64_t sizeOfType(const Type& t, const CGEnv& env) {
     }
     return total;
   }
-  if (t.base == Type::Base::Struct && t.ptrDepth == 0) {
-    auto it = env.structFields.find(t.structName);
-    if (it == env.structFields.end()) return sizeof(void*);
-    uint64_t total = 0;
-    for (const auto& field : it->second) {
-      total += sizeOfType(field.type, env);
-    }
-    return total;
+  if ((t.base == Type::Base::Struct || t.base == Type::Base::Union) && t.ptrDepth == 0) {
+    llvm::Type* ty = llvmType(const_cast<CGEnv&>(env), t);
+    return env.mod.getDataLayout().getTypeAllocSize(ty);
   }
   if (t.isNumeric()) return integerSizeBytes(t);
   return sizeof(void*);
@@ -317,6 +367,7 @@ static uint64_t sizeOfType(const Type& t, const CGEnv& env) {
 
 static int integerRank(const Type& t) {
   switch (t.base) {
+    case Type::Base::Bool: return 0;
     case Type::Base::Char: return 1;
     case Type::Base::Short: return 2;
     case Type::Base::Int: return 3;
@@ -348,6 +399,11 @@ static Type promoteInteger(const Type& t) {
     res.enumName.clear();
     return res;
   }
+  if (t.base == Type::Base::Bool) {
+    res.base = Type::Base::Int;
+    res.isUnsigned = false;
+    return res;
+  }
   if (t.base == Type::Base::Char || t.base == Type::Base::Short) {
     res.base = Type::Base::Int;
   }
@@ -355,14 +411,19 @@ static Type promoteInteger(const Type& t) {
 }
 
 static Type commonIntegerType(const Type& lhs, const Type& rhs) {
-  int rank = std::max(integerRank(lhs), integerRank(rhs));
+  Type L = promoteInteger(lhs);
+  Type R = promoteInteger(rhs);
+  int rank = std::max(integerRank(L), integerRank(R));
   Type t = typeFromRank(rank);
-  t.isUnsigned = lhs.isUnsigned || rhs.isUnsigned;
+  t.isUnsigned = L.isUnsigned || R.isUnsigned;
   return t;
 }
 
 static Type commonNumericType(const Type& lhs, const Type& rhs) {
   if (lhs.isFloating() || rhs.isFloating()) {
+    if (lhs.base == Type::Base::LongDouble || rhs.base == Type::Base::LongDouble) {
+      return Type{Type::Base::LongDouble, 0};
+    }
     if (lhs.base == Type::Base::Double || rhs.base == Type::Base::Double) {
       return Type{Type::Base::Double, 0};
     }
@@ -415,7 +476,8 @@ static llvm::Constant* zeroValue(CGEnv& env, const Type& t) {
   if (t.isPointer()) {
     return llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(ty));
   }
-  if (t.isArray() || (t.base == Type::Base::Struct && t.ptrDepth == 0)) {
+  if (t.isArray() || ((t.base == Type::Base::Struct || t.base == Type::Base::Union) &&
+                      t.ptrDepth == 0)) {
     return llvm::ConstantAggregateZero::get(ty);
   }
   if (t.isInteger()) {
@@ -439,11 +501,104 @@ static llvm::Value* decayArrayToPointer(CGEnv& env, llvm::Value* addr, const Typ
   return env.b.CreateGEP(arrTy, addr, idxs, "arr.decay");
 }
 
+static bool lookupFieldAccess(CGEnv& env, const Type& recordTy, const std::string& member,
+                              CGEnv::RecordFieldAccess& out) {
+  if (recordTy.base == Type::Base::Struct) {
+    auto it = env.structFieldAccess.find(recordTy.structName);
+    if (it == env.structFieldAccess.end()) return false;
+    auto fit = it->second.find(member);
+    if (fit == it->second.end()) return false;
+    out = fit->second;
+    return true;
+  }
+  if (recordTy.base == Type::Base::Union) {
+    auto it = env.unionFieldAccess.find(recordTy.unionName);
+    if (it == env.unionFieldAccess.end()) return false;
+    auto fit = it->second.find(member);
+    if (fit == it->second.end()) return false;
+    out = fit->second;
+    return true;
+  }
+  return false;
+}
+
+static llvm::Value* bitfieldLoad(CGEnv& env, llvm::Value* storageAddr,
+                                 const CGEnv::RecordFieldAccess& info) {
+  llvm::Type* storageTy = llvmType(env, info.storageType);
+  llvm::Value* raw = env.b.CreateLoad(storageTy, storageAddr, "bf.raw");
+  unsigned storageBits = static_cast<unsigned>(integerBitWidth(info.storageType));
+  unsigned width = static_cast<unsigned>(info.bitWidth);
+  unsigned offset = static_cast<unsigned>(info.bitOffset);
+
+  if (offset > 0) {
+    raw = env.b.CreateLShr(raw, offset, "bf.shr");
+  }
+  llvm::Value* masked = raw;
+  if (width < storageBits) {
+    uint64_t mask = width == 64 ? ~0ULL : ((1ULL << width) - 1);
+    masked = env.b.CreateAnd(masked,
+                             llvm::ConstantInt::get(storageTy, mask, false),
+                             "bf.mask");
+  }
+  if (!info.type.isUnsigned && width < storageBits) {
+    unsigned shift = storageBits - width;
+    masked = env.b.CreateShl(masked, shift, "bf.shl");
+    masked = env.b.CreateAShr(masked, shift, "bf.ashr");
+  }
+  llvm::Type* fieldTy = llvmType(env, info.type);
+  if (masked->getType() != fieldTy) {
+    masked = env.b.CreateTruncOrBitCast(masked, fieldTy, "bf.cast");
+  }
+  return masked;
+}
+
+static void bitfieldStore(CGEnv& env, llvm::Value* storageAddr,
+                          const CGEnv::RecordFieldAccess& info, llvm::Value* value) {
+  llvm::Type* storageTy = llvmType(env, info.storageType);
+  llvm::Value* raw = env.b.CreateLoad(storageTy, storageAddr, "bf.raw");
+  unsigned width = static_cast<unsigned>(info.bitWidth);
+  unsigned offset = static_cast<unsigned>(info.bitOffset);
+
+  llvm::Value* v = value;
+  if (v->getType() != storageTy) {
+    v = env.b.CreateZExtOrTrunc(v, storageTy, "bf.val.cast");
+  }
+  uint64_t maskBits = width == 64 ? ~0ULL : ((1ULL << width) - 1);
+  llvm::Value* mask = llvm::ConstantInt::get(storageTy, maskBits, false);
+  v = env.b.CreateAnd(v, mask, "bf.val.mask");
+  if (offset > 0) {
+    v = env.b.CreateShl(v, offset, "bf.val.shl");
+  }
+  llvm::Value* clearMask = env.b.CreateNot(
+      env.b.CreateShl(mask, offset, "bf.mask.shl"), "bf.mask.not");
+  llvm::Value* cleared = env.b.CreateAnd(raw, clearMask, "bf.clear");
+  llvm::Value* combined = env.b.CreateOr(cleared, v, "bf.set");
+  env.b.CreateStore(combined, storageAddr);
+}
+
 // forward decl
 static llvm::Value* emitExpr(CGEnv& env, const Expr& e);
 
 static llvm::Value* emitEqualByAddr(
     CGEnv& env, const Type& ty, llvm::Value* lhsAddr, llvm::Value* rhsAddr) {
+  auto emitEqualBytes = [&](uint64_t size) -> llvm::Value* {
+    if (size == 0) return llvm::ConstantInt::getTrue(env.ctx);
+    llvm::Type* i8Ty = llvm::Type::getInt8Ty(env.ctx);
+    llvm::Type* i8PtrTy = llvm::PointerType::getUnqual(i8Ty);
+    llvm::Value* lbase = env.b.CreateBitCast(lhsAddr, i8PtrTy);
+    llvm::Value* rbase = env.b.CreateBitCast(rhsAddr, i8PtrTy);
+    llvm::Value* acc = nullptr;
+    for (uint64_t i = 0; i < size; ++i) {
+      llvm::Value* idx = i32Const(env, static_cast<int64_t>(i));
+      llvm::Value* lptr = env.b.CreateGEP(i8Ty, lbase, idx, "cmp.u.l");
+      llvm::Value* rptr = env.b.CreateGEP(i8Ty, rbase, idx, "cmp.u.r");
+      llvm::Value* l = env.b.CreateLoad(i8Ty, lptr, "cmp.u.lv");
+      llvm::Value* r = env.b.CreateLoad(i8Ty, rptr, "cmp.u.rv");
+      llvm::Value* eq = env.b.CreateICmpEQ(l, r, "cmp.u.eq");
+      acc = acc ? env.b.CreateAnd(acc, eq, "cmp.and") : eq;
+    }
+    return acc ? acc : llvm::ConstantInt::getTrue(env.ctx);
+  };
   if (ty.isPointer() || ty.isInteger() || ty.isFloating()) {
     llvm::Type* elemTy = llvmType(env, ty);
     llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
@@ -472,6 +627,12 @@ static llvm::Value* emitEqualByAddr(
   }
 
   if (ty.base == Type::Base::Struct && ty.ptrDepth == 0) {
+    auto hf = env.structHasBitfields.find(ty.structName);
+    if (hf != env.structHasBitfields.end() && hf->second) {
+      llvm::Type* stTy = llvmType(env, ty);
+      uint64_t size = env.mod.getDataLayout().getTypeAllocSize(stTy);
+      return emitEqualBytes(size);
+    }
     auto it = env.structFields.find(ty.structName);
     auto stIt = env.structs.find(ty.structName);
     if (it == env.structFields.end() || stIt == env.structs.end()) {
@@ -491,6 +652,12 @@ static llvm::Value* emitEqualByAddr(
     return acc;
   }
 
+  if (ty.base == Type::Base::Union && ty.ptrDepth == 0) {
+    llvm::Type* unionTy = llvmType(env, ty);
+    uint64_t size = env.mod.getDataLayout().getTypeAllocSize(unionTy);
+    return emitEqualBytes(size);
+  }
+
   llvm::Type* elemTy = llvmType(env, ty);
   llvm::Value* L = env.b.CreateLoad(elemTy, lhsAddr, "cmp.l");
   llvm::Value* R = env.b.CreateLoad(elemTy, rhsAddr, "cmp.r");
@@ -504,7 +671,8 @@ static llvm::Value* emitEqual(CGEnv& env, const Type& ty, llvm::Value* lhs, llvm
   if (ty.isFloating()) {
     return env.b.CreateFCmpOEQ(lhs, rhs, "cmp");
   }
-  if (ty.isArray() || (ty.base == Type::Base::Struct && ty.ptrDepth == 0)) {
+  if (ty.isArray() ||
+      ((ty.base == Type::Base::Struct || ty.base == Type::Base::Union) && ty.ptrDepth == 0)) {
     llvm::AllocaInst* ltmp = createEntryAlloca(env, "cmp.lhs", ty);
     llvm::AllocaInst* rtmp = createEntryAlloca(env, "cmp.rhs", ty);
     env.b.CreateStore(lhs, ltmp);
@@ -528,23 +696,24 @@ static bool resolveDesignatorAddr(
       curTy = curTy.elementType();
       continue;
     }
-    if (curTy.base != Type::Base::Struct || curTy.ptrDepth != 0) return false;
-    auto fieldsIt = env.structFields.find(curTy.structName);
-    auto stIt = env.structs.find(curTy.structName);
-    if (fieldsIt == env.structFields.end() || stIt == env.structs.end()) return false;
-    size_t fieldIndex = 0;
-    bool found = false;
-    for (size_t i = 0; i < fieldsIt->second.size(); ++i) {
-      if (fieldsIt->second[i].name == d.field) {
-        fieldIndex = i;
-        found = true;
-        break;
-      }
+    if (curTy.ptrDepth != 0) return false;
+    CGEnv::RecordFieldAccess access;
+    if (!lookupFieldAccess(env, curTy, d.field, access)) return false;
+    if (access.isBitfield) return false;
+    if (curTy.base == Type::Base::Struct) {
+      auto stIt = env.structs.find(curTy.structName);
+      if (stIt == env.structs.end()) return false;
+      curAddr = env.b.CreateStructGEP(stIt->second, curAddr,
+                                      access.storageIndex, "init.fld");
+      curTy = access.type;
+    } else if (curTy.base == Type::Base::Union) {
+      llvm::Type* fieldTy = llvmType(env, access.type);
+      curAddr = env.b.CreateBitCast(curAddr, llvm::PointerType::getUnqual(fieldTy),
+                                    "init.ufld");
+      curTy = access.type;
+    } else {
+      return false;
     }
-    if (!found) return false;
-    curAddr = env.b.CreateStructGEP(stIt->second, curAddr, static_cast<unsigned>(fieldIndex),
-                                    "init.fld");
-    curTy = fieldsIt->second[fieldIndex].type;
   }
   outTy = curTy;
   outAddr = curAddr;
@@ -584,37 +753,122 @@ static void emitInitToAddr(CGEnv& env, const Type& ty, llvm::Value* addr, const 
       if (it == env.structFields.end()) return;
       auto stIt = env.structs.find(ty.structName);
       if (stIt == env.structs.end()) return;
-      size_t count = it->second.size();
-      for (size_t i = 0; i < count; ++i) {
-        llvm::Value* fieldAddr = env.b.CreateStructGEP(
-            stIt->second, addr, static_cast<unsigned>(i), "init.fld");
-        env.b.CreateStore(zeroValue(env, it->second[i].type), fieldAddr);
-      }
+      env.b.CreateStore(zeroValue(env, ty), addr);
+      auto storeBitfield = [&](const StructField& field, const Expr& expr) {
+        CGEnv::RecordFieldAccess access;
+        if (field.name.empty() || !lookupFieldAccess(env, ty, field.name, access)) return;
+        llvm::Value* storageAddr = env.b.CreateStructGEP(
+            stIt->second, addr, access.storageIndex, "bf.addr");
+        llvm::Value* v = emitExpr(env, expr);
+        if (access.type.isNumeric() && exprType(expr).isNumeric()) {
+          v = castNumericToType(env, v, exprType(expr), access.type);
+        }
+        bitfieldStore(env, storageAddr, access, v);
+      };
+      auto nextNamedField = [&](size_t start) {
+        size_t idx = start;
+        while (idx < it->second.size() && it->second[idx].name.empty()) ++idx;
+        return idx;
+      };
       size_t nextField = 0;
       for (const auto& elem : list->elems) {
         Type targetTy;
         llvm::Value* targetAddr = nullptr;
+        StructField* fieldPtr = nullptr;
         if (!elem.designators.empty()) {
           if (elem.designators[0].kind == Designator::Kind::Field) {
             for (size_t fi = 0; fi < it->second.size(); ++fi) {
               if (it->second[fi].name == elem.designators[0].field) {
                 nextField = fi + 1;
+                fieldPtr = &it->second[fi];
                 break;
               }
             }
+          }
+          if (fieldPtr && fieldPtr->bitWidth.has_value() && elem.designators.size() == 1) {
+            storeBitfield(*fieldPtr, *elem.expr);
+            continue;
           }
           if (!resolveDesignatorAddr(env, ty, addr, elem.designators, targetTy, targetAddr)) {
             continue;
           }
         } else {
-          size_t idx = nextField++;
+          size_t idx = nextNamedField(nextField);
+          nextField = idx + 1;
           if (idx >= it->second.size()) continue;
-          targetTy = it->second[idx].type;
-          targetAddr = env.b.CreateStructGEP(
-              stIt->second, addr, static_cast<unsigned>(idx), "init.fld");
+          fieldPtr = &it->second[idx];
+          if (fieldPtr->bitWidth.has_value()) {
+            storeBitfield(*fieldPtr, *elem.expr);
+            continue;
+          }
+          std::vector<Designator> ds;
+          ds.push_back(Designator::fieldName(fieldPtr->nameLoc, fieldPtr->name));
+          if (!resolveDesignatorAddr(env, ty, addr, ds, targetTy, targetAddr)) continue;
         }
         if (targetAddr) emitInitToAddr(env, targetTy, targetAddr, *elem.expr);
       }
+      return;
+    }
+    if (ty.base == Type::Base::Union && ty.ptrDepth == 0) {
+      auto it = env.unionFields.find(ty.unionName);
+      if (it == env.unionFields.end()) return;
+      auto utIt = env.unions.find(ty.unionName);
+      if (utIt == env.unions.end()) return;
+      env.b.CreateStore(zeroValue(env, ty), addr);
+      if (list->elems.empty()) return;
+      const auto& elem = list->elems[0];
+      Type targetTy;
+      llvm::Value* targetAddr = nullptr;
+      const StructField* fieldPtr = nullptr;
+      if (!elem.designators.empty()) {
+        if (elem.designators[0].kind == Designator::Kind::Field) {
+          for (const auto& field : it->second) {
+            if (field.name == elem.designators[0].field) {
+              fieldPtr = &field;
+              break;
+            }
+          }
+        }
+        if (fieldPtr && fieldPtr->bitWidth.has_value() && elem.designators.size() == 1) {
+          CGEnv::RecordFieldAccess access;
+          if (lookupFieldAccess(env, ty, fieldPtr->name, access)) {
+            llvm::Type* storageTy = llvmType(env, access.storageType);
+            llvm::Value* storageAddr = env.b.CreateBitCast(
+                addr, llvm::PointerType::getUnqual(storageTy), "bf.uaddr");
+            llvm::Value* v = emitExpr(env, *elem.expr);
+            if (access.type.isNumeric() && exprType(*elem.expr).isNumeric()) {
+              v = castNumericToType(env, v, exprType(*elem.expr), access.type);
+            }
+            bitfieldStore(env, storageAddr, access, v);
+          }
+          return;
+        }
+        if (!resolveDesignatorAddr(env, ty, addr, elem.designators, targetTy, targetAddr)) {
+          return;
+        }
+      } else {
+        if (it->second.empty()) return;
+        fieldPtr = &it->second[0];
+        if (fieldPtr->bitWidth.has_value()) {
+          CGEnv::RecordFieldAccess access;
+          if (lookupFieldAccess(env, ty, fieldPtr->name, access)) {
+            llvm::Type* storageTy = llvmType(env, access.storageType);
+            llvm::Value* storageAddr = env.b.CreateBitCast(
+                addr, llvm::PointerType::getUnqual(storageTy), "bf.uaddr");
+            llvm::Value* v = emitExpr(env, *elem.expr);
+            if (access.type.isNumeric() && exprType(*elem.expr).isNumeric()) {
+              v = castNumericToType(env, v, exprType(*elem.expr), access.type);
+            }
+            bitfieldStore(env, storageAddr, access, v);
+          }
+          return;
+        }
+        targetTy = fieldPtr->type;
+        llvm::Type* fieldTy = llvmType(env, targetTy);
+        targetAddr = env.b.CreateBitCast(addr, llvm::PointerType::getUnqual(fieldTy),
+                                         "init.ufld");
+      }
+      if (targetAddr) emitInitToAddr(env, targetTy, targetAddr, *elem.expr);
       return;
     }
     if (ty.isArray() && !ty.ptrOutsideArrays) {
@@ -982,7 +1236,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::EqualEqual: {
-      if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
+      if ((lhsTy.base == Type::Base::Struct || lhsTy.base == Type::Base::Union) &&
+          lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         return env.b.CreateZExt(eq, env.i32Ty(), "cmp.i32");
       }
@@ -1014,7 +1269,8 @@ static llvm::Value* emitBinary(CGEnv& env, const BinaryExpr& bin) {
       return env.b.CreateZExt(c, env.i32Ty(), "cmp.i32");
     }
     case TokenKind::BangEqual: {
-      if (lhsTy.base == Type::Base::Struct && lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
+      if ((lhsTy.base == Type::Base::Struct || lhsTy.base == Type::Base::Union) &&
+          lhsTy.ptrDepth == 0 && lhsTy == rhsTy) {
         llvm::Value* eq = emitEqual(env, lhsTy, L, R);
         llvm::Value* ne = env.b.CreateNot(eq, "cmp.not");
         return env.b.CreateZExt(ne, env.i32Ty(), "cmp.i32");
@@ -1085,23 +1341,21 @@ static llvm::Value* emitLValue(CGEnv& env, const Expr& e) {
     } else {
       basePtr = emitLValue(env, *mem->base);
     }
-
-    auto it = env.structFields.find(structTy.structName);
-    if (it == env.structFields.end()) return nullptr;
-    size_t fieldIndex = 0;
-    bool found = false;
-    for (size_t i = 0; i < it->second.size(); ++i) {
-      if (it->second[i].name == mem->member) {
-        fieldIndex = i;
-        found = true;
-        break;
-      }
+    CGEnv::RecordFieldAccess access;
+    if (!lookupFieldAccess(env, structTy, mem->member, access)) return nullptr;
+    if (access.isBitfield) return nullptr;
+    if (structTy.base == Type::Base::Struct) {
+      auto stIt = env.structs.find(structTy.structName);
+      if (stIt == env.structs.end()) return nullptr;
+      return env.b.CreateStructGEP(stIt->second, basePtr,
+                                   access.storageIndex, "member.addr");
     }
-    if (!found) return nullptr;
-    auto stIt = env.structs.find(structTy.structName);
-    if (stIt == env.structs.end()) return nullptr;
-    return env.b.CreateStructGEP(stIt->second, basePtr,
-                                 static_cast<unsigned>(fieldIndex), "member.addr");
+    if (structTy.base == Type::Base::Union) {
+      llvm::Type* llvmFieldTy = llvmType(env, access.type);
+      return env.b.CreateBitCast(basePtr, llvm::PointerType::getUnqual(llvmFieldTy),
+                                 "member.uaddr");
+    }
+    return nullptr;
   }
 
   return nullptr;
@@ -1125,6 +1379,33 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   }
 
   if (auto* inc = dynamic_cast<const IncDecExpr*>(&e)) {
+    if (auto* mem = dynamic_cast<const MemberExpr*>(inc->operand.get())) {
+      Type baseTy = exprType(*mem->base);
+      Type structTy = mem->isArrow ? baseTy.pointee() : baseTy;
+      CGEnv::RecordFieldAccess access;
+      if (lookupFieldAccess(env, structTy, mem->member, access) && access.isBitfield) {
+        llvm::Value* basePtr = mem->isArrow ? emitExpr(env, *mem->base)
+                                            : emitLValue(env, *mem->base);
+        llvm::Value* storageAddr = nullptr;
+        if (structTy.base == Type::Base::Struct) {
+          auto stIt = env.structs.find(structTy.structName);
+          if (stIt == env.structs.end()) return i32Const(env, 0);
+          storageAddr = env.b.CreateStructGEP(stIt->second, basePtr,
+                                              access.storageIndex, "bf.addr");
+        } else if (structTy.base == Type::Base::Union) {
+          llvm::Type* storageTy = llvmType(env, access.storageType);
+          storageAddr = env.b.CreateBitCast(basePtr, llvm::PointerType::getUnqual(storageTy),
+                                            "bf.uaddr");
+        }
+        if (!storageAddr) return i32Const(env, 0);
+        llvm::Value* oldV = bitfieldLoad(env, storageAddr, access);
+        llvm::Value* one = llvm::ConstantInt::get(oldV->getType(), 1, true);
+        llvm::Value* newV = inc->isInc ? env.b.CreateAdd(oldV, one, "bf.inc")
+                                       : env.b.CreateSub(oldV, one, "bf.dec");
+        bitfieldStore(env, storageAddr, access, newV);
+        return inc->isPost ? oldV : newV;
+      }
+    }
     llvm::Value* addr = emitLValue(env, *inc->operand);
     if (!addr) return i32Const(env, 0);
     Type opTy = exprType(*inc->operand);
@@ -1290,7 +1571,8 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
 
     llvm::Value* callV = env.b.CreateCall(fnTy, calleeV, argsV, "calltmp");
     const Type& resTy = exprType(*call);
-    if (resTy.base == Type::Base::Struct && resTy.ptrDepth == 0) {
+    if ((resTy.base == Type::Base::Struct || resTy.base == Type::Base::Union) &&
+        resTy.ptrDepth == 0) {
       callV = unpackReturnValue(env, resTy, callV);
     }
     return callV;
@@ -1354,19 +1636,31 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
     llvm::Value* addr = emitLValue(env, *mem);
     Type baseTy = exprType(*mem->base);
     Type structTy = mem->isArrow ? baseTy.pointee() : baseTy;
-    Type fieldTy;
-    bool found = false;
-    auto it = env.structFields.find(structTy.structName);
-    if (it != env.structFields.end()) {
-      for (const auto& field : it->second) {
-        if (field.name == mem->member) {
-          fieldTy = field.type;
-          found = true;
-          break;
+    CGEnv::RecordFieldAccess access;
+    if (lookupFieldAccess(env, structTy, mem->member, access)) {
+      if (access.isBitfield) {
+        llvm::Value* basePtr = mem->isArrow ? emitExpr(env, *mem->base) : emitLValue(env, *mem->base);
+        llvm::Value* storageAddr = nullptr;
+        if (structTy.base == Type::Base::Struct) {
+          auto stIt = env.structs.find(structTy.structName);
+          if (stIt == env.structs.end()) return i32Const(env, 0);
+          storageAddr = env.b.CreateStructGEP(stIt->second, basePtr,
+                                              access.storageIndex, "bf.addr");
+        } else if (structTy.base == Type::Base::Union) {
+          llvm::Type* storageTy = llvmType(env, access.storageType);
+          storageAddr = env.b.CreateBitCast(basePtr, llvm::PointerType::getUnqual(storageTy),
+                                            "bf.uaddr");
         }
+        if (!storageAddr) return i32Const(env, 0);
+        return bitfieldLoad(env, storageAddr, access);
       }
+      const Type& elemTy = access.type;
+      if (elemTy.isArray() && !elemTy.ptrOutsideArrays) {
+        return decayArrayToPointer(env, addr, elemTy);
+      }
+      return env.b.CreateLoad(llvmType(env, elemTy), addr, "member.val");
     }
-    const Type& elemTy = found ? fieldTy : exprType(e);
+    const Type& elemTy = exprType(e);
     if (elemTy.isArray() && !elemTy.ptrOutsideArrays) {
       return decayArrayToPointer(env, addr, elemTy);
     }
@@ -1378,6 +1672,92 @@ static llvm::Value* emitExpr(CGEnv& env, const Expr& e) {
   }
 
   if (auto* asn = dynamic_cast<const AssignExpr*>(&e)) {
+    if (auto* mem = dynamic_cast<const MemberExpr*>(asn->lhs.get())) {
+      Type baseTy = exprType(*mem->base);
+      Type structTy = mem->isArrow ? baseTy.pointee() : baseTy;
+      CGEnv::RecordFieldAccess access;
+      if (lookupFieldAccess(env, structTy, mem->member, access) && access.isBitfield) {
+        llvm::Value* basePtr = mem->isArrow ? emitExpr(env, *mem->base)
+                                            : emitLValue(env, *mem->base);
+        llvm::Value* storageAddr = nullptr;
+        if (structTy.base == Type::Base::Struct) {
+          auto stIt = env.structs.find(structTy.structName);
+          if (stIt == env.structs.end()) return i32Const(env, 0);
+          storageAddr = env.b.CreateStructGEP(stIt->second, basePtr,
+                                              access.storageIndex, "bf.addr");
+        } else if (structTy.base == Type::Base::Union) {
+          llvm::Type* storageTy = llvmType(env, access.storageType);
+          storageAddr = env.b.CreateBitCast(basePtr, llvm::PointerType::getUnqual(storageTy),
+                                            "bf.uaddr");
+        }
+        if (!storageAddr) return i32Const(env, 0);
+
+        llvm::Value* rhsV = emitExpr(env, *asn->rhs);
+        const Type& rhsTy = exprType(*asn->rhs);
+        llvm::Type* fieldLlvmTy = llvmType(env, access.type);
+        if (access.type.isNumeric() && rhsTy.isNumeric()) {
+          rhsV = castNumericToType(env, rhsV, rhsTy, access.type);
+        }
+        if (rhsV->getType() != fieldLlvmTy) {
+          rhsV = env.b.CreateTruncOrBitCast(rhsV, fieldLlvmTy, "bf.rhs.cast");
+        }
+
+        if (asn->op != TokenKind::Assign) {
+          llvm::Value* lhsV = bitfieldLoad(env, storageAddr, access);
+          llvm::Value* newV = nullptr;
+          if (asn->op == TokenKind::PlusAssign || asn->op == TokenKind::MinusAssign) {
+            llvm::Value* L = lhsV;
+            llvm::Value* R = rhsV;
+            if (access.type.isFloating()) {
+              newV = (asn->op == TokenKind::PlusAssign)
+                        ? env.b.CreateFAdd(L, R, "bf.fadd")
+                        : env.b.CreateFSub(L, R, "bf.fsub");
+            } else {
+              newV = (asn->op == TokenKind::PlusAssign)
+                        ? env.b.CreateAdd(L, R, "bf.add")
+                        : env.b.CreateSub(L, R, "bf.sub");
+            }
+          } else if (asn->op == TokenKind::StarAssign || asn->op == TokenKind::SlashAssign) {
+            llvm::Value* L = lhsV;
+            llvm::Value* R = rhsV;
+            if (access.type.isFloating()) {
+              newV = (asn->op == TokenKind::StarAssign)
+                        ? env.b.CreateFMul(L, R, "bf.fmul")
+                        : env.b.CreateFDiv(L, R, "bf.fdiv");
+            } else {
+              newV = (asn->op == TokenKind::StarAssign)
+                        ? env.b.CreateMul(L, R, "bf.mul")
+                        : (access.type.isUnsigned ? env.b.CreateUDiv(L, R, "bf.udiv")
+                                                  : env.b.CreateSDiv(L, R, "bf.sdiv"));
+            }
+          } else if (asn->op == TokenKind::PercentAssign) {
+            newV = access.type.isUnsigned ? env.b.CreateURem(lhsV, rhsV, "bf.urem")
+                                          : env.b.CreateSRem(lhsV, rhsV, "bf.srem");
+          } else if (asn->op == TokenKind::LessLessAssign ||
+                     asn->op == TokenKind::GreaterGreaterAssign) {
+            if (asn->op == TokenKind::LessLessAssign) {
+              newV = env.b.CreateShl(lhsV, rhsV, "bf.shl");
+            } else if (access.type.isUnsigned) {
+              newV = env.b.CreateLShr(lhsV, rhsV, "bf.lshr");
+            } else {
+              newV = env.b.CreateAShr(lhsV, rhsV, "bf.ashr");
+            }
+          } else if (asn->op == TokenKind::AmpAssign || asn->op == TokenKind::PipeAssign ||
+                     asn->op == TokenKind::CaretAssign) {
+            if (asn->op == TokenKind::AmpAssign) newV = env.b.CreateAnd(lhsV, rhsV, "bf.and");
+            else if (asn->op == TokenKind::PipeAssign) newV = env.b.CreateOr(lhsV, rhsV, "bf.or");
+            else newV = env.b.CreateXor(lhsV, rhsV, "bf.xor");
+          }
+          if (!newV) return i32Const(env, 0);
+          bitfieldStore(env, storageAddr, access, newV);
+          return newV;
+        }
+
+        bitfieldStore(env, storageAddr, access, rhsV);
+        return rhsV;
+      }
+    }
+
     llvm::Value* addr = emitLValue(env, *asn->lhs);
     const Type& lhsTy = exprType(*asn->lhs);
     const Type& rhsTy = exprType(*asn->rhs);
@@ -1702,7 +2082,8 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
         llvm::Constant* init = nullptr;
         if (item.type.isArray()) {
           init = llvm::ConstantAggregateZero::get(gvTy);
-        } else if (item.type.base == Type::Base::Struct && item.type.ptrDepth == 0) {
+        } else if ((item.type.base == Type::Base::Struct || item.type.base == Type::Base::Union) &&
+                   item.type.ptrDepth == 0) {
           init = llvm::ConstantAggregateZero::get(gvTy);
         } else if (item.type.isPointer()) {
           init = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(gvTy));
@@ -1754,7 +2135,9 @@ static bool emitStmt(CGEnv& env, const Stmt& s) {
     } else if (env.currentReturnType.isNumeric() && exprType(*r->valueExpr).isNumeric()) {
       retV = castNumericToType(env, retV, exprType(*r->valueExpr), env.currentReturnType);
     }
-    if (env.currentReturnType.base == Type::Base::Struct && env.currentReturnType.ptrDepth == 0) {
+    if ((env.currentReturnType.base == Type::Base::Struct ||
+         env.currentReturnType.base == Type::Base::Union) &&
+        env.currentReturnType.ptrDepth == 0) {
       retV = packReturnValue(env, env.currentReturnType, retV);
     }
     env.b.CreateRet(retV);
@@ -1829,17 +2212,117 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
     env.structFields.emplace(sd->name, sd->fields);
   }
 
+  // 0.5) Predeclare union types
+  for (const auto& item : tu.items) {
+    auto* ud = std::get_if<UnionDef>(&item);
+    if (!ud) continue;
+    if (env.unions.count(ud->name)) continue;
+    env.unions.emplace(ud->name, llvm::StructType::create(ctx, ud->name));
+    env.unionFields.emplace(ud->name, ud->fields);
+  }
+
   for (const auto& item : tu.items) {
     auto* sd = std::get_if<StructDef>(&item);
     if (!sd) continue;
     auto it = env.structs.find(sd->name);
     if (it == env.structs.end()) continue;
-    std::vector<llvm::Type*> fieldTys;
-    fieldTys.reserve(sd->fields.size());
+    std::vector<llvm::Type*> storageTys;
+    storageTys.reserve(sd->fields.size());
+    llvm::Type* curStorageTy = nullptr;
+    int64_t curBitsUsed = 0;
+    unsigned curStorageIndex = 0;
+    bool hasBitfields = false;
+    auto& accessMap = env.structFieldAccess[sd->name];
     for (const auto& field : sd->fields) {
-      fieldTys.push_back(llvmType(env, field.type));
+      if (field.bitWidth.has_value()) {
+        hasBitfields = true;
+        int64_t width = *field.bitWidth;
+        if (width == 0) {
+          curStorageTy = nullptr;
+          curBitsUsed = 0;
+          continue;
+        }
+        llvm::Type* storageTy = bitfieldStorageType(env, field.type);
+        int64_t totalBits = integerBitWidth(field.type);
+        if (!curStorageTy || curStorageTy != storageTy || curBitsUsed + width > totalBits) {
+          storageTys.push_back(storageTy);
+          curStorageIndex = static_cast<unsigned>(storageTys.size() - 1);
+          curStorageTy = storageTy;
+          curBitsUsed = 0;
+        }
+        if (!field.name.empty()) {
+          CGEnv::RecordFieldAccess access;
+          access.type = field.type;
+          access.storageType = field.type;
+          access.isBitfield = true;
+          access.storageIndex = curStorageIndex;
+          access.bitOffset = static_cast<int>(curBitsUsed);
+          access.bitWidth = static_cast<int>(width);
+          accessMap.emplace(field.name, access);
+        }
+        curBitsUsed += width;
+        continue;
+      }
+      curStorageTy = nullptr;
+      curBitsUsed = 0;
+      llvm::Type* fieldTy = llvmType(env, field.type);
+      storageTys.push_back(fieldTy);
+      curStorageIndex = static_cast<unsigned>(storageTys.size() - 1);
+      if (!field.name.empty()) {
+        CGEnv::RecordFieldAccess access;
+        access.type = field.type;
+        access.storageType = field.type;
+        access.isBitfield = false;
+        access.storageIndex = curStorageIndex;
+        accessMap.emplace(field.name, access);
+      }
+    }
+    if (storageTys.empty()) {
+      storageTys.push_back(llvm::Type::getInt8Ty(ctx));
+    }
+    it->second->setBody(storageTys, /*isPacked=*/false);
+    env.structHasBitfields[sd->name] = hasBitfields;
+  }
+
+  for (const auto& item : tu.items) {
+    auto* ud = std::get_if<UnionDef>(&item);
+    if (!ud) continue;
+    auto it = env.unions.find(ud->name);
+    if (it == env.unions.end()) continue;
+    uint64_t maxSize = 0;
+    uint64_t maxAlign = 1;
+    llvm::Type* maxAlignTy = llvm::Type::getInt8Ty(ctx);
+    uint64_t maxAlignTySize = 1;
+    for (const auto& field : ud->fields) {
+      llvm::Type* fty = llvmType(env, field.type);
+      uint64_t size = env.mod.getDataLayout().getTypeAllocSize(fty);
+      uint64_t align = env.mod.getDataLayout().getABITypeAlign(fty).value();
+      if (align > maxAlign || (align == maxAlign && size > maxAlignTySize)) {
+        maxAlign = align;
+        maxAlignTy = fty;
+        maxAlignTySize = size;
+      }
+      if (size > maxSize) maxSize = size;
+    }
+    uint64_t pad = maxSize > maxAlignTySize ? maxSize - maxAlignTySize : 0;
+    std::vector<llvm::Type*> fieldTys;
+    fieldTys.push_back(maxAlignTy);
+    if (pad > 0) {
+      fieldTys.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx), pad));
     }
     it->second->setBody(fieldTys, /*isPacked=*/false);
+    auto& accessMap = env.unionFieldAccess[ud->name];
+    for (const auto& field : ud->fields) {
+      if (field.name.empty()) continue;
+      CGEnv::RecordFieldAccess access;
+      access.type = field.type;
+      access.storageType = field.type;
+      access.isBitfield = field.bitWidth.has_value();
+      access.storageIndex = 0;
+      access.bitOffset = 0;
+      access.bitWidth = field.bitWidth.has_value() ? static_cast<int>(*field.bitWidth) : 0;
+      accessMap.emplace(field.name, access);
+    }
   }
 
   // 1) Emit global variables
@@ -1863,7 +2346,8 @@ std::unique_ptr<llvm::Module> CodeGen::emitLLVM(
       llvm::Constant* init = nullptr;
       if (decl.type.isArray()) {
         init = llvm::ConstantAggregateZero::get(gvTy);
-      } else if (decl.type.base == Type::Base::Struct && decl.type.ptrDepth == 0) {
+      } else if ((decl.type.base == Type::Base::Struct || decl.type.base == Type::Base::Union) &&
+                 decl.type.ptrDepth == 0) {
         init = llvm::ConstantAggregateZero::get(gvTy);
       } else if (decl.type.isPointer()) {
         init = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(gvTy));

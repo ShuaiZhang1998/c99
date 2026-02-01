@@ -30,11 +30,12 @@ enum class StorageClass {
 };
 
 struct Type {
-  enum class Base { Char, Short, Int, Long, LongLong, Float, Double, Void, Struct, Enum };
+  enum class Base { Char, Short, Int, Long, LongLong, Bool, Float, Double, LongDouble, Void, Struct, Union, Enum };
   Base base = Base::Int;
   bool isUnsigned = false;
   bool isConst = false;
   std::string structName;
+  std::string unionName;
   std::string enumName;
   int ptrDepth = 0; // 0 == int, 1 == int*, 2 == int**, ...
   std::vector<bool> ptrConst;
@@ -48,17 +49,21 @@ struct Type {
   bool isInt() const { return base == Base::Int && ptrDepth == 0 && arrayDims.empty(); }
   bool isFloat() const { return base == Base::Float && ptrDepth == 0 && arrayDims.empty(); }
   bool isDouble() const { return base == Base::Double && ptrDepth == 0 && arrayDims.empty(); }
+  bool isLongDouble() const { return base == Base::LongDouble && ptrDepth == 0 && arrayDims.empty(); }
+  bool isBool() const { return base == Base::Bool && ptrDepth == 0 && arrayDims.empty(); }
   bool isFloating() const {
-    return (base == Base::Float || base == Base::Double) && ptrDepth == 0 && arrayDims.empty();
+    return (base == Base::Float || base == Base::Double || base == Base::LongDouble) &&
+           ptrDepth == 0 && arrayDims.empty();
   }
   bool isInteger() const {
     if (ptrDepth != 0 || !arrayDims.empty()) return false;
     return base == Base::Char || base == Base::Short || base == Base::Int || base == Base::Long ||
-           base == Base::LongLong || base == Base::Enum;
+           base == Base::LongLong || base == Base::Bool || base == Base::Enum;
   }
   bool isNumeric() const { return isInteger() || isFloating(); }
   bool isVoid() const { return base == Base::Void && ptrDepth == 0 && arrayDims.empty(); }
   bool isStruct() const { return base == Base::Struct; }
+  bool isUnion() const { return base == Base::Union; }
   bool isEnum() const { return base == Base::Enum; }
   bool isPointer() const { return ptrDepth > 0; }
   bool isArray() const { return !arrayDims.empty(); }
@@ -86,6 +91,7 @@ struct Type {
     t.isUnsigned = isUnsigned;
     t.isConst = isConst;
     t.structName = structName;
+    t.unionName = unionName;
     t.enumName = enumName;
     t.ptrOutsideArrays = false;
     t.func = func;
@@ -100,6 +106,7 @@ struct Type {
     t.isUnsigned = isUnsigned;
     t.isConst = isConst;
     t.structName = structName;
+    t.unionName = unionName;
     t.enumName = enumName;
     t.func = func;
     t.ptrConst = ptrConst;
@@ -110,6 +117,7 @@ struct Type {
     t.isUnsigned = isUnsigned;
     t.isConst = isConst;
     t.structName = structName;
+    t.unionName = unionName;
     t.enumName = enumName;
     t.func = func;
     t.ptrConst = ptrConst;
@@ -144,7 +152,8 @@ inline bool Type::operator==(const Type& other) const {
     if (!(*func == *other.func)) return false;
   }
   return base == other.base && isUnsigned == other.isUnsigned &&
-         isConst == other.isConst && structName == other.structName && enumName == other.enumName &&
+         isConst == other.isConst && structName == other.structName &&
+         unionName == other.unionName && enumName == other.enumName &&
          ptrDepth == other.ptrDepth && arrayDims == other.arrayDims &&
          ptrOutsideArrays == other.ptrOutsideArrays && ptrConst == other.ptrConst;
 }
@@ -323,6 +332,7 @@ struct StructField {
   Type type;
   std::string name;
   SourceLocation nameLoc;
+  std::optional<int64_t> bitWidth;
 };
 
 struct DeclStmt final : Stmt {
@@ -458,6 +468,12 @@ struct StructDef {
   std::vector<StructField> fields;
 };
 
+struct UnionDef {
+  std::string name;
+  SourceLocation nameLoc;
+  std::vector<StructField> fields;
+};
+
 struct EnumItem {
   std::string name;
   SourceLocation nameLoc;
@@ -474,7 +490,7 @@ struct TypedefDecl {
   std::vector<DeclItem> items;
 };
 
-using TopLevelItem = std::variant<StructDef, EnumDef, TypedefDecl,
+using TopLevelItem = std::variant<StructDef, UnionDef, EnumDef, TypedefDecl,
                                   FunctionDecl, FunctionDef, GlobalVarDecl>;
 
 struct AstTranslationUnit {
@@ -509,15 +525,18 @@ private:
   struct ParsedTypeSpec {
     Type type;
     std::optional<StructDef> structDef;
+    std::optional<UnionDef> unionDef;
     std::optional<EnumDef> enumDef;
     StorageClass storage = StorageClass::None;
   };
   std::optional<ParsedTypeSpec> parseTypeSpec(bool allowStructDef, bool allowStorage);
   std::optional<Type> parseTypeName(bool allowStructDef);
   std::optional<std::vector<StructField>> parseStructFields();
+  std::optional<std::vector<StructField>> parseUnionFields();
   std::optional<std::vector<EnumItem>> parseEnumItems();
   std::optional<std::vector<std::optional<size_t>>> parseArrayDims(bool allowFirstEmpty);
   std::optional<std::unique_ptr<Expr>> parseInitializer();
+  bool evalConstExpr(const Expr& e, int64_t& out);
 
   std::optional<AstTranslationUnit> parseTranslationUnit();
   std::optional<TopLevelItem> parseTopLevelItem();

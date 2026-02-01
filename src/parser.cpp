@@ -31,7 +31,7 @@ static std::optional<ParsedIntLiteral> parseIntLiteralToken(
   std::string suffix = text.substr(pos);
   int64_t value = 0;
   try {
-    value = std::stoll(digits);
+    value = std::stoll(digits, nullptr, 0);
   } catch (...) {
     diags.error(loc, "invalid integer literal");
     return std::nullopt;
@@ -136,7 +136,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     if (cur_.kind == TokenKind::KwFloat || cur_.kind == TokenKind::KwDouble ||
-        cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
+        cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct ||
+        cur_.kind == TokenKind::KwUnion || cur_.kind == TokenKind::KwBool) {
       diags_.error(cur_.loc, "expected integer type after 'unsigned'");
       return std::nullopt;
     }
@@ -224,6 +225,18 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
   }
   if (cur_.kind == TokenKind::KwLong) {
     advance();
+    if (cur_.kind == TokenKind::KwDouble) {
+      advance();
+      spec.type.base = Type::Base::LongDouble;
+      while (cur_.kind == TokenKind::KwConst) {
+        isConst = true;
+        advance();
+      }
+      spec.type.isConst = isConst;
+      spec.storage = isStatic ? StorageClass::Static
+                              : (isExtern ? StorageClass::Extern : StorageClass::None);
+      return spec;
+    }
     if (cur_.kind == TokenKind::KwLong) {
       advance();
       spec.type.base = Type::Base::LongLong;
@@ -236,6 +249,19 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       return spec;
     }
     spec.type.base = Type::Base::Long;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
+    return spec;
+  }
+  if (cur_.kind == TokenKind::KwBool) {
+    advance();
+    spec.type.base = Type::Base::Bool;
+    spec.type.isUnsigned = true;
     while (cur_.kind == TokenKind::KwConst) {
       isConst = true;
       advance();
@@ -265,7 +291,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwVoid) {
@@ -276,7 +303,8 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
       advance();
     }
     spec.type.isConst = isConst;
-    spec.storage = isStatic ? StorageClass::Static : StorageClass::None;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
     return spec;
   }
   if (cur_.kind == TokenKind::KwEnum) {
@@ -349,6 +377,39 @@ std::optional<Parser::ParsedTypeSpec> Parser::parseTypeSpec(bool allowStructDef,
     }
     return spec;
   }
+  if (cur_.kind == TokenKind::KwUnion) {
+    advance();
+    if (!expect(TokenKind::Identifier, "union name")) return std::nullopt;
+    std::string name = cur_.text;
+    SourceLocation nameLoc = cur_.loc;
+    advance();
+    spec.type.base = Type::Base::Union;
+    spec.type.unionName = name;
+    while (cur_.kind == TokenKind::KwConst) {
+      isConst = true;
+      advance();
+    }
+    spec.type.isConst = isConst;
+    spec.storage = isStatic ? StorageClass::Static
+                            : (isExtern ? StorageClass::Extern : StorageClass::None);
+    if (cur_.kind == TokenKind::LBrace) {
+      if (!allowStructDef) {
+        diags_.error(cur_.loc, "union definition not allowed here");
+        return std::nullopt;
+      }
+      advance();
+      auto fields = parseUnionFields();
+      if (!fields) return std::nullopt;
+      if (!expect(TokenKind::RBrace, "'}'")) return std::nullopt;
+      advance();
+      UnionDef def;
+      def.name = std::move(name);
+      def.nameLoc = nameLoc;
+      def.fields = std::move(*fields);
+      spec.unionDef = std::move(def);
+    }
+    return spec;
+  }
   if (cur_.kind == TokenKind::Identifier) {
     auto it = typedefs_.find(cur_.text);
     if (it != typedefs_.end()) {
@@ -374,13 +435,32 @@ std::optional<std::vector<StructField>> Parser::parseStructFields() {
     Type baseType = baseSpec->type;
 
     while (true) {
-      auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/false,
-                                  /*allowFunctionPointer=*/true);
-      if (!decl) return std::nullopt;
       StructField f;
-      f.type = decl->type;
-      f.name = std::move(decl->name);
-      f.nameLoc = decl->nameLoc;
+      if (cur_.kind == TokenKind::Colon) {
+        f.type = baseType;
+        f.name.clear();
+        f.nameLoc = cur_.loc;
+      } else {
+        auto decl = parseDeclarator(baseType, /*allowArray=*/true, /*allowFirstEmpty=*/false,
+                                    /*allowFunctionPointer=*/true);
+        if (!decl) return std::nullopt;
+        f.type = decl->type;
+        f.name = std::move(decl->name);
+        f.nameLoc = decl->nameLoc;
+      }
+
+      if (cur_.kind == TokenKind::Colon) {
+        advance();
+        auto expr = parseAssignmentExpr();
+        if (!expr) return std::nullopt;
+        int64_t value = 0;
+        if (!evalConstExpr(**expr, value) || value < 0) {
+          diags_.error(cur_.loc, "invalid bit-field width");
+          return std::nullopt;
+        }
+        f.bitWidth = value;
+      }
+
       fields.push_back(std::move(f));
 
       if (cur_.kind != TokenKind::Comma) break;
@@ -391,6 +471,10 @@ std::optional<std::vector<StructField>> Parser::parseStructFields() {
     advance();
   }
   return fields;
+}
+
+std::optional<std::vector<StructField>> Parser::parseUnionFields() {
+  return parseStructFields();
 }
 
 std::optional<std::vector<EnumItem>> Parser::parseEnumItems() {
@@ -405,28 +489,10 @@ std::optional<std::vector<EnumItem>> Parser::parseEnumItems() {
     int64_t value = current + 1;
     if (cur_.kind == TokenKind::Assign) {
       advance();
-      bool neg = false;
-      if (cur_.kind == TokenKind::Minus || cur_.kind == TokenKind::Plus) {
-        neg = (cur_.kind == TokenKind::Minus);
-        advance();
-      }
-      if (cur_.kind == TokenKind::IntegerLiteral) {
-        auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
-        if (!parsed) return std::nullopt;
-        value = parsed->value;
-        if (neg) value = -value;
-        advance();
-      } else if (cur_.kind == TokenKind::Identifier) {
-        auto it = enumConstants_.find(cur_.text);
-        if (it == enumConstants_.end()) {
-          diags_.error(cur_.loc, "unknown enum constant '" + cur_.text + "'");
-          return std::nullopt;
-        }
-        value = it->second;
-        if (neg) value = -value;
-        advance();
-      } else {
-        diags_.error(cur_.loc, "expected integer literal or enum constant");
+      auto expr = parseAssignmentExpr();
+      if (!expr) return std::nullopt;
+      if (!evalConstExpr(**expr, value)) {
+        diags_.error(cur_.loc, "expected constant expression");
         return std::nullopt;
       }
     }
@@ -461,20 +527,79 @@ std::optional<std::vector<std::optional<size_t>>> Parser::parseArrayDims(bool al
       diags_.error(cur_.loc, "expected integer literal in array size");
       return std::nullopt;
     }
-    if (cur_.kind != TokenKind::IntegerLiteral) {
-      diags_.error(cur_.loc, "expected integer literal in array size");
+    auto expr = parseAssignmentExpr();
+    if (!expr) return std::nullopt;
+    int64_t value = 0;
+    if (!evalConstExpr(**expr, value) || value < 0) {
+      diags_.error(cur_.loc, "invalid array size");
       return std::nullopt;
     }
-    auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
-    if (!parsed) return std::nullopt;
-    size_t size = static_cast<size_t>(parsed->value);
-    dims.push_back(size);
-    advance();
+    dims.push_back(static_cast<size_t>(value));
     if (!expect(TokenKind::RBracket, "']'")) return std::nullopt;
     advance();
   }
   if (dims.empty()) return std::nullopt;
   return dims;
+}
+
+bool Parser::evalConstExpr(const Expr& e, int64_t& out) {
+  if (auto* lit = dynamic_cast<const IntLiteralExpr*>(&e)) {
+    out = lit->value;
+    return true;
+  }
+  if (auto* vr = dynamic_cast<const VarRefExpr*>(&e)) {
+    auto it = enumConstants_.find(vr->name);
+    if (it == enumConstants_.end()) return false;
+    out = it->second;
+    return true;
+  }
+  if (auto* un = dynamic_cast<const UnaryExpr*>(&e)) {
+    int64_t v = 0;
+    if (!evalConstExpr(*un->operand, v)) return false;
+    switch (un->op) {
+      case TokenKind::Plus: out = v; return true;
+      case TokenKind::Minus: out = -v; return true;
+      case TokenKind::Tilde: out = ~v; return true;
+      case TokenKind::Bang: out = !v; return true;
+      default: return false;
+    }
+  }
+  if (auto* bin = dynamic_cast<const BinaryExpr*>(&e)) {
+    int64_t l = 0, r = 0;
+    if (!evalConstExpr(*bin->lhs, l)) return false;
+    if (!evalConstExpr(*bin->rhs, r)) return false;
+    switch (bin->op) {
+      case TokenKind::Plus: out = l + r; return true;
+      case TokenKind::Minus: out = l - r; return true;
+      case TokenKind::Star: out = l * r; return true;
+      case TokenKind::Slash: if (r == 0) return false; out = l / r; return true;
+      case TokenKind::Percent: if (r == 0) return false; out = l % r; return true;
+      case TokenKind::LessLess: out = l << r; return true;
+      case TokenKind::GreaterGreater: out = l >> r; return true;
+      case TokenKind::Amp: out = l & r; return true;
+      case TokenKind::Pipe: out = l | r; return true;
+      case TokenKind::Caret: out = l ^ r; return true;
+      case TokenKind::AmpAmp: out = (l && r) ? 1 : 0; return true;
+      case TokenKind::PipePipe: out = (l || r) ? 1 : 0; return true;
+      case TokenKind::EqualEqual: out = (l == r) ? 1 : 0; return true;
+      case TokenKind::BangEqual: out = (l != r) ? 1 : 0; return true;
+      case TokenKind::Less: out = (l < r) ? 1 : 0; return true;
+      case TokenKind::LessEqual: out = (l <= r) ? 1 : 0; return true;
+      case TokenKind::Greater: out = (l > r) ? 1 : 0; return true;
+      case TokenKind::GreaterEqual: out = (l >= r) ? 1 : 0; return true;
+      default: return false;
+    }
+  }
+  if (auto* ter = dynamic_cast<const TernaryExpr*>(&e)) {
+    int64_t c = 0;
+    if (!evalConstExpr(*ter->cond, c)) return false;
+    return c ? evalConstExpr(*ter->thenExpr, out)
+             : evalConstExpr(*ter->elseExpr, out);
+  }
+  if (auto* cast = dynamic_cast<const CastExpr*>(&e)) {
+    return evalConstExpr(*cast->expr, out);
+  }
+  return false;
 }
 
 std::optional<Type> Parser::parseTypeName(bool allowStructDef) {
@@ -743,6 +868,15 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     advance();
     return TopLevelItem{std::move(def)};
   }
+  if (specOpt->unionDef && cur_.kind == TokenKind::Semicolon) {
+    if (specOpt->storage != StorageClass::None) {
+      diags_.error(cur_.loc, "storage class not allowed here");
+      return std::nullopt;
+    }
+    UnionDef def = std::move(*specOpt->unionDef);
+    advance();
+    return TopLevelItem{std::move(def)};
+  }
   if (specOpt->enumDef && cur_.kind == TokenKind::Semicolon) {
     if (specOpt->storage != StorageClass::None) {
       diags_.error(cur_.loc, "storage class not allowed here");
@@ -784,6 +918,10 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
         pending_.push_back(TopLevelItem{std::move(decl)});
         return TopLevelItem{std::move(*specOpt->structDef)};
       }
+      if (specOpt->unionDef) {
+        pending_.push_back(TopLevelItem{std::move(decl)});
+        return TopLevelItem{std::move(*specOpt->unionDef)};
+      }
       if (specOpt->enumDef) {
         pending_.push_back(TopLevelItem{std::move(decl)});
         return TopLevelItem{std::move(*specOpt->enumDef)};
@@ -797,6 +935,10 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
       if (specOpt->structDef) {
         pending_.push_back(TopLevelItem{std::move(*def)});
         return TopLevelItem{std::move(*specOpt->structDef)};
+      }
+      if (specOpt->unionDef) {
+        pending_.push_back(TopLevelItem{std::move(*def)});
+        return TopLevelItem{std::move(*specOpt->unionDef)};
       }
       if (specOpt->enumDef) {
         pending_.push_back(TopLevelItem{std::move(*def)});
@@ -855,6 +997,10 @@ std::optional<TopLevelItem> Parser::parseTopLevelItem() {
     pending_.push_back(TopLevelItem{std::move(decl)});
     return TopLevelItem{std::move(*specOpt->structDef)};
   }
+  if (specOpt->unionDef) {
+    pending_.push_back(TopLevelItem{std::move(decl)});
+    return TopLevelItem{std::move(*specOpt->unionDef)};
+  }
   if (specOpt->enumDef) {
     pending_.push_back(TopLevelItem{std::move(decl)});
     return TopLevelItem{std::move(*specOpt->enumDef)};
@@ -886,6 +1032,7 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseStmt() {
       cur_.kind == TokenKind::KwUnsigned || cur_.kind == TokenKind::KwFloat ||
       cur_.kind == TokenKind::KwDouble ||
       cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct ||
+      cur_.kind == TokenKind::KwUnion || cur_.kind == TokenKind::KwBool ||
       cur_.kind == TokenKind::KwEnum ||
       (cur_.kind == TokenKind::Identifier && typedefs_.count(cur_.text) > 0)) {
     return parseDeclStmt();
@@ -1181,7 +1328,8 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseForStmt() {
              cur_.kind == TokenKind::KwInt || cur_.kind == TokenKind::KwLong ||
              cur_.kind == TokenKind::KwUnsigned || cur_.kind == TokenKind::KwFloat ||
              cur_.kind == TokenKind::KwDouble ||
-             cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct) {
+             cur_.kind == TokenKind::KwVoid || cur_.kind == TokenKind::KwStruct ||
+             cur_.kind == TokenKind::KwUnion || cur_.kind == TokenKind::KwBool) {
     auto d = parseDeclStmt();
     if (!d) return std::nullopt;
     init = std::move(*d);
@@ -1247,14 +1395,13 @@ std::optional<std::unique_ptr<Stmt>> Parser::parseSwitchStmt() {
     if (cur_.kind == TokenKind::KwCase) {
       SourceLocation caseLoc = cur_.loc;
       advance();
-      if (cur_.kind != TokenKind::IntegerLiteral) {
-        diags_.error(cur_.loc, "expected integer literal after 'case'");
+      auto expr = parseExpr();
+      if (!expr) return std::nullopt;
+      int64_t value = 0;
+      if (!evalConstExpr(**expr, value)) {
+        diags_.error(cur_.loc, "expected constant expression after 'case'");
         return std::nullopt;
       }
-      auto parsed = parseIntLiteralToken(diags_, cur_.loc, cur_.text);
-      if (!parsed) return std::nullopt;
-      int64_t value = parsed->value;
-      advance();
       if (!expect(TokenKind::Colon, "':'")) return std::nullopt;
       advance();
 
@@ -1372,7 +1519,9 @@ std::optional<std::unique_ptr<Expr>> Parser::parseUnary() {
         t.kind == TokenKind::KwInt || t.kind == TokenKind::KwLong ||
         t.kind == TokenKind::KwUnsigned || t.kind == TokenKind::KwFloat ||
         t.kind == TokenKind::KwDouble || t.kind == TokenKind::KwVoid ||
-        t.kind == TokenKind::KwStruct || t.kind == TokenKind::KwEnum) {
+        t.kind == TokenKind::KwStruct || t.kind == TokenKind::KwUnion ||
+        t.kind == TokenKind::KwBool ||
+        t.kind == TokenKind::KwEnum) {
       return true;
     }
     if (t.kind == TokenKind::Identifier) {

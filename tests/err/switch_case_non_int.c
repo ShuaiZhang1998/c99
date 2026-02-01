@@ -1,4 +1,4 @@
-// ERROR: expected integer literal after 'case'
+// ERROR: expected constant expression after 'case'
 int main() {
   int x = 1;
   switch (x) {

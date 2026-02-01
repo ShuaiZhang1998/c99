@@ -50,6 +50,19 @@ static const StructInfo* lookupStruct(const StructTable& structs, const std::str
   return &it->second;
 }
 
+struct UnionInfo {
+  std::vector<StructField> fields;
+  SourceLocation nameLoc{};
+};
+
+using UnionTable = std::unordered_map<std::string, UnionInfo>;
+
+static const UnionInfo* lookupUnion(const UnionTable& unions, const std::string& name) {
+  auto it = unions.find(name);
+  if (it == unions.end()) return nullptr;
+  return &it->second;
+}
+
 static Type adjustParamType(const Type& t);
 
 static bool sameSignature(const FnInfo& info, const FunctionProto& proto) {
@@ -86,7 +99,7 @@ static Type functionPointerTypeFromFnInfo(const FnInfo& info) {
 
 static std::optional<Type> checkExprImpl(
     Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs,
-    const EnumConstTable& enums, Expr& e);
+    const UnionTable& unions, const EnumConstTable& enums, Expr& e);
 
 static bool isScalarType(const Type& t) {
   return t.isNumeric() || t.isPointer();
@@ -106,6 +119,11 @@ static Type promoteInteger(const Type& t) {
     res.enumName.clear();
     return res;
   }
+  if (t.base == Type::Base::Bool) {
+    res.base = Type::Base::Int;
+    res.isUnsigned = false;
+    return res;
+  }
   if (t.base == Type::Base::Char || t.base == Type::Base::Short) {
     res.base = Type::Base::Int;
   }
@@ -114,6 +132,7 @@ static Type promoteInteger(const Type& t) {
 
 static int integerRank(const Type& t) {
   switch (t.base) {
+    case Type::Base::Bool: return 0;
     case Type::Base::Char: return 1;
     case Type::Base::Short: return 2;
     case Type::Base::Int: return 3;
@@ -148,6 +167,9 @@ static Type commonIntegerType(const Type& lhs, const Type& rhs) {
 
 static Type commonNumericType(const Type& lhs, const Type& rhs) {
   if (lhs.isFloating() || rhs.isFloating()) {
+    if (lhs.base == Type::Base::LongDouble || rhs.base == Type::Base::LongDouble) {
+      return Type{Type::Base::LongDouble, 0};
+    }
     if (lhs.base == Type::Base::Double || rhs.base == Type::Base::Double) {
       return Type{Type::Base::Double, 0};
     }
@@ -198,6 +220,18 @@ static bool samePointerTypeIgnoreQuals(const Type& lhs, const Type& rhs) {
 
 static bool isArrayElementVoid(const Type& t) {
   return t.isArray() && t.base == Type::Base::Void && t.ptrDepth == 0;
+}
+
+static int64_t integerBitWidth(const Type& t) {
+  switch (t.base) {
+    case Type::Base::Char: return 8;
+    case Type::Base::Short: return 16;
+    case Type::Base::Int: return 32;
+    case Type::Base::Long: return 64;
+    case Type::Base::LongLong: return 64;
+    case Type::Base::Enum: return 32;
+    default: return 0;
+  }
 }
 
 static bool hasInvalidArraySize(const Type& t, bool allowFirstEmpty) {
@@ -271,8 +305,8 @@ static bool fillArraySizeFromInitList(DeclItem& item, Diagnostics& diags) {
   return true;
 }
 
-static bool requiresStructDef(const Type& t) {
-  return t.base == Type::Base::Struct && t.ptrDepth == 0;
+static bool requiresRecordDef(const Type& t) {
+  return (t.base == Type::Base::Struct || t.base == Type::Base::Union) && t.ptrDepth == 0;
 }
 
 static bool requiresEnumDef(const Type& t) {
@@ -284,6 +318,7 @@ static bool checkInitializer(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const UnionTable& unions,
     const EnumConstTable& enums,
     const Type& target,
     Expr& init,
@@ -294,6 +329,7 @@ static bool checkInitList(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const UnionTable& unions,
     const EnumConstTable& enums,
     const Type& target,
     InitListExpr& list,
@@ -351,27 +387,49 @@ static bool checkInitList(
             }
             targetTy = targetTy.elementType();
           } else {
-            if (targetTy.base != Type::Base::Struct || targetTy.ptrDepth != 0) {
-              diags.error(d.loc, "invalid struct designator");
+            if ((targetTy.base != Type::Base::Struct && targetTy.base != Type::Base::Union) ||
+                targetTy.ptrDepth != 0) {
+              diags.error(d.loc, "invalid struct/union designator");
               return false;
             }
-            const StructInfo* info = lookupStruct(structs, targetTy.structName);
-            if (!info) {
-              diags.error(d.loc, "unknown struct type '" + targetTy.structName + "'");
-              return false;
-            }
-            bool found = false;
-            for (const auto& field : info->fields) {
-              if (field.name == d.field) {
-                targetTy = field.type;
-                found = true;
-                break;
+            if (targetTy.base == Type::Base::Struct) {
+              const StructInfo* info = lookupStruct(structs, targetTy.structName);
+              if (!info) {
+                diags.error(d.loc, "unknown struct type '" + targetTy.structName + "'");
+                return false;
               }
-            }
-            if (!found) {
-              diags.error(d.loc,
-                          "unknown field '" + d.field + "' in struct '" + targetTy.structName + "'");
-              return false;
+              bool found = false;
+              for (const auto& field : info->fields) {
+                if (field.name == d.field) {
+                  targetTy = field.type;
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                diags.error(d.loc, "unknown field '" + d.field +
+                                     "' in struct '" + targetTy.structName + "'");
+                return false;
+              }
+            } else {
+              const UnionInfo* info = lookupUnion(unions, targetTy.unionName);
+              if (!info) {
+                diags.error(d.loc, "unknown union type '" + targetTy.unionName + "'");
+                return false;
+              }
+              bool found = false;
+              for (const auto& field : info->fields) {
+                if (field.name == d.field) {
+                  targetTy = field.type;
+                  found = true;
+                  break;
+                }
+              }
+              if (!found) {
+                diags.error(d.loc, "unknown field '" + d.field +
+                                     "' in union '" + targetTy.unionName + "'");
+                return false;
+              }
             }
           }
         }
@@ -382,19 +440,118 @@ static bool checkInitList(
         diags.error(list.loc, "excess elements in array initializer");
         return false;
       }
-      if (!checkInitializer(diags, scopes, fns, structs, enums, targetTy, *elem.expr, true)) {
+      if (!checkInitializer(diags, scopes, fns, structs, unions, enums,
+                            targetTy, *elem.expr, true)) {
         return false;
       }
     }
     return true;
   }
 
-  if (target.base == Type::Base::Struct && target.ptrDepth == 0) {
-    const StructInfo* info = lookupStruct(structs, target.structName);
-    if (!info) {
-      diags.error(list.loc, "unknown struct type '" + target.structName + "'");
-      return false;
+  if ((target.base == Type::Base::Struct || target.base == Type::Base::Union) &&
+      target.ptrDepth == 0) {
+    const std::vector<StructField>* fields = nullptr;
+    std::string recordName;
+    const char* recordKind = nullptr;
+    if (target.base == Type::Base::Struct) {
+      const StructInfo* info = lookupStruct(structs, target.structName);
+      if (!info) {
+        diags.error(list.loc, "unknown struct type '" + target.structName + "'");
+        return false;
+      }
+      fields = &info->fields;
+      recordName = target.structName;
+      recordKind = "struct";
+    } else {
+      const UnionInfo* info = lookupUnion(unions, target.unionName);
+      if (!info) {
+        diags.error(list.loc, "unknown union type '" + target.unionName + "'");
+        return false;
+      }
+      fields = &info->fields;
+      recordName = target.unionName;
+      recordKind = "union";
     }
+
+    auto resolveFieldType = [&](const Type& recTy, const std::string& fieldName,
+                                SourceLocation loc, Type& outTy) -> bool {
+      if (recTy.base == Type::Base::Struct) {
+        const StructInfo* info = lookupStruct(structs, recTy.structName);
+        if (!info) {
+          diags.error(loc, "unknown struct type '" + recTy.structName + "'");
+          return false;
+        }
+        for (const auto& field : info->fields) {
+          if (field.name == fieldName) {
+            outTy = field.type;
+            return true;
+          }
+        }
+        diags.error(loc, "unknown field '" + fieldName + "' in struct '" + recTy.structName + "'");
+        return false;
+      }
+      if (recTy.base == Type::Base::Union) {
+        const UnionInfo* info = lookupUnion(unions, recTy.unionName);
+        if (!info) {
+          diags.error(loc, "unknown union type '" + recTy.unionName + "'");
+          return false;
+        }
+        for (const auto& field : info->fields) {
+          if (field.name == fieldName) {
+            outTy = field.type;
+            return true;
+          }
+        }
+        diags.error(loc, "unknown field '" + fieldName + "' in union '" + recTy.unionName + "'");
+        return false;
+      }
+      diags.error(loc, "invalid record designator");
+      return false;
+    };
+
+    if (target.base == Type::Base::Union) {
+      if (list.elems.empty() || fields->empty()) return true;
+      if (list.elems.size() > 1) {
+        diags.error(list.loc, "excess elements in union initializer");
+        return false;
+      }
+      const auto& elem = list.elems[0];
+      Type targetTy;
+      if (!elem.designators.empty()) {
+        const auto& first = elem.designators[0];
+        if (first.kind != Designator::Kind::Field) {
+          diags.error(first.loc, "invalid union designator");
+          return false;
+        }
+        if (!resolveFieldType(target, first.field, first.loc, targetTy)) return false;
+        for (size_t di = 1; di < elem.designators.size(); ++di) {
+          const auto& d = elem.designators[di];
+          if (d.kind == Designator::Kind::Field) {
+            if (!resolveFieldType(targetTy, d.field, d.loc, targetTy)) return false;
+          } else {
+            if (!targetTy.isArray() || targetTy.ptrOutsideArrays) {
+              diags.error(d.loc, "invalid array designator");
+              return false;
+            }
+            if (targetTy.arrayDims.empty() || !targetTy.arrayDims[0].has_value()) {
+              diags.error(d.loc, "invalid array initializer");
+              return false;
+            }
+            size_t arrSize = *targetTy.arrayDims[0];
+            if (d.index >= arrSize) {
+              diags.error(d.loc, "array designator out of range");
+              return false;
+            }
+            targetTy = targetTy.elementType();
+          }
+        }
+      } else {
+        targetTy = (*fields)[0].type;
+      }
+      return checkInitializer(diags, scopes, fns, structs, unions, enums,
+                              targetTy, *elem.expr, true);
+    }
+
     size_t nextField = 0;
     for (const auto& elem : list.elems) {
       size_t idx = nextField;
@@ -406,8 +563,8 @@ static bool checkInitList(
           return false;
         }
         bool found = false;
-        for (size_t fi = 0; fi < info->fields.size(); ++fi) {
-          if (info->fields[fi].name == first.field) {
+        for (size_t fi = 0; fi < fields->size(); ++fi) {
+          if ((*fields)[fi].name == first.field) {
             idx = fi;
             found = true;
             break;
@@ -415,35 +572,15 @@ static bool checkInitList(
         }
         if (!found) {
           diags.error(first.loc,
-                      "unknown field '" + first.field + "' in struct '" + target.structName + "'");
+                      "unknown field '" + first.field + "' in " + std::string(recordKind) +
+                          " '" + recordName + "'");
           return false;
         }
         nextField = idx + 1;
         targetTy = target;
         for (const auto& d : elem.designators) {
           if (d.kind == Designator::Kind::Field) {
-            if (targetTy.base != Type::Base::Struct || targetTy.ptrDepth != 0) {
-              diags.error(d.loc, "invalid struct designator");
-              return false;
-            }
-            const StructInfo* curInfo = lookupStruct(structs, targetTy.structName);
-            if (!curInfo) {
-              diags.error(d.loc, "unknown struct type '" + targetTy.structName + "'");
-              return false;
-            }
-            bool fieldFound = false;
-            for (const auto& field : curInfo->fields) {
-              if (field.name == d.field) {
-                targetTy = field.type;
-                fieldFound = true;
-                break;
-              }
-            }
-            if (!fieldFound) {
-              diags.error(d.loc,
-                          "unknown field '" + d.field + "' in struct '" + targetTy.structName + "'");
-              return false;
-            }
+            if (!resolveFieldType(targetTy, d.field, d.loc, targetTy)) return false;
           } else {
             if (!targetTy.isArray() || targetTy.ptrOutsideArrays) {
               diags.error(d.loc, "invalid array designator");
@@ -463,17 +600,18 @@ static bool checkInitList(
         }
       } else {
         nextField = idx + 1;
-        if (idx >= info->fields.size()) {
+        if (idx >= fields->size()) {
           diags.error(list.loc, "excess elements in struct initializer");
           return false;
         }
-        targetTy = info->fields[idx].type;
+        targetTy = (*fields)[idx].type;
       }
-      if (idx >= info->fields.size()) {
+      if (idx >= fields->size()) {
         diags.error(list.loc, "excess elements in struct initializer");
         return false;
       }
-      if (!checkInitializer(diags, scopes, fns, structs, enums, targetTy, *elem.expr, true)) {
+      if (!checkInitializer(diags, scopes, fns, structs, unions, enums,
+                            targetTy, *elem.expr, true)) {
         return false;
       }
     }
@@ -485,7 +623,7 @@ static bool checkInitList(
     diags.error(list.loc, "invalid initializer");
     return false;
   }
-  return checkInitializer(diags, scopes, fns, structs, enums,
+  return checkInitializer(diags, scopes, fns, structs, unions, enums,
                           target, *list.elems[0].expr, allowArrayInit);
 }
 
@@ -494,12 +632,14 @@ static bool checkInitializer(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const UnionTable& unions,
     const EnumConstTable& enums,
     const Type& target,
     Expr& init,
     bool allowArrayInit) {
   if (auto* list = dynamic_cast<InitListExpr*>(&init)) {
-    return checkInitList(diags, scopes, fns, structs, enums, target, *list, allowArrayInit);
+    return checkInitList(diags, scopes, fns, structs, unions, enums,
+                         target, *list, allowArrayInit);
   }
 
   if (target.isArray() && !target.ptrOutsideArrays) {
@@ -526,7 +666,7 @@ static bool checkInitializer(
     return false;
   }
 
-  auto initTy = checkExprImpl(diags, scopes, fns, structs, enums, init);
+  auto initTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, init);
   if (initTy && !isAssignable(target, *initTy, init)) {
     diags.error(init.loc, "incompatible initializer");
     return false;
@@ -537,36 +677,58 @@ static bool checkInitializer(
 static std::optional<Type> resolveMemberType(
     Diagnostics& diags,
     const StructTable& structs,
+    const UnionTable& unions,
     const Type& baseTy,
     const std::string& member,
     SourceLocation memberLoc,
-    bool isArrow) {
+    bool isArrow,
+    std::optional<int64_t>* bitWidthOut = nullptr) {
   Type structTy = baseTy;
   if (isArrow) {
-    if (!baseTy.isPointer() || baseTy.ptrDepth != 1 || baseTy.base != Type::Base::Struct) {
-      diags.error(memberLoc, "member access requires pointer to struct");
+    if (!baseTy.isPointer() || baseTy.ptrDepth != 1 ||
+        (baseTy.base != Type::Base::Struct && baseTy.base != Type::Base::Union)) {
+      diags.error(memberLoc, "member access requires pointer to struct/union");
       return std::nullopt;
     }
     structTy = baseTy.pointee();
   } else {
-    if (baseTy.base != Type::Base::Struct || baseTy.ptrDepth != 0) {
-      diags.error(memberLoc, "member access requires struct");
+    if ((baseTy.base != Type::Base::Struct && baseTy.base != Type::Base::Union) ||
+        baseTy.ptrDepth != 0) {
+      diags.error(memberLoc, "member access requires struct/union");
       return std::nullopt;
     }
   }
 
-  const StructInfo* info = lookupStruct(structs, structTy.structName);
-  if (!info) {
-    diags.error(memberLoc, "unknown struct type '" + structTy.structName + "'");
+  if (structTy.base == Type::Base::Struct) {
+    const StructInfo* info = lookupStruct(structs, structTy.structName);
+    if (!info) {
+      diags.error(memberLoc, "unknown struct type '" + structTy.structName + "'");
+      return std::nullopt;
+    }
+    for (const auto& field : info->fields) {
+      if (field.name == member) {
+        if (bitWidthOut) *bitWidthOut = field.bitWidth;
+        return field.type;
+      }
+    }
+    diags.error(memberLoc,
+                "unknown field '" + member + "' in struct '" + structTy.structName + "'");
     return std::nullopt;
   }
 
-  for (const auto& field : info->fields) {
-    if (field.name == member) return field.type;
+  const UnionInfo* info = lookupUnion(unions, structTy.unionName);
+  if (!info) {
+    diags.error(memberLoc, "unknown union type '" + structTy.unionName + "'");
+    return std::nullopt;
   }
-
+  for (const auto& field : info->fields) {
+    if (field.name == member) {
+      if (bitWidthOut) *bitWidthOut = field.bitWidth;
+      return field.type;
+    }
+  }
   diags.error(memberLoc,
-              "unknown field '" + member + "' in struct '" + structTy.structName + "'");
+              "unknown field '" + member + "' in union '" + structTy.unionName + "'");
   return std::nullopt;
 }
 
@@ -575,6 +737,7 @@ static void checkStmtImpl(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const UnionTable& unions,
     const EnumConstTable& enums,
     const EnumTypeTable& enumTypes,
     const Type& returnType,
@@ -584,7 +747,7 @@ static void checkStmtImpl(
   if (auto* blk = dynamic_cast<BlockStmt*>(&s)) {
     scopes.push_back({});
     for (const auto& st : blk->stmts) {
-      checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+      checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                     returnType, loopDepth, switchDepth, *st);
     }
     scopes.pop_back();
@@ -592,38 +755,38 @@ static void checkStmtImpl(
   }
 
   if (auto* iff = dynamic_cast<IfStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, enums, *iff->cond);
-    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+    checkExprImpl(diags, scopes, fns, structs, unions, enums, *iff->cond);
+    checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                   returnType, loopDepth, switchDepth, *iff->thenBranch);
     if (iff->elseBranch) {
-      checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+      checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                     returnType, loopDepth, switchDepth, *iff->elseBranch);
     }
     return;
   }
 
   if (auto* wh = dynamic_cast<WhileStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, enums, *wh->cond);
-    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+    checkExprImpl(diags, scopes, fns, structs, unions, enums, *wh->cond);
+    checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                   returnType, loopDepth + 1, switchDepth, *wh->body);
     return;
   }
 
   if (auto* dw = dynamic_cast<DoWhileStmt*>(&s)) {
-    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+    checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                   returnType, loopDepth + 1, switchDepth, *dw->body);
-    checkExprImpl(diags, scopes, fns, structs, enums, *dw->cond);
+    checkExprImpl(diags, scopes, fns, structs, unions, enums, *dw->cond);
     return;
   }
 
   if (auto* fo = dynamic_cast<ForStmt*>(&s)) {
     // for introduces its own scope (matches your existing tests)
     scopes.push_back({});
-    if (fo->init) checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+    if (fo->init) checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                                 returnType, loopDepth, switchDepth, *fo->init);
-    if (fo->cond) checkExprImpl(diags, scopes, fns, structs, enums, *fo->cond);
-    if (fo->inc)  checkExprImpl(diags, scopes, fns, structs, enums, *fo->inc);
-    checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+    if (fo->cond) checkExprImpl(diags, scopes, fns, structs, unions, enums, *fo->cond);
+    if (fo->inc)  checkExprImpl(diags, scopes, fns, structs, unions, enums, *fo->inc);
+    checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                   returnType, loopDepth + 1, switchDepth, *fo->body);
     scopes.pop_back();
     return;
@@ -640,7 +803,7 @@ static void checkStmtImpl(
   }
 
   if (auto* sw = dynamic_cast<SwitchStmt*>(&s)) {
-    auto condTy = checkExprImpl(diags, scopes, fns, structs, enums, *sw->cond);
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sw->cond);
     if (condTy && !condTy->isInteger()) {
       diags.error(sw->cond->loc, "switch condition must be int");
     }
@@ -665,7 +828,7 @@ static void checkStmtImpl(
         seenDefault = true;
       }
       for (const auto& st : c.stmts) {
-        checkStmtImpl(diags, scopes, fns, structs, enums, enumTypes,
+        checkStmtImpl(diags, scopes, fns, structs, unions, enums, enumTypes,
                       returnType, loopDepth, switchDepth + 1, *st);
       }
     }
@@ -714,10 +877,17 @@ static void checkStmtImpl(
         diags.error(item.nameLoc, "invalid array size");
         return;
       }
-      if (requiresStructDef(item.type)) {
-        if (!lookupStruct(structs, item.type.structName)) {
-          diags.error(item.nameLoc, "unknown struct type '" + item.type.structName + "'");
-          return;
+      if (requiresRecordDef(item.type)) {
+        if (item.type.base == Type::Base::Struct) {
+          if (!lookupStruct(structs, item.type.structName)) {
+            diags.error(item.nameLoc, "unknown struct type '" + item.type.structName + "'");
+            return;
+          }
+        } else {
+          if (!lookupUnion(unions, item.type.unionName)) {
+            diags.error(item.nameLoc, "unknown union type '" + item.type.unionName + "'");
+            return;
+          }
         }
       }
       if (requiresEnumDef(item.type)) {
@@ -731,7 +901,7 @@ static void checkStmtImpl(
       // keep behavior by checking before insertion.
       if (item.initExpr) {
         bool allowArrayInit = item.type.isArray() && !item.type.ptrOutsideArrays;
-        if (!checkInitializer(diags, scopes, fns, structs, enums,
+        if (!checkInitializer(diags, scopes, fns, structs, unions, enums,
                               item.type, *item.initExpr, allowArrayInit)) {
           return;
         }
@@ -744,7 +914,7 @@ static void checkStmtImpl(
 
   if (auto* as = dynamic_cast<AssignStmt*>(&s)) {
     // legacy stmt (if still exists somewhere)
-    checkExprImpl(diags, scopes, fns, structs, enums, *as->valueExpr);
+    checkExprImpl(diags, scopes, fns, structs, unions, enums, *as->valueExpr);
     if (!lookupVarType(scopes, as->name).has_value()) {
       diags.error(as->nameLoc, "assignment to undeclared identifier '" + as->name + "'");
     }
@@ -758,7 +928,7 @@ static void checkStmtImpl(
       }
       return;
     }
-    auto retTy = checkExprImpl(diags, scopes, fns, structs, enums, *ret->valueExpr);
+    auto retTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *ret->valueExpr);
     if (retTy && !isAssignable(returnType, *retTy, *ret->valueExpr)) {
       diags.error(ret->loc, "incompatible return type");
     }
@@ -766,7 +936,7 @@ static void checkStmtImpl(
   }
 
   if (auto* es = dynamic_cast<ExprStmt*>(&s)) {
-    checkExprImpl(diags, scopes, fns, structs, enums, *es->expr);
+    checkExprImpl(diags, scopes, fns, structs, unions, enums, *es->expr);
     return;
   }
 
@@ -783,6 +953,7 @@ static std::optional<Type> checkLValue(
     ScopeStack& scopes,
     const FnTable& fns,
     const StructTable& structs,
+    const UnionTable& unions,
     const EnumConstTable& enums,
     Expr& e,
     const char* errMsg,
@@ -815,7 +986,7 @@ static std::optional<Type> checkLValue(
 
   if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
     if (un->op == TokenKind::Star) {
-      auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *un->operand);
+      auto opTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *un->operand);
       if (!opTy) return std::nullopt;
       if (!opTy->isPointer()) {
         diags.error(un->loc, "cannot dereference non-pointer");
@@ -832,8 +1003,8 @@ static std::optional<Type> checkLValue(
   }
 
   if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->base);
-    auto idxTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->index);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sub->index);
     if (!baseTy || !idxTy) return std::nullopt;
     if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
       Type dt = baseTy->decayType();
@@ -861,10 +1032,11 @@ static std::optional<Type> checkLValue(
   }
 
   if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *mem->base);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *mem->base);
     if (!baseTy) return std::nullopt;
+    std::optional<int64_t> bitWidth;
     auto fieldTy = resolveMemberType(
-        diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
+        diags, structs, unions, *baseTy, mem->member, mem->memberLoc, mem->isArrow, &bitWidth);
     if (!fieldTy) return std::nullopt;
     if (fieldTy->isArray() && !fieldTy->ptrOutsideArrays) {
       if (isAssign) {
@@ -872,6 +1044,10 @@ static std::optional<Type> checkLValue(
       } else {
         diags.error(mem->memberLoc, "cannot take address of array");
       }
+      return std::nullopt;
+    }
+    if (!isAssign && bitWidth.has_value()) {
+      diags.error(mem->memberLoc, "cannot take address of bit-field");
       return std::nullopt;
     }
     if (isAssign && fieldTy->isTopLevelConst()) {
@@ -900,7 +1076,7 @@ static bool isAssignable(const Type& dst, const Type& src, const Expr& srcExpr) 
 
 static std::optional<Type> checkExprImpl(
     Diagnostics& diags, ScopeStack& scopes, const FnTable& fns, const StructTable& structs,
-    const EnumConstTable& enums, Expr& e) {
+    const UnionTable& unions, const EnumConstTable& enums, Expr& e) {
   if (auto* lit = dynamic_cast<IntLiteralExpr*>(&e)) {
     Type t;
     if (lit->longKind == 1) {
@@ -932,7 +1108,7 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* inc = dynamic_cast<IncDecExpr*>(&e)) {
-    auto lvTy = checkLValue(diags, scopes, fns, structs, enums, *inc->operand,
+    auto lvTy = checkLValue(diags, scopes, fns, structs, unions, enums, *inc->operand,
                             "expected lvalue for increment/decrement",
                             /*isAssign=*/true);
     if (!lvTy) return std::nullopt;
@@ -967,7 +1143,7 @@ static std::optional<Type> checkExprImpl(
         }
         vr->semaType = *ty;
       } else {
-        auto ty = checkExprImpl(diags, scopes, fns, structs, enums, *sz->expr);
+        auto ty = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sz->expr);
         if (!ty) return std::nullopt;
         if (ty->isVoidObject()) {
           diags.error(sz->loc, "sizeof of void");
@@ -981,13 +1157,13 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* cast = dynamic_cast<CastExpr*>(&e)) {
-    auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *cast->expr);
+    auto opTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *cast->expr);
     if (!opTy) return std::nullopt;
     if (cast->targetType.isArray()) {
       diags.error(cast->loc, "invalid cast target");
       return std::nullopt;
     }
-    if (cast->targetType.isStruct()) {
+    if (cast->targetType.isStruct() || cast->targetType.isUnion()) {
       diags.error(cast->loc, "invalid cast target");
       return std::nullopt;
     }
@@ -1046,11 +1222,11 @@ static std::optional<Type> checkExprImpl(
     SourceLocation calleeLoc = call->calleeLoc;
     if (call->calleeExpr) {
       calleeLoc = call->calleeExpr->loc;
-      auto calleeTy = checkExprImpl(diags, scopes, fns, structs, enums, *call->calleeExpr);
+      auto calleeTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *call->calleeExpr);
       if (!calleeTy) return std::nullopt;
       if (!calleeTy->func || calleeTy->ptrDepth > 1) {
         diags.error(calleeLoc, "called object is not a function");
-        for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, enums, *a);
+        for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, unions, enums, *a);
         return std::nullopt;
       }
       fnTy = calleeTy->func.get();
@@ -1059,7 +1235,7 @@ static std::optional<Type> checkExprImpl(
       if (varTy) {
         if (!varTy->func || varTy->ptrDepth != 1) {
           diags.error(calleeLoc, "called object is not a function");
-          for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, enums, *a);
+          for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, unions, enums, *a);
           return std::nullopt;
         }
         fnTy = varTy->func.get();
@@ -1067,7 +1243,7 @@ static std::optional<Type> checkExprImpl(
         auto it = fns.find(call->callee);
         if (it == fns.end()) {
           diags.error(calleeLoc, "call to undeclared function '" + call->callee + "'");
-          for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, enums, *a);
+          for (const auto& a : call->args) checkExprImpl(diags, scopes, fns, structs, unions, enums, *a);
           return std::nullopt;
         }
         fnFromInfo.returnType = it->second.returnType;
@@ -1092,7 +1268,7 @@ static std::optional<Type> checkExprImpl(
     }
 
     for (size_t i = 0; i < call->args.size(); ++i) {
-      auto argTy = checkExprImpl(diags, scopes, fns, structs, enums, *call->args[i]);
+      auto argTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *call->args[i]);
       if (!argTy || i >= fnTy->params.size()) continue;
       if (!isAssignable(fnTy->params[i], *argTy, *call->args[i])) {
         diags.error(call->args[i]->loc, "incompatible argument type");
@@ -1104,10 +1280,10 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* asn = dynamic_cast<AssignExpr*>(&e)) {
-    auto lhsTy = checkLValue(diags, scopes, fns, structs, enums, *asn->lhs,
+    auto lhsTy = checkLValue(diags, scopes, fns, structs, unions, enums, *asn->lhs,
                              "expected lvalue on left-hand side of assignment",
                              /*isAssign=*/true);
-    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *asn->rhs);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *asn->rhs);
     if (!lhsTy || !rhsTy) return std::nullopt;
     if (asn->op == TokenKind::Assign) {
       if (!isAssignable(*lhsTy, *rhsTy, *asn->rhs)) {
@@ -1173,9 +1349,9 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* ter = dynamic_cast<TernaryExpr*>(&e)) {
-    auto condTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->cond);
-    auto thenTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->thenExpr);
-    auto elseTy = checkExprImpl(diags, scopes, fns, structs, enums, *ter->elseExpr);
+    auto condTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *ter->cond);
+    auto thenTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *ter->thenExpr);
+    auto elseTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *ter->elseExpr);
     if (condTy && !isScalarType(*condTy)) {
       diags.error(ter->cond->loc, "condition must be scalar");
     }
@@ -1203,7 +1379,7 @@ static std::optional<Type> checkExprImpl(
 
   if (auto* un = dynamic_cast<UnaryExpr*>(&e)) {
     if (un->op == TokenKind::Amp) {
-      auto lvTy = checkLValue(diags, scopes, fns, structs, enums, *un->operand,
+      auto lvTy = checkLValue(diags, scopes, fns, structs, unions, enums, *un->operand,
                               "expected lvalue for address-of operator",
                               /*isAssign=*/false);
       if (!lvTy) return std::nullopt;
@@ -1214,7 +1390,7 @@ static std::optional<Type> checkExprImpl(
       return t;
     }
 
-    auto opTy = checkExprImpl(diags, scopes, fns, structs, enums, *un->operand);
+    auto opTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *un->operand);
     if (!opTy) return std::nullopt;
 
     if (un->op == TokenKind::Star) {
@@ -1257,8 +1433,8 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* bin = dynamic_cast<BinaryExpr*>(&e)) {
-    auto lhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *bin->lhs);
-    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, enums, *bin->rhs);
+    auto lhsTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *bin->lhs);
+    auto rhsTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *bin->rhs);
     if (!lhsTy || !rhsTy) return std::nullopt;
 
     switch (bin->op) {
@@ -1394,8 +1570,8 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* sub = dynamic_cast<SubscriptExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->base);
-    auto idxTy = checkExprImpl(diags, scopes, fns, structs, enums, *sub->index);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sub->base);
+    auto idxTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *sub->index);
     if (!baseTy || !idxTy) return std::nullopt;
     if (baseTy->isArray() && !baseTy->ptrOutsideArrays) {
       Type dt = baseTy->decayType();
@@ -1419,10 +1595,10 @@ static std::optional<Type> checkExprImpl(
   }
 
   if (auto* mem = dynamic_cast<MemberExpr*>(&e)) {
-    auto baseTy = checkExprImpl(diags, scopes, fns, structs, enums, *mem->base);
+    auto baseTy = checkExprImpl(diags, scopes, fns, structs, unions, enums, *mem->base);
     if (!baseTy) return std::nullopt;
     auto fieldTy = resolveMemberType(
-        diags, structs, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
+        diags, structs, unions, *baseTy, mem->member, mem->memberLoc, mem->isArrow);
     if (!fieldTy) return std::nullopt;
     if (fieldTy->isArray() && !fieldTy->ptrOutsideArrays) {
       Type dt = fieldTy->decayType();
@@ -1488,6 +1664,7 @@ static void addOrCheckFn(
 bool Sema::run(AstTranslationUnit& tu) {
   // 0) collect struct definitions
   StructTable structs;
+  UnionTable unions;
   EnumConstTable enumConsts;
   std::unordered_set<std::string> enumNames;
   for (const auto& item : tu.items) {
@@ -1519,17 +1696,48 @@ bool Sema::run(AstTranslationUnit& tu) {
   }
 
   for (const auto& item : tu.items) {
+    auto* ud = std::get_if<UnionDef>(&item);
+    if (!ud) continue;
+    if (unions.count(ud->name)) {
+      diags_.error(ud->nameLoc, "redefinition of 'union " + ud->name + "'");
+      return false;
+    }
+    UnionInfo info;
+    info.fields = ud->fields;
+    info.nameLoc = ud->nameLoc;
+    unions.emplace(ud->name, std::move(info));
+  }
+
+  for (const auto& item : tu.items) {
     auto* sd = std::get_if<StructDef>(&item);
     if (!sd) continue;
     std::unordered_set<std::string> fieldNames;
     for (const auto& field : sd->fields) {
-      if (!fieldNames.insert(field.name).second) {
-        diags_.error(field.nameLoc, "duplicate field name '" + field.name + "'");
-        return false;
+      if (!field.name.empty()) {
+        if (!fieldNames.insert(field.name).second) {
+          diags_.error(field.nameLoc, "duplicate field name '" + field.name + "'");
+          return false;
+        }
       }
       if (!isValidUnsignedUse(field.type)) {
         diags_.error(field.nameLoc, "invalid field type");
         return false;
+      }
+      if (field.bitWidth.has_value()) {
+        if (!field.type.isInteger() || field.type.isPointer() || field.type.isArray() ||
+            field.type.isStruct() || field.type.isUnion()) {
+          diags_.error(field.nameLoc, "invalid bit-field type");
+          return false;
+        }
+        int64_t bits = integerBitWidth(field.type);
+        if (*field.bitWidth > bits) {
+          diags_.error(field.nameLoc, "invalid bit-field width");
+          return false;
+        }
+        if (*field.bitWidth == 0 && !field.name.empty()) {
+          diags_.error(field.nameLoc, "bit-field width is zero");
+          return false;
+        }
       }
       if (isArrayElementVoid(field.type)) {
         diags_.error(field.nameLoc, "invalid field type");
@@ -1543,14 +1751,98 @@ bool Sema::run(AstTranslationUnit& tu) {
         diags_.error(field.nameLoc, "invalid array size");
         return false;
       }
-      if (requiresStructDef(field.type)) {
-        if (field.type.structName == sd->name) {
-          diags_.error(field.nameLoc, "field has incomplete type");
+      if (requiresRecordDef(field.type)) {
+        if (field.type.base == Type::Base::Struct) {
+          if (field.type.structName == sd->name) {
+            diags_.error(field.nameLoc, "field has incomplete type");
+            return false;
+          }
+          if (!lookupStruct(structs, field.type.structName)) {
+            diags_.error(field.nameLoc, "unknown struct type '" + field.type.structName + "'");
+            return false;
+          }
+        } else {
+          if (field.type.unionName == sd->name) {
+            diags_.error(field.nameLoc, "field has incomplete type");
+            return false;
+          }
+          if (!lookupUnion(unions, field.type.unionName)) {
+            diags_.error(field.nameLoc, "unknown union type '" + field.type.unionName + "'");
+            return false;
+          }
+        }
+      }
+      if (requiresEnumDef(field.type)) {
+        if (!enumNames.count(field.type.enumName)) {
+          diags_.error(field.nameLoc, "unknown enum type '" + field.type.enumName + "'");
           return false;
         }
-        if (!lookupStruct(structs, field.type.structName)) {
-          diags_.error(field.nameLoc, "unknown struct type '" + field.type.structName + "'");
+      }
+    }
+  }
+
+  for (const auto& item : tu.items) {
+    auto* ud = std::get_if<UnionDef>(&item);
+    if (!ud) continue;
+    std::unordered_set<std::string> fieldNames;
+    for (const auto& field : ud->fields) {
+      if (!field.name.empty()) {
+        if (!fieldNames.insert(field.name).second) {
+          diags_.error(field.nameLoc, "duplicate field name '" + field.name + "'");
           return false;
+        }
+      }
+      if (!isValidUnsignedUse(field.type)) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
+      if (field.bitWidth.has_value()) {
+        if (!field.type.isInteger() || field.type.isPointer() || field.type.isArray() ||
+            field.type.isStruct() || field.type.isUnion()) {
+          diags_.error(field.nameLoc, "invalid bit-field type");
+          return false;
+        }
+        int64_t bits = integerBitWidth(field.type);
+        if (*field.bitWidth > bits) {
+          diags_.error(field.nameLoc, "invalid bit-field width");
+          return false;
+        }
+        if (*field.bitWidth == 0 && !field.name.empty()) {
+          diags_.error(field.nameLoc, "bit-field width is zero");
+          return false;
+        }
+      }
+      if (isArrayElementVoid(field.type)) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
+      if (field.type.isVoidObject()) {
+        diags_.error(field.nameLoc, "invalid field type");
+        return false;
+      }
+      if (hasInvalidArraySize(field.type, /*allowFirstEmpty=*/false)) {
+        diags_.error(field.nameLoc, "invalid array size");
+        return false;
+      }
+      if (requiresRecordDef(field.type)) {
+        if (field.type.base == Type::Base::Struct) {
+          if (field.type.structName == ud->name) {
+            diags_.error(field.nameLoc, "field has incomplete type");
+            return false;
+          }
+          if (!lookupStruct(structs, field.type.structName)) {
+            diags_.error(field.nameLoc, "unknown struct type '" + field.type.structName + "'");
+            return false;
+          }
+        } else {
+          if (field.type.unionName == ud->name) {
+            diags_.error(field.nameLoc, "field has incomplete type");
+            return false;
+          }
+          if (!lookupUnion(unions, field.type.unionName)) {
+            diags_.error(field.nameLoc, "unknown union type '" + field.type.unionName + "'");
+            return false;
+          }
         }
       }
       if (requiresEnumDef(field.type)) {
@@ -1649,10 +1941,17 @@ bool Sema::run(AstTranslationUnit& tu) {
           diags_.error(decl.nameLoc, "invalid array size");
           return false;
         }
-        if (requiresStructDef(decl.type)) {
-          if (!lookupStruct(structs, decl.type.structName)) {
-            diags_.error(decl.nameLoc, "unknown struct type '" + decl.type.structName + "'");
-            return false;
+        if (requiresRecordDef(decl.type)) {
+          if (decl.type.base == Type::Base::Struct) {
+            if (!lookupStruct(structs, decl.type.structName)) {
+              diags_.error(decl.nameLoc, "unknown struct type '" + decl.type.structName + "'");
+              return false;
+            }
+          } else {
+            if (!lookupUnion(unions, decl.type.unionName)) {
+              diags_.error(decl.nameLoc, "unknown union type '" + decl.type.unionName + "'");
+              return false;
+            }
           }
         }
         if (requiresEnumDef(decl.type)) {
@@ -1664,7 +1963,7 @@ bool Sema::run(AstTranslationUnit& tu) {
 
         if (decl.initExpr) {
           bool allowArrayInit = decl.type.isArray() && !decl.type.ptrOutsideArrays;
-          if (!checkInitializer(diags_, scopes, fns, structs, enumConsts,
+          if (!checkInitializer(diags_, scopes, fns, structs, unions, enumConsts,
                                 decl.type, *decl.initExpr, allowArrayInit)) {
             return false;
           }
@@ -1721,7 +2020,7 @@ bool Sema::run(AstTranslationUnit& tu) {
     }
 
     for (const auto& st : def->body) {
-      checkStmtImpl(diags_, scopes, fns, structs, enumConsts, enumNames,
+      checkStmtImpl(diags_, scopes, fns, structs, unions, enumConsts, enumNames,
                     def->proto.returnType,
                     /*loopDepth=*/0, /*switchDepth=*/0, *st);
     }
