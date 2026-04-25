@@ -31,7 +31,7 @@
 
 ### 表达式与语句
 
-- 字面量：整数（十进制）、浮点（十进制与科学计数法、`f/F`）、字符与字符串
+- 字面量：整数（十进制、八进制、十六进制，含 `u/l/ll` 后缀）、浮点（十进制、科学计数法、十六进制浮点、`f/F`）、字符与字符串
 - 运算符：一元/二元算术、位运算、移位、比较、逻辑（短路）、逗号、赋值与复合赋值
 - 显式类型转换与 `sizeof`
 - 指针算术与数组下标
@@ -72,11 +72,12 @@
 - `putchar/puts`
 - `fopen/fclose/fread/fwrite/fgetc/fputc/getc/putc/ungetc/fgets/fputs/fseek/ftell/fseeko/ftello/rewind/fflush/feof/ferror/clearerr/fprintf/sprintf/snprintf/fscanf/remove/rename/tmpnam/tmpfile/perror`（基础文件 I/O 与格式化 I/O）
   - `fopen` 模式：`r/w/a`，支持 `+` 与 `b`
+  - `perror` 使用可读错误字符串输出
 - `scanf/sscanf`（最小实现：`%d/%u/%x/%o/%i/%f/%e/%g/%s/%c/%p/%n/%[]`，支持 `l/ll` 修饰与宽度、`*` 抑制赋值，含 `%%`、空白匹配）
 - `stdin/stdout/stderr`（在 `stdio.h` 中通过访问器宏提供）
 - `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
 - `stdlib.h`（最小实现：`atoi/atol/atoll`、`strtol/strtoul/strtod`、`abs/labs/llabs`、`div/ldiv`、`rand/srand`、`qsort/bsearch`、`exit/abort`）
-- `string.h`（最小实现：`memcpy/memmove/memset/memcmp`、`strlen/strcmp`、`strcpy/strncpy`、`strcat/strncat`）
+- `string.h`（最小实现：`memcpy/memmove/memset/memcmp/memchr`、`strlen/strcmp/strncmp/strcoll/strxfrm`、`strcpy/strncpy/strdup`、`strcat/strncat`、`strchr/strrchr/strstr/strspn/strcspn/strpbrk/strtok/strerror`）
 - `ctype.h`（最小实现：`isdigit`、`isspace`）
 - `errno.h`（最小实现：`errno` 与常见错误码）
 - 运行时编译使用 `-I include`，避免系统头文件宏与本项目最小实现冲突
@@ -187,7 +188,6 @@ EOS
 
 ## 已知限制与缺口（面向常见 C99 项目）
 
-- 数值字面量：不支持十六/八进制、十六进制浮点
 - 转义序列：仅支持基础转义（如 `\n`/`\t`/`\r`/`\0`/`\\`/`\'`/`\"`）
 - 类型与转换：整数提升与常规算术转换为简化版
 - 预处理器：不支持 `#pragma once`，宏展开与 token 规则不完全一致于标准
@@ -208,8 +208,6 @@ EOS
 
 ### 1) 语言层面的关键缺口（优先）
 - **整数与常量表达式**
-  - 十六进制/八进制整数（`0xFF`/`077`）
-  - 十六进制浮点（`0x1.2p3`）
   - 更完整的常量表达式（数组维度/枚举计算/`case` 表达式等）
 - **类型系统**
   - （暂无）
@@ -227,7 +225,6 @@ EOS
 - `time.h`：`time/localtime/strftime` 的最小实现
 - `assert.h`：`assert` 宏
 - `signal.h`：`signal/raise` 的最小实现
-- `string.h`：`strchr/strrchr/strstr/strtok/memchr`
 - `stdlib.h`：`getenv`、`strtoll/strtoull`（以及更完整的 `strtol` 族）
 - `stdio.h`：更完整的 `scanf/printf` 覆盖（标志位/长度修饰/更多格式）
 
@@ -239,6 +236,5 @@ EOS
 
 - `stdio.h`：继续扩展 `scanf/sscanf` 规格与更完整的文件/缓冲 I/O
 - `stdlib.h`：`rand/srand`、`strtol/strtoul/strtod`、`qsort/bsearch`、`getenv`
-- `string.h`：`strchr/strrchr/strstr/strtok`、`memchr`
 - `math.h`：`sqrt/pow/sin/cos` 等基础函数
 - `time.h` / `errno.h` / `assert.h` / `signal.h`

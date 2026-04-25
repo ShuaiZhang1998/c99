@@ -583,26 +583,7 @@ void perror(const char* s) {
     c99cc_write_file(stderr, (const unsigned char*)msg, (size_t)strlen(msg));
     c99cc_write_file(stderr, (const unsigned char*)": ", 2);
   }
-  if (errno == 0) {
-    c99cc_write_file(stderr, (const unsigned char*)"error\n", 6);
-    return;
-  }
-  char buf[32];
-  int v = errno;
-  int i = 0;
-  if (v < 0) {
-    buf[i++] = '-';
-    v = -v;
-  }
-  char digits[16];
-  int d = 0;
-  while (v > 0 && d < 16) {
-    digits[d++] = (char)('0' + (v % 10));
-    v /= 10;
-  }
-  if (d == 0) digits[d++] = '0';
-  while (d > 0) buf[i++] = digits[--d];
-  buf[i++] = '\n';
-  c99cc_write_file(stderr, (const unsigned char*)"error ", 6);
-  c99cc_write_file(stderr, (const unsigned char*)buf, (size_t)i);
+  const char* err = strerror(errno);
+  c99cc_write_file(stderr, (const unsigned char*)err, (size_t)strlen(err));
+  c99cc_write_file(stderr, (const unsigned char*)"\n", 1);
 }

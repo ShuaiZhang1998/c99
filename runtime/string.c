@@ -1,4 +1,6 @@
 #include <stddef.h>
+#include "errno.h"
+#include "stdlib.h"
 
 void* memcpy(void* dst, const void* src, size_t n) {
   unsigned char* d = (unsigned char*)dst;
@@ -41,6 +43,15 @@ int memcmp(const void* a, const void* b, size_t n) {
     if (x[i] != y[i]) {
       return (x[i] < y[i]) ? -1 : 1;
     }
+  }
+  return 0;
+}
+
+void* memchr(const void* s, int c, size_t n) {
+  const unsigned char* p = (const unsigned char*)s;
+  unsigned char want = (unsigned char)c;
+  for (size_t i = 0; i < n; ++i) {
+    if (p[i] == want) return (void*)(p + i);
   }
   return 0;
 }
@@ -115,4 +126,136 @@ char* strncat(char* dst, const char* src, size_t n) {
   }
   dst[i] = '\0';
   return out;
+}
+
+char* strchr(const char* s, int c) {
+  char want = (char)c;
+  while (*s) {
+    if (*s == want) return (char*)s;
+    ++s;
+  }
+  if (want == '\0') return (char*)s;
+  return 0;
+}
+
+char* strrchr(const char* s, int c) {
+  char want = (char)c;
+  const char* last = 0;
+  while (*s) {
+    if (*s == want) last = s;
+    ++s;
+  }
+  if (want == '\0') return (char*)s;
+  return (char*)last;
+}
+
+char* strstr(const char* haystack, const char* needle) {
+  if (!*needle) return (char*)haystack;
+  for (const char* h = haystack; *h; ++h) {
+    const char* hs = h;
+    const char* ns = needle;
+    while (*hs && *ns && *hs == *ns) {
+      ++hs;
+      ++ns;
+    }
+    if (!*ns) return (char*)h;
+  }
+  return 0;
+}
+
+static int char_in_set(char c, const char* set) {
+  while (*set) {
+    if (*set == c) return 1;
+    ++set;
+  }
+  return 0;
+}
+
+size_t strspn(const char* s, const char* accept) {
+  size_t n = 0;
+  while (s[n] && char_in_set(s[n], accept)) {
+    ++n;
+  }
+  return n;
+}
+
+size_t strcspn(const char* s, const char* reject) {
+  size_t n = 0;
+  while (s[n] && !char_in_set(s[n], reject)) {
+    ++n;
+  }
+  return n;
+}
+
+char* strpbrk(const char* s, const char* accept) {
+  while (*s) {
+    if (char_in_set(*s, accept)) return (char*)s;
+    ++s;
+  }
+  return 0;
+}
+
+char* strtok(char* s, const char* delim) {
+  static char* next;
+  char* start;
+  if (s) {
+    next = s;
+  } else if (!next) {
+    return 0;
+  }
+
+  while (*next && char_in_set(*next, delim)) {
+    ++next;
+  }
+  if (!*next) {
+    next = 0;
+    return 0;
+  }
+
+  start = next;
+  while (*next && !char_in_set(*next, delim)) {
+    ++next;
+  }
+  if (*next) {
+    *next = '\0';
+    ++next;
+  } else {
+    next = 0;
+  }
+  return start;
+}
+
+char* strerror(int errnum) {
+  switch (errnum) {
+    case 0: return "no error";
+    case EINVAL: return "invalid argument";
+    case ENOENT: return "no such file or directory";
+    case EIO: return "input/output error";
+    case ENOMEM: return "not enough memory";
+    case EACCES: return "permission denied";
+    default: return "unknown error";
+  }
+}
+
+char* strdup(const char* s) {
+  size_t n = strlen(s) + 1;
+  char* out = (char*)malloc(n);
+  if (!out) return 0;
+  memcpy(out, s, n);
+  return out;
+}
+
+int strcoll(const char* a, const char* b) {
+  return strcmp(a, b);
+}
+
+size_t strxfrm(char* dst, const char* src, size_t n) {
+  size_t len = strlen(src);
+  if (n != 0) {
+    size_t copy = len;
+    if (copy >= n) copy = n - 1;
+    memcpy(dst, src, copy);
+    dst[copy] = '\0';
+  }
+  return len;
 }
