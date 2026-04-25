@@ -63,7 +63,7 @@
 
 ### 标准库与运行时（最小）
 
-- 头文件（需 `-I include`）：`stddef.h` / `stdint.h` / `stdbool.h` / `string.h` / `stdlib.h` / `stdio.h` / `ctype.h` / `errno.h`
+- 头文件（需 `-I include`）：`assert.h` / `ctype.h` / `errno.h` / `math.h` / `signal.h` / `stdbool.h` / `stddef.h` / `stdint.h` / `stdio.h` / `stdlib.h` / `string.h` / `time.h`
 - `printf`（最小实现）：
   - 支持 `%d/%i/%c/%s/%f/%%`
   - 支持最小宽度
@@ -76,10 +76,14 @@
 - `scanf/sscanf`（最小实现：`%d/%u/%x/%o/%i/%f/%e/%g/%s/%c/%p/%n/%[]`，支持 `l/ll` 修饰与宽度、`*` 抑制赋值，含 `%%`、空白匹配）
 - `stdin/stdout/stderr`（在 `stdio.h` 中通过访问器宏提供）
 - `malloc/calloc/realloc/free`（最小实现：POSIX 使用 `mmap`，Windows 使用 `VirtualAlloc`；`free` 可释放整块）
-- `stdlib.h`（最小实现：`atoi/atol/atoll`、`strtol/strtoul/strtod`、`abs/labs/llabs`、`div/ldiv`、`rand/srand`、`qsort/bsearch`、`exit/abort`）
+- `stdlib.h`（最小实现：`atoi/atol/atoll`、`strtol/strtoul/strtoll/strtoull/strtod`、`abs/labs/llabs`、`div/ldiv`、`rand/srand`、`qsort/bsearch`、`getenv`、`exit/abort`）
 - `string.h`（最小实现：`memcpy/memmove/memset/memcmp/memchr`、`strlen/strcmp/strncmp/strcoll/strxfrm`、`strcpy/strncpy/strdup`、`strcat/strncat`、`strchr/strrchr/strstr/strspn/strcspn/strpbrk/strtok/strerror`）
 - `ctype.h`（最小实现：`isdigit`、`isspace`）
 - `errno.h`（最小实现：`errno` 与常见错误码）
+- `assert.h`（`assert` / `NDEBUG`）
+- `math.h`（最小实现：`fabs/fabsf`、`sqrt/sqrtf`、`pow/powf`、`sin/sinf`、`cos/cosf`）
+- `time.h`（最小实现：`time`、`localtime`、`strftime`）
+- `signal.h`（最小实现：`signal`、`raise`、`SIGABRT/SIGINT/SIGTERM`、`SIG_DFL/SIG_IGN/SIG_ERR`）
 - 运行时编译使用 `-I include`，避免系统头文件宏与本项目最小实现冲突
 
 ## 构建
@@ -190,7 +194,7 @@ EOS
 
 - 转义序列：仅支持基础转义（如 `\n`/`\t`/`\r`/`\0`/`\\`/`\'`/`\"`）
 - 类型与转换：整数提升与常规算术转换为简化版
-- 预处理器：不支持 `#pragma once`，宏展开与 token 规则不完全一致于标准
+- 预处理器：已支持 `#pragma once`，但宏展开与 token 规则仍不完全一致于标准；`#line` 仍未实现
 - 类型系统：暂无重大缺口（仍有功能差异，详见“已知限制”）
 - 作用域与存储期：存储类规则仍不完整（已支持 `static`/`extern` 的基础用法）
 - 标准库：仅提供最小头文件与子集实现，无完整 libc
@@ -217,24 +221,22 @@ EOS
 
 ### 2) 预处理器与语义一致性（中优先）
 - 宏展开边界与 token 化规则更贴近标准
-- `#pragma once`
 - `#line` 指令（影响诊断与调试）
 
 ### 3) 标准库覆盖（中优先）
-- `math.h`：`sqrt/pow/sin/cos` 等基础函数
-- `time.h`：`time/localtime/strftime` 的最小实现
-- `assert.h`：`assert` 宏
-- `signal.h`：`signal/raise` 的最小实现
-- `stdlib.h`：`getenv`、`strtoll/strtoull`（以及更完整的 `strtol` 族）
 - `stdio.h`：更完整的 `scanf/printf` 覆盖（标志位/长度修饰/更多格式）
+- `ctype.h`：更完整的分类/大小写转换接口
+- 更多常见头文件：`limits.h` / `float.h` / `stdarg.h` / `setjmp.h` / `locale.h`
+- `time.h` / `math.h` 的更完整语义与更多接口
+- `signal.h` 的系统级兼容语义（当前是最小模型）
 
 ### 4) 诊断与健壮性（低优先但重要）
 - 更准确的类型错误与恢复策略
 - 多处错误的连续报告（当前更易“首错即停”）
 
-## 接下来优先完善的 C 运行时（面向简单 C99 项目）
+## 接下来优先完善的方向（面向简单 C99 项目）
 
-- `stdio.h`：继续扩展 `scanf/sscanf` 规格与更完整的文件/缓冲 I/O
-- `stdlib.h`：`rand/srand`、`strtol/strtoul/strtod`、`qsort/bsearch`、`getenv`
-- `math.h`：`sqrt/pow/sin/cos` 等基础函数
-- `time.h` / `errno.h` / `assert.h` / `signal.h`
+- 预处理器：`#line`，以及更接近标准的宏展开/token 规则
+- `stdio.h`：继续扩展 `scanf/sscanf/printf` 规格与更完整的文件/缓冲 I/O
+- 常见头文件补齐：`limits.h` / `float.h` / `stdarg.h`
+- 运行时语义打磨：`time.h` 的真实本地时区行为、`math.h` 的精度与边界情况、`signal.h` 的系统兼容性

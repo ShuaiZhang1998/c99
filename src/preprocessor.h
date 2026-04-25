@@ -1,5 +1,6 @@
 #pragma once
 #include <optional>
+#include <unordered_set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,7 @@ private:
   std::unordered_map<std::string, Macro> macros_;
   std::vector<std::string> includePaths_;
   std::vector<std::string> systemIncludePaths_;
+  std::unordered_set<std::string> pragmaOnceFiles_;
   std::string builtinDate_;
   std::string builtinTime_;
   std::vector<std::string> errors_;

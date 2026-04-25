@@ -40,10 +40,13 @@ ldiv_t ldiv(long num, long den);
 
 long strtol(const char* nptr, char** endptr, int base);
 unsigned long strtoul(const char* nptr, char** endptr, int base);
+long long strtoll(const char* nptr, char** endptr, int base);
+unsigned long long strtoull(const char* nptr, char** endptr, int base);
 double strtod(const char* nptr, char** endptr);
 
 int rand(void);
 void srand(unsigned int seed);
+char* getenv(const char* name);
 
 void qsort(void* base, size_t nmemb, size_t size,
            int (*compar)(const void*, const void*));

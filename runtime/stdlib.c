@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -221,10 +222,18 @@ static int digit_value(char c) {
   return -1;
 }
 
-long strtol(const char* nptr, char** endptr, int base) {
+static int str_eq_n(const char* a, const char* b, size_t n) {
+  for (size_t i = 0; i < n; ++i) {
+    if (a[i] != b[i]) return 0;
+  }
+  return 1;
+}
+
+static unsigned long long parse_int(const char* nptr, char** endptr, int base, int* signOut) {
   const char* s = nptr;
   if (!s) {
     if (endptr) *endptr = (char*)nptr;
+    if (signOut) *signOut = 1;
     return 0;
   }
   while (is_space_char(*s)) ++s;
@@ -242,51 +251,43 @@ long strtol(const char* nptr, char** endptr, int base) {
     }
   }
   if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-  unsigned long value = 0;
+  unsigned long long value = 0;
   int any = 0;
   while (*s) {
     int d = digit_value(*s);
     if (d < 0 || d >= base) break;
-    value = value * (unsigned long)base + (unsigned long)d;
+    value = value * (unsigned long long)base + (unsigned long long)d;
     any = 1;
     ++s;
   }
   if (endptr) *endptr = (char*)(any ? s : nptr);
-  return (long)(sign * (long)value);
+  if (signOut) *signOut = sign;
+  return value;
+}
+
+long strtol(const char* nptr, char** endptr, int base) {
+  int sign = 1;
+  unsigned long long value = parse_int(nptr, endptr, base, &sign);
+  return (long)(sign * (long long)value);
 }
 
 unsigned long strtoul(const char* nptr, char** endptr, int base) {
-  const char* s = nptr;
-  if (!s) {
-    if (endptr) *endptr = (char*)nptr;
-    return 0;
-  }
-  while (is_space_char(*s)) ++s;
   int sign = 1;
-  if (*s == '+' || *s == '-') {
-    if (*s == '-') sign = -1;
-    ++s;
-  }
-  if (base == 0) {
-    if (*s == '0') {
-      if (s[1] == 'x' || s[1] == 'X') base = 16;
-      else base = 8;
-    } else {
-      base = 10;
-    }
-  }
-  if (base == 16 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-  unsigned long value = 0;
-  int any = 0;
-  while (*s) {
-    int d = digit_value(*s);
-    if (d < 0 || d >= base) break;
-    value = value * (unsigned long)base + (unsigned long)d;
-    any = 1;
-    ++s;
-  }
-  if (endptr) *endptr = (char*)(any ? s : nptr);
+  unsigned long long value = parse_int(nptr, endptr, base, &sign);
   if (sign < 0) return (unsigned long)(-(long)value);
+  return (unsigned long)value;
+}
+
+long long strtoll(const char* nptr, char** endptr, int base) {
+  int sign = 1;
+  unsigned long long value = parse_int(nptr, endptr, base, &sign);
+  return (long long)(sign * (long long)value);
+}
+
+unsigned long long strtoull(const char* nptr, char** endptr, int base) {
+  int sign = 1;
+  unsigned long long value = parse_int(nptr, endptr, base, &sign);
+  if (sign < 0) return (unsigned long long)(-(long long)value);
   return value;
 }
 
@@ -354,6 +355,41 @@ static unsigned long rand_state = 1;
 
 void srand(unsigned int seed) {
   rand_state = seed ? seed : 1u;
+}
+
+char* getenv(const char* name) {
+  if (!name || !*name) return NULL;
+  size_t len = 0;
+  while (name[len]) {
+    if (name[len] == '=') return NULL;
+    ++len;
+  }
+#ifdef _WIN32
+  static char* env_buf = NULL;
+  static size_t env_buf_size = 0;
+  DWORD needed = GetEnvironmentVariableA(name, NULL, 0);
+  if (needed == 0) return NULL;
+  if (env_buf_size < (size_t)needed) {
+    char* p = (char*)realloc(env_buf, (size_t)needed);
+    if (!p) return NULL;
+    env_buf = p;
+    env_buf_size = (size_t)needed;
+  }
+  if (GetEnvironmentVariableA(name, env_buf, (DWORD)env_buf_size) == 0) return NULL;
+  return env_buf;
+#else
+  extern char** environ;
+  if (!environ) return NULL;
+  for (char** env = environ; *env; ++env) {
+    const char* entry = *env;
+    size_t i = 0;
+    while (entry[i] && entry[i] != '=') ++i;
+    if (i == len && entry[i] == '=' && str_eq_n(entry, name, len)) {
+      return (char*)(entry + i + 1);
+    }
+  }
+  return NULL;
+#endif
 }
 
 int rand(void) {
@@ -436,4 +472,9 @@ void* bsearch(const void* key, const void* base, size_t nmemb, size_t size,
     else lo = mid + 1;
   }
   return NULL;
+}
+
+void __c99cc_assert_fail(const char* expr, const char* file, int line) {
+  fprintf(stderr, "Assertion failed: %s, file %s, line %d\n", expr, file, line);
+  abort();
 }

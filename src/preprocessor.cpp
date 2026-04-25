@@ -207,6 +207,7 @@ std::optional<std::string> Preprocessor::run(const std::string& path, const std:
 }
 
 bool Preprocessor::processFile(const std::string& path, const std::string& source, std::string& out) {
+  if (pragmaOnceFiles_.count(path) > 0) return true;
   return processLines(path, source, out);
 }
 
@@ -284,6 +285,16 @@ bool Preprocessor::handleDirective(
     }
     if (!processFile(fullPath, content, out)) return false;
     return true;
+  }
+
+  if (directive == "pragma") {
+    if (!active) return true;
+    std::string rest = trim(lineText.substr(i));
+    if (rest == "once") {
+      pragmaOnceFiles_.insert(path);
+      return true;
+    }
+    return report(path, line, static_cast<int>(start + 1), "unknown preprocessor directive");
   }
 
   if (directive == "define") {
